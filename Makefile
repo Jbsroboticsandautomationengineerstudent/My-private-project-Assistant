@@ -1,6 +1,8 @@
 THEOS_PACKAGE_SCHEME = rootless
 TARGET = iphone:clang:latest:17.0
-ARCHS = arm64 arm64e
+# The official ONNX Runtime iOS framework contains arm64 only. arm64e
+# devices can run the arm64 slice; linking a separate arm64e slice fails.
+ARCHS = arm64
 INSTALL_TARGET_PROCESSES = Chess
 
 # Optional checksum override when the Hugging Face metadata API is unavailable.

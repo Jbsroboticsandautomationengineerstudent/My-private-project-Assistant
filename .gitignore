@@ -1,0 +1,7 @@
+.asset-cache/
+.theos/
+layout/
+packages/
+__pycache__/
+*.pyc
+*.deb

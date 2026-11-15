@@ -260,6 +260,7 @@ static id<MLFeatureProvider> CAPModifiedPredict(MLModel *self, SEL selector,
                 double highest = MAX(values[0], MAX(values[1], values[2]));
                 double weights[3] = {exp(values[0] - highest), exp(values[1] - highest), exp(values[2] - highest)};
                 double total = weights[0] + weights[1] + weights[2];
+                double lossWeight = weights[0], drawWeight = weights[1], winWeight = weights[2];
                 [CAPFenLock() lock];
                 NSString *fen = [predictionFEN copy];
                 [CAPFenLock() unlock];
@@ -267,9 +268,9 @@ static id<MLFeatureProvider> CAPModifiedPredict(MLModel *self, SEL selector,
                     if (![currentFEN isEqualToString:fen] || total <= 0) return;
                     BOOL whiteToMove = [fen containsString:@" w "];
                     // Maia3 value labels are loss, draw, win for the side to move.
-                    maiaWDL[0] = (whiteToMove ? weights[2] : weights[0]) / total;
-                    maiaWDL[1] = weights[1] / total;
-                    maiaWDL[2] = (whiteToMove ? weights[0] : weights[2]) / total;
+                    maiaWDL[0] = (whiteToMove ? winWeight : lossWeight) / total;
+                    maiaWDL[1] = drawWeight / total;
+                    maiaWDL[2] = (whiteToMove ? lossWeight : winWeight) / total;
                     hasMaiaWDL = YES;
                     CAPRefreshAll();
                 });
@@ -373,9 +374,12 @@ static UIView *CAPFindBoardIn(UIView *root) {
 }
 
 static UIView *CAPVisibleBoard(void) {
-    for (UIWindow *window in [UIApplication.sharedApplication.windows reverseObjectEnumerator]) {
-        UIView *found = CAPFindBoardIn(window);
-        if (found) return found;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class]) continue;
+        for (UIWindow *window in [((UIWindowScene *)scene).windows reverseObjectEnumerator]) {
+            UIView *found = CAPFindBoardIn(window);
+            if (found) return found;
+        }
     }
     return nil;
 }
@@ -545,7 +549,6 @@ static UIButton *CAPButton(NSString *text, id target, SEL action, NSInteger tag)
     button.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1];
     button.layer.cornerRadius = 12;
     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
-    button.contentEdgeInsets = UIEdgeInsetsMake(12, 16, 12, 16);
     button.titleLabel.numberOfLines = 2;
     button.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
     [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];

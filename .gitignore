@@ -1,4 +1,5 @@
 .asset-cache/
+.build-sources/
 .theos/
 layout/
 packages/

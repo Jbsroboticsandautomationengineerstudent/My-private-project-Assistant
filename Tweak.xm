@@ -9,9 +9,20 @@
 #include <onnxruntime_c_api.h>
 #include <stdint.h>
 #include <string.h>
+#include <errno.h>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <string>
+
+extern char **environ;
 
 static NSString *const kModelPath = @"/var/jb/Library/Application Support/ChessAssistantPro/maia3_79m_int32.onnx";
 static NSString *const kAutoPlayKey = @"ChessAssistantPro_AutoPlay";
+static NSString *const kGodEngineKey = @"godEngineChoice";
+static const char *kTriumviratusPath = "/var/jb/usr/bin/triumviratus";
 
 static const OrtApi *CAPOrt(void) {
     static const OrtApi *api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
@@ -275,6 +286,133 @@ static void CAPMaiaGo(const char *fen, uintptr_t selfElo, uintptr_t oppoElo,
     originalMaiaGo(fen, selfElo, oppoElo, [forwarded copy]);
 }
 
+// EngineGo's callback ABI is recovered from the injected Chess.dylib. Returning
+// this result lets its existing CHPad/board path draw the normal engine arrow.
+struct EngineLine { char move[8]; bool flag1; bool flag2; int value; };
+static_assert(sizeof(EngineLine) == 16, "Engine callback ABI changed");
+typedef void (^EngineCallback)(const EngineLine *, int);
+typedef void (*EngineGoFn)(const char *, uintptr_t, uintptr_t, uintptr_t, EngineCallback);
+static EngineGoFn originalEngineGo = nullptr;
+
+static BOOL CAPWrite(int fd, const std::string &command) {
+    const char *data = command.data();
+    size_t remaining = command.size();
+    while (remaining) {
+        ssize_t written = write(fd, data, remaining);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) return NO;
+        data += written;
+        remaining -= (size_t)written;
+    }
+    return YES;
+}
+
+static BOOL CAPReadLine(int fd, std::string &line, CFAbsoluteTime deadline) {
+    line.clear();
+    while (line.size() < 4096 && CFAbsoluteTimeGetCurrent() < deadline) {
+        int timeout = (int)((deadline - CFAbsoluteTimeGetCurrent()) * 1000);
+        struct pollfd item = {fd, POLLIN, 0};
+        int ready = poll(&item, 1, MAX(timeout, 1));
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0 || (item.revents & (POLLERR | POLLNVAL))) return NO;
+        char character;
+        ssize_t count = read(fd, &character, 1);
+        if (count <= 0) return NO;
+        if (character == '\n') return YES;
+        if (character != '\r') line.push_back(character);
+    }
+    return NO;
+}
+
+static BOOL CAPWaitForLine(int fd, const char *expected, CFAbsoluteTime deadline) {
+    std::string line;
+    while (CAPReadLine(fd, line, deadline)) {
+        if (line == expected) return YES;
+    }
+    return NO;
+}
+
+static BOOL CAPUciMove(const std::string &move) {
+    if (move.size() != 4 && move.size() != 5) return NO;
+    if (move[0] < 'a' || move[0] > 'h' || move[2] < 'a' || move[2] > 'h' ||
+        move[1] < '1' || move[1] > '8' || move[3] < '1' || move[3] > '8') return NO;
+    return move.size() == 4 || move[4] == 'q' || move[4] == 'r' ||
+           move[4] == 'b' || move[4] == 'n';
+}
+
+static BOOL CAPTriumviratusMove(const char *fen, std::string &bestMove) {
+    if (access(kTriumviratusPath, X_OK) != 0) return NO;
+    int input[2], output[2];
+    if (pipe(input) != 0) return NO;
+    if (pipe(output) != 0) { close(input[0]); close(input[1]); return NO; }
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, input[0], STDIN_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, output[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, output[1], STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&actions, input[1]);
+    posix_spawn_file_actions_addclose(&actions, output[0]);
+    pid_t pid = 0;
+    char *const arguments[] = {const_cast<char *>(kTriumviratusPath), nullptr};
+    int status = posix_spawn(&pid, kTriumviratusPath, &actions, nullptr, arguments, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(input[0]); close(output[1]);
+    if (status != 0) { close(input[1]); close(output[0]); return NO; }
+    BOOL success = NO;
+    std::string line;
+    CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 20.0;
+    if (!CAPWrite(input[1], "uci\n") || !CAPWaitForLine(output[0], "uciok", deadline)) goto done;
+    if (!CAPWrite(input[1], "isready\n") || !CAPWaitForLine(output[0], "readyok", deadline)) goto done;
+    if (!CAPWrite(input[1], std::string("position fen ") + fen + "\n")) goto done;
+    if (!CAPWrite(input[1], "go depth 16\n")) goto done;
+    deadline = CFAbsoluteTimeGetCurrent() + 15.0;
+    while (CAPReadLine(output[0], line, deadline)) {
+        if (line.compare(0, 9, "bestmove ") != 0) continue;
+        size_t end = line.find(' ', 9);
+        bestMove = line.substr(9, end == std::string::npos ? end : end - 9);
+        success = CAPUciMove(bestMove);
+        break;
+    }
+done:
+    close(input[1]); close(output[0]);
+    kill(pid, SIGKILL);
+    while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+    return success;
+}
+
+static void CAPEngineGo(const char *fen, uintptr_t arg1, uintptr_t arg2,
+                        uintptr_t arg3, EngineCallback callback) {
+    if (!originalEngineGo) return;
+    size_t length = fen ? strnlen(fen, 256) : 0;
+    if ([[NSUserDefaults standardUserDefaults] integerForKey:kGodEngineKey] != 1 ||
+        length == 0 || length >= 256 || strpbrk(fen, "\r\n") ||
+        access(kTriumviratusPath, X_OK) != 0) {
+        originalEngineGo(fen, arg1, arg2, arg3, callback);
+        return;
+    }
+    NSString *position = [[NSString alloc] initWithBytes:fen length:length encoding:NSUTF8StringEncoding];
+    if (!position) { originalEngineGo(fen, arg1, arg2, arg3, callback); return; }
+    EngineCallback copied = [callback copy];
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ queue = dispatch_queue_create("com.jerich.chessassistantpro.triumviratus", DISPATCH_QUEUE_SERIAL); });
+    dispatch_async(queue, ^{
+        std::string move;
+        BOOL found = NO;
+        @try { found = CAPTriumviratusMove(position.UTF8String, move); }
+        @catch (NSException *exception) { NSLog(@"[ChessAssistantPro] Triumviratus failed: %@", exception); }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!found) {
+                originalEngineGo(position.UTF8String, arg1, arg2, arg3, copied);
+                return;
+            }
+            EngineLine result = {};
+            strlcpy(result.move, move.c_str(), sizeof(result.move));
+            if (copied) copied(&result, 1);
+        });
+    });
+}
+
 static UIButton *CAPFindPauseButton(UIView *view) {
     if ([view isKindOfClass:UIButton.class]) {
         UIButton *button = (UIButton *)view;
@@ -293,7 +431,7 @@ static char kAutoPlayRowKey;
 static void CAPInsertAutoPlay(id panel) {
     if (![panel isKindOfClass:UIView.class]) return;
     UIView *existing = objc_getAssociatedObject(panel, &kAutoPlayRowKey);
-    if (existing.superview) return;
+    if ([existing isDescendantOfView:(UIView *)panel]) return;
     UIButton *pause = CAPFindPauseButton((UIView *)panel);
     if (!pause) return;
     UIView *child = pause;
@@ -322,10 +460,51 @@ static void CAPInsertAutoPlay(id panel) {
     objc_setAssociatedObject(panel, &kAutoPlayRowKey, row, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+static char kGodEngineRowKey;
+static void CAPInsertGodEngine(id panel) {
+    if (![panel isKindOfClass:UIView.class]) return;
+    UIView *existing = objc_getAssociatedObject(panel, &kGodEngineRowKey);
+    if ([existing isDescendantOfView:(UIView *)panel]) return;
+    UIButton *pause = CAPFindPauseButton((UIView *)panel);
+    if (!pause) return;
+    UIView *child = pause;
+    UIStackView *stack = nil;
+    while (child.superview) {
+        UIView *parent = child.superview;
+        if ([parent isKindOfClass:UIStackView.class] &&
+            [((UIStackView *)parent).arrangedSubviews containsObject:child]) {
+            stack = (UIStackView *)parent;
+            break;
+        }
+        child = parent;
+    }
+    if (!stack || ![panel respondsToSelector:@selector(rowTitle:control:)]) return;
+    UISegmentedControl *choice = [[UISegmentedControl alloc]
+        initWithItems:@[@"Stockfish", @"Triumviratus"]];
+    choice.selectedSegmentIndex = [[NSUserDefaults standardUserDefaults] integerForKey:kGodEngineKey] == 1 ? 1 : 0;
+    [choice addTarget:panel action:@selector(cap_godEngineChanged:)
+       forControlEvents:UIControlEventValueChanged];
+    if ([panel respondsToSelector:@selector(styleSeg:)])
+        ((void (*)(id, SEL, id))objc_msgSend)(panel, @selector(styleSeg:), choice);
+    UIView *row = ((id (*)(id, SEL, id, id))objc_msgSend)
+        (panel, @selector(rowTitle:control:), @"God Engine", choice);
+    if (![row isKindOfClass:UIView.class]) return;
+    NSUInteger index = [stack.arrangedSubviews indexOfObject:child];
+    if (index == NSNotFound) return;
+    [stack insertArrangedSubview:row atIndex:index];
+    objc_setAssociatedObject(panel, &kGodEngineRowKey, row, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 %hook CHSettingsPanel
 - (void)populate {
     %orig;
+    CAPInsertGodEngine(self);
     CAPInsertAutoPlay(self);
+}
+%new
+- (void)cap_godEngineChanged:(UISegmentedControl *)sender {
+    [[NSUserDefaults standardUserDefaults] setInteger:(sender.selectedSegmentIndex == 1 ? 1 : 0)
+                                               forKey:kGodEngineKey];
 }
 %new
 - (void)cap_autoPlayChanged:(UISwitch *)sender {
@@ -341,6 +520,8 @@ static void CAPInsertAutoPlay(id panel) {
                                         (IMP)CAPModifiedPredict, (IMP *)&originalPredict);
         void *maia = dlsym(RTLD_DEFAULT, "MaiaGo");
         if (maia) MSHookFunction(maia, (void *)CAPMaiaGo, (void **)&originalMaiaGo);
-        NSLog(@"[ChessAssistantPro] Maia ONNX hook=%p", maia);
+        void *engine = dlsym(RTLD_DEFAULT, "EngineGo");
+        if (engine) MSHookFunction(engine, (void *)CAPEngineGo, (void **)&originalEngineGo);
+        NSLog(@"[ChessAssistantPro] Maia=%p Engine=%p", maia, engine);
     }
 }

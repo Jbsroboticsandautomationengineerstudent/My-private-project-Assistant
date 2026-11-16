@@ -347,39 +347,64 @@ static BOOL CAPUciMove(const std::string &move) {
 static BOOL CAPExternalEngineMove(const char *path, const char *fen,
                                   BOOL stockfish19, std::string &bestMove) {
     if (!path || !fen || access(path, X_OK) != 0) return NO;
-    int input[2], output[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, input) != 0) return NO;
-    if (pipe(output) != 0) { close(input[0]); close(input[1]); return NO; }
-    int noSigPipe = 1;
-    if (setsockopt(input[1], SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe)) != 0) {
-        close(input[0]); close(input[1]); close(output[0]); close(output[1]);
-        return NO;
+    CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
+    // Accessed only from the serial God Engine queue. Keep Stockfish warm so
+    // later positions do not pay process launch and NNUE initialization costs.
+    static int cachedInput = -1, cachedOutput = -1;
+    static pid_t cachedPid = 0;
+    if (stockfish19 && cachedPid > 0) {
+        int status = 0;
+        pid_t exited;
+        do { exited = waitpid(cachedPid, &status, WNOHANG); }
+        while (exited < 0 && errno == EINTR);
+        if (exited != 0) {
+            close(cachedInput); close(cachedOutput);
+            cachedInput = cachedOutput = -1;
+            cachedPid = 0;
+        }
     }
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_adddup2(&actions, input[0], STDIN_FILENO);
-    posix_spawn_file_actions_adddup2(&actions, output[1], STDOUT_FILENO);
-    posix_spawn_file_actions_adddup2(&actions, output[1], STDERR_FILENO);
-    posix_spawn_file_actions_addclose(&actions, input[1]);
-    posix_spawn_file_actions_addclose(&actions, output[0]);
+    int input[2] = {-1, -1}, output[2] = {-1, -1};
     pid_t pid = 0;
-    char *const arguments[] = {const_cast<char *>(path), nullptr};
-    int status = posix_spawn(&pid, path, &actions, nullptr, arguments, environ);
-    posix_spawn_file_actions_destroy(&actions);
-    close(input[0]); close(output[1]);
-    if (status != 0) { close(input[1]); close(output[0]); return NO; }
+    BOOL reused = stockfish19 && cachedPid > 0;
+    if (reused) {
+        input[1] = cachedInput;
+        output[0] = cachedOutput;
+        pid = cachedPid;
+    } else {
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, input) != 0) return NO;
+        if (pipe(output) != 0) { close(input[0]); close(input[1]); return NO; }
+        int noSigPipe = 1;
+        if (setsockopt(input[1], SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe)) != 0) {
+            close(input[0]); close(input[1]); close(output[0]); close(output[1]);
+            return NO;
+        }
+        posix_spawn_file_actions_t actions;
+        posix_spawn_file_actions_init(&actions);
+        posix_spawn_file_actions_adddup2(&actions, input[0], STDIN_FILENO);
+        posix_spawn_file_actions_adddup2(&actions, output[1], STDOUT_FILENO);
+        posix_spawn_file_actions_adddup2(&actions, output[1], STDERR_FILENO);
+        posix_spawn_file_actions_addclose(&actions, input[1]);
+        posix_spawn_file_actions_addclose(&actions, output[0]);
+        char *const arguments[] = {const_cast<char *>(path), nullptr};
+        int status = posix_spawn(&pid, path, &actions, nullptr, arguments, environ);
+        posix_spawn_file_actions_destroy(&actions);
+        close(input[0]); close(output[1]);
+        if (status != 0) { close(input[1]); close(output[0]); return NO; }
+    }
     BOOL success = NO;
     std::string line;
     CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 5.0;
-    if (!CAPWrite(input[1], "uci\n") || !CAPWaitForLine(output[0], "uciok", deadline)) goto done;
-    if (stockfish19 &&
-        (!CAPWrite(input[1], "setoption name Threads value 2\n") ||
-         !CAPWrite(input[1], "setoption name Hash value 32\n") ||
-         !CAPWrite(input[1], "setoption name MultiPV value 1\n"))) goto done;
-    if (!CAPWrite(input[1], "isready\n") || !CAPWaitForLine(output[0], "readyok", deadline)) goto done;
+    if (!reused) {
+        if (!CAPWrite(input[1], "uci\n") || !CAPWaitForLine(output[0], "uciok", deadline)) goto done;
+        if (stockfish19 &&
+            (!CAPWrite(input[1], "setoption name Threads value 2\n") ||
+             !CAPWrite(input[1], "setoption name Hash value 32\n") ||
+             !CAPWrite(input[1], "setoption name MultiPV value 1\n"))) goto done;
+        if (!CAPWrite(input[1], "isready\n") || !CAPWaitForLine(output[0], "readyok", deadline)) goto done;
+    }
     if (!CAPWrite(input[1], std::string("position fen ") + fen + "\n")) goto done;
-    if (!CAPWrite(input[1], stockfish19 ? "go movetime 700\n" : "go depth 16\n")) goto done;
-    deadline = CFAbsoluteTimeGetCurrent() + (stockfish19 ? 4.0 : 15.0);
+    if (!CAPWrite(input[1], stockfish19 ? "go movetime 300\n" : "go depth 16\n")) goto done;
+    deadline = CFAbsoluteTimeGetCurrent() + (stockfish19 ? 3.0 : 15.0);
     while (CAPReadLine(output[0], line, deadline)) {
         if (line.find("CRITICAL ERROR") != std::string::npos) break;
         if (line.compare(0, 9, "bestmove ") != 0) continue;
@@ -389,6 +414,17 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
         break;
     }
 done:
+    if (stockfish19 && success) {
+        cachedInput = input[1]; cachedOutput = output[0]; cachedPid = pid;
+        NSLog(@"[ChessAssistantPro] Stockfish 19 bestmove %s in %.0f ms (%@)",
+              bestMove.c_str(), (CFAbsoluteTimeGetCurrent() - started) * 1000.0,
+              reused ? @"warm" : @"cold");
+        return YES;
+    }
+    if (stockfish19) {
+        cachedInput = cachedOutput = -1;
+        cachedPid = 0;
+    }
     close(input[1]); close(output[0]);
     kill(pid, SIGKILL);
     while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
@@ -431,6 +467,7 @@ static void CAPEngineGo(const char *fen, uintptr_t arg1, uintptr_t arg2,
         dispatch_async(dispatch_get_main_queue(), ^{
             if (engineGeneration.load() != request) return;
             if (!found) {
+                NSLog(@"[ChessAssistantPro] External engine unavailable; using embedded Stockfish 16");
                 originalEngineGo(position.UTF8String, arg1, arg2, arg3, copied);
                 return;
             }

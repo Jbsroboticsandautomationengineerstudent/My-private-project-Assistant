@@ -1,6 +1,6 @@
 Package: com.jerich.chessassistantpro
 Name: Chess Assistant Pro
-Version: 0.3.0
+Version: 0.3.1
 Architecture: iphoneos-arm64
 Description: Maia ONNX with Stockfish 19 or Triumviratus and Stockfish 16 fallback
 Maintainer: Jerich

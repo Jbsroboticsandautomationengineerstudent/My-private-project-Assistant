@@ -399,11 +399,13 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
         if (stockfish19 &&
             (!CAPWrite(input[1], "setoption name Threads value 2\n") ||
              !CAPWrite(input[1], "setoption name Hash value 32\n") ||
-             !CAPWrite(input[1], "setoption name MultiPV value 1\n"))) goto done;
+             !CAPWrite(input[1], "setoption name MultiPV value 1\n") ||
+             !CAPWrite(input[1], "setoption name Skill Level value 20\n") ||
+             !CAPWrite(input[1], "setoption name UCI_LimitStrength value false\n"))) goto done;
         if (!CAPWrite(input[1], "isready\n") || !CAPWaitForLine(output[0], "readyok", deadline)) goto done;
     }
     if (!CAPWrite(input[1], std::string("position fen ") + fen + "\n")) goto done;
-    if (!CAPWrite(input[1], stockfish19 ? "go movetime 300\n" : "go depth 16\n")) goto done;
+    if (!CAPWrite(input[1], stockfish19 ? "go movetime 200\n" : "go depth 16\n")) goto done;
     deadline = CFAbsoluteTimeGetCurrent() + (stockfish19 ? 3.0 : 15.0);
     while (CAPReadLine(output[0], line, deadline)) {
         if (line.find("CRITICAL ERROR") != std::string::npos) break;

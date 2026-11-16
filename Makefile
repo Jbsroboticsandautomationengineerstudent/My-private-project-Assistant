@@ -23,10 +23,12 @@ include $(THEOS_MAKE_PATH)/tweak.mk
 .PHONY: assets
 assets:
 	@python3 prepare_assets.py
+	@bash build_stockfish19.sh
 	@bash build_triumviratus.sh
 
 # Download before compilation so the ONNX Runtime headers and library exist.
 # Theos prefixes layout/ with /var/jb for rootless packages.
 before-all::
 	@python3 prepare_assets.py
+	@bash build_stockfish19.sh
 	@bash build_triumviratus.sh

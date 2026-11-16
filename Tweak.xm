@@ -13,8 +13,10 @@
 #include <poll.h>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <atomic>
 #include <string>
 
 extern char **environ;
@@ -22,6 +24,7 @@ extern char **environ;
 static NSString *const kModelPath = @"/var/jb/Library/Application Support/ChessAssistantPro/maia3_79m_int32.onnx";
 static NSString *const kAutoPlayKey = @"ChessAssistantPro_AutoPlay";
 static NSString *const kGodEngineKey = @"godEngineChoice";
+static const char *kStockfish19Path = "/var/jb/usr/bin/stockfish19";
 static const char *kTriumviratusPath = "/var/jb/usr/bin/triumviratus";
 
 static const OrtApi *CAPOrt(void) {
@@ -293,6 +296,7 @@ static_assert(sizeof(EngineLine) == 16, "Engine callback ABI changed");
 typedef void (^EngineCallback)(const EngineLine *, int);
 typedef void (*EngineGoFn)(const char *, uintptr_t, uintptr_t, uintptr_t, EngineCallback);
 static EngineGoFn originalEngineGo = nullptr;
+static std::atomic<uint64_t> engineGeneration{0};
 
 static BOOL CAPWrite(int fd, const std::string &command) {
     const char *data = command.data();
@@ -340,11 +344,17 @@ static BOOL CAPUciMove(const std::string &move) {
            move[4] == 'b' || move[4] == 'n';
 }
 
-static BOOL CAPTriumviratusMove(const char *fen, std::string &bestMove) {
-    if (access(kTriumviratusPath, X_OK) != 0) return NO;
+static BOOL CAPExternalEngineMove(const char *path, const char *fen,
+                                  BOOL stockfish19, std::string &bestMove) {
+    if (!path || !fen || access(path, X_OK) != 0) return NO;
     int input[2], output[2];
-    if (pipe(input) != 0) return NO;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, input) != 0) return NO;
     if (pipe(output) != 0) { close(input[0]); close(input[1]); return NO; }
+    int noSigPipe = 1;
+    if (setsockopt(input[1], SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe)) != 0) {
+        close(input[0]); close(input[1]); close(output[0]); close(output[1]);
+        return NO;
+    }
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_adddup2(&actions, input[0], STDIN_FILENO);
@@ -353,20 +363,25 @@ static BOOL CAPTriumviratusMove(const char *fen, std::string &bestMove) {
     posix_spawn_file_actions_addclose(&actions, input[1]);
     posix_spawn_file_actions_addclose(&actions, output[0]);
     pid_t pid = 0;
-    char *const arguments[] = {const_cast<char *>(kTriumviratusPath), nullptr};
-    int status = posix_spawn(&pid, kTriumviratusPath, &actions, nullptr, arguments, environ);
+    char *const arguments[] = {const_cast<char *>(path), nullptr};
+    int status = posix_spawn(&pid, path, &actions, nullptr, arguments, environ);
     posix_spawn_file_actions_destroy(&actions);
     close(input[0]); close(output[1]);
     if (status != 0) { close(input[1]); close(output[0]); return NO; }
     BOOL success = NO;
     std::string line;
-    CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 20.0;
+    CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 5.0;
     if (!CAPWrite(input[1], "uci\n") || !CAPWaitForLine(output[0], "uciok", deadline)) goto done;
+    if (stockfish19 &&
+        (!CAPWrite(input[1], "setoption name Threads value 2\n") ||
+         !CAPWrite(input[1], "setoption name Hash value 32\n") ||
+         !CAPWrite(input[1], "setoption name MultiPV value 1\n"))) goto done;
     if (!CAPWrite(input[1], "isready\n") || !CAPWaitForLine(output[0], "readyok", deadline)) goto done;
     if (!CAPWrite(input[1], std::string("position fen ") + fen + "\n")) goto done;
-    if (!CAPWrite(input[1], "go depth 16\n")) goto done;
-    deadline = CFAbsoluteTimeGetCurrent() + 15.0;
+    if (!CAPWrite(input[1], stockfish19 ? "go movetime 700\n" : "go depth 16\n")) goto done;
+    deadline = CFAbsoluteTimeGetCurrent() + (stockfish19 ? 4.0 : 15.0);
     while (CAPReadLine(output[0], line, deadline)) {
+        if (line.find("CRITICAL ERROR") != std::string::npos) break;
         if (line.compare(0, 9, "bestmove ") != 0) continue;
         size_t end = line.find(' ', 9);
         bestMove = line.substr(9, end == std::string::npos ? end : end - 9);
@@ -383,10 +398,15 @@ done:
 static void CAPEngineGo(const char *fen, uintptr_t arg1, uintptr_t arg2,
                         uintptr_t arg3, EngineCallback callback) {
     if (!originalEngineGo) return;
+    uint64_t request = engineGeneration.fetch_add(1) + 1;
     size_t length = fen ? strnlen(fen, 256) : 0;
-    if ([[NSUserDefaults standardUserDefaults] integerForKey:kGodEngineKey] != 1 ||
-        length == 0 || length >= 256 || strpbrk(fen, "\r\n") ||
-        access(kTriumviratusPath, X_OK) != 0) {
+    if (length == 0 || length >= 256 || strpbrk(fen, "\r\n")) {
+        originalEngineGo(fen, arg1, arg2, arg3, callback);
+        return;
+    }
+    BOOL useTriumviratus = [[NSUserDefaults standardUserDefaults] integerForKey:kGodEngineKey] == 1;
+    if (access(useTriumviratus ? kTriumviratusPath : kStockfish19Path, X_OK) != 0 &&
+        access(kStockfish19Path, X_OK) != 0) {
         originalEngineGo(fen, arg1, arg2, arg3, callback);
         return;
     }
@@ -395,13 +415,21 @@ static void CAPEngineGo(const char *fen, uintptr_t arg1, uintptr_t arg2,
     EngineCallback copied = [callback copy];
     static dispatch_queue_t queue;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ queue = dispatch_queue_create("com.jerich.chessassistantpro.triumviratus", DISPATCH_QUEUE_SERIAL); });
+    dispatch_once(&once, ^{ queue = dispatch_queue_create("com.jerich.chessassistantpro.godengine", DISPATCH_QUEUE_SERIAL); });
     dispatch_async(queue, ^{
+        if (engineGeneration.load() != request) return;
         std::string move;
         BOOL found = NO;
-        @try { found = CAPTriumviratusMove(position.UTF8String, move); }
-        @catch (NSException *exception) { NSLog(@"[ChessAssistantPro] Triumviratus failed: %@", exception); }
+        @try {
+            if (useTriumviratus)
+                found = CAPExternalEngineMove(kTriumviratusPath, position.UTF8String, NO, move);
+            if (!found)
+                found = CAPExternalEngineMove(kStockfish19Path, position.UTF8String, YES, move);
+        } @catch (NSException *exception) {
+            NSLog(@"[ChessAssistantPro] External engine failed: %@", exception);
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (engineGeneration.load() != request) return;
             if (!found) {
                 originalEngineGo(position.UTF8String, arg1, arg2, arg3, copied);
                 return;
@@ -480,7 +508,7 @@ static void CAPInsertGodEngine(id panel) {
     }
     if (!stack || ![panel respondsToSelector:@selector(rowTitle:control:)]) return;
     UISegmentedControl *choice = [[UISegmentedControl alloc]
-        initWithItems:@[@"Stockfish", @"Triumviratus"]];
+        initWithItems:@[@"Stockfish 19", @"Triumviratus"]];
     choice.selectedSegmentIndex = [[NSUserDefaults standardUserDefaults] integerForKey:kGodEngineKey] == 1 ? 1 : 0;
     [choice addTarget:panel action:@selector(cap_godEngineChanged:)
        forControlEvents:UIControlEventValueChanged];

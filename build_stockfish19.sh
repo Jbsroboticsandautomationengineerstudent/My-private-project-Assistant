@@ -41,7 +41,7 @@ make -C "$SOURCE_DIR/src" clean ARCH=armv8 COMP=clang TARGET_KERNEL=iOS
 make -C "$SOURCE_DIR/src" -j "$(sysctl -n hw.ncpu)" all \
   ARCH=armv8 COMP=clang TARGET_KERNEL=iOS COMPCXX="$CXX" optimize=no \
   EXTRACXXFLAGS="$TARGET_FLAGS -O3 -DNDEBUG -fPIE" \
-  EXTRALDFLAGS="$TARGET_FLAGS -fPIE -pie"
+  LDFLAGS="$TARGET_FLAGS"
 
 cp "$SOURCE_DIR/src/stockfish" "$DEST_DIR/stockfish19"
 chmod 755 "$DEST_DIR/stockfish19"

@@ -1,8 +1,8 @@
 Package: com.jerich.chessassistantpro
 Name: Chess Assistant Pro
-Version: 0.1.0
+Version: 0.2.0
 Architecture: iphoneos-arm64
-Description: Local Maia and Stockfish engine controls for Chess Assistant
+Description: Maia ONNX with optional Stockfish or Triumviratus engine
 Maintainer: Jerich
 Author: Jerich
 Section: Tweaks

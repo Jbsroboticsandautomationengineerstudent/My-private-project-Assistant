@@ -6,6 +6,8 @@
 #import <substrate.h>
 #import <dlfcn.h>
 #import <dispatch/dispatch.h>
+#import <QuartzCore/QuartzCore.h>
+#import "VendorTouch/TouchSimulator.h"
 #include <onnxruntime_c_api.h>
 #include <stdint.h>
 #include <string.h>
@@ -28,6 +30,7 @@ static NSString *const kAutoPlayKey = @"ChessAssistantPro_AutoPlay";
 static NSString *const kAutoPlayMinDelayKey = @"ChessAssistantPro_AutoPlayMinDelay";
 static NSString *const kAutoPlayMaxDelayKey = @"ChessAssistantPro_AutoPlayMaxDelay";
 static NSString *const kGodEngineKey = @"godEngineChoice";
+static NSString *const kAutoEngineKey = @"ChessAssistantPro_AutoPlayEngine";
 static const char *kStockfish19Path = "/var/jb/usr/bin/stockfish19";
 static const char *kTriumviratusPath = "/var/jb/usr/bin/triumviratus";
 
@@ -194,6 +197,38 @@ typedef NS_ENUM(NSInteger, CAPMoveSource) {
     CAPMoveSourceGod
 };
 
+typedef NS_ENUM(NSInteger, CAPAutoEngine) {
+    CAPAutoEngineMaia,
+    CAPAutoEngineStockfish19,
+    CAPAutoEngineTriumviratus
+};
+
+static NSString *lastObservedPosition = nil; // Main queue only.
+static NSString *CAPPositionKey(NSString *fen);
+
+static CAPAutoEngine CAPSelectedAutoEngine(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if (![defaults objectForKey:kAutoEngineKey])
+        return [defaults boolForKey:@"ChessAssist_UseMaia"] ? CAPAutoEngineMaia :
+            ([defaults integerForKey:kGodEngineKey] == 1 ?
+             CAPAutoEngineTriumviratus : CAPAutoEngineStockfish19);
+    NSInteger value = [defaults integerForKey:kAutoEngineKey];
+    return value >= CAPAutoEngineMaia && value <= CAPAutoEngineTriumviratus ?
+        (CAPAutoEngine)value : CAPAutoEngineMaia;
+}
+
+static void CAPObservePosition(NSString *fen) {
+    NSString *key = CAPPositionKey(fen);
+    if (!key) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (![lastObservedPosition isEqualToString:key]) {
+            lastObservedPosition = [key copy];
+            ++autoPlayGeneration;
+            lastScheduledFEN = nil;
+        }
+    });
+}
+
 static NSString *CAPNormalizeMove(NSString *move) {
     if (!move) return nil;
     NSMutableString *normalized = [NSMutableString stringWithCapacity:5];
@@ -222,8 +257,11 @@ static BOOL CAPSourceEnabled(CAPMoveSource source) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     id assistantEnabled = [defaults objectForKey:@"ChessAssist_Enabled"];
     if (assistantEnabled && ![assistantEnabled boolValue]) return NO;
+    CAPAutoEngine selected = CAPSelectedAutoEngine();
     BOOL maiaSelected = [defaults boolForKey:@"ChessAssist_UseMaia"];
-    return source == CAPMoveSourceMaia ? maiaSelected : !maiaSelected;
+    return source == CAPMoveSourceMaia ?
+        (selected == CAPAutoEngineMaia && maiaSelected) :
+        (selected != CAPAutoEngineMaia && !maiaSelected);
 }
 
 static double CAPDelay(NSString *key, double fallback) {
@@ -283,6 +321,157 @@ static UIView *CAPVisibleBoardForFEN(NSString *fen) {
     return nil;
 }
 
+// The current Chess.com live board is SwiftChessBoard.ChessBoard. The older
+// CHBoardView path above remains useful in legacy modes but is absent in the
+// live-game screenshot, so an Objective-C makeMove: call cannot move it.
+static UIView *CAPFindSwiftBoard(UIView *view) {
+    if (view.hidden || view.alpha < 0.05 || !view.window) return nil;
+    Class swiftBoard = NSClassFromString(@"_TtC15SwiftChessBoard10ChessBoard");
+    if (swiftBoard && [view isKindOfClass:swiftBoard] &&
+        view.bounds.size.width > 160 &&
+        fabs(view.bounds.size.width - view.bounds.size.height) < 4 &&
+        CGRectIntersectsRect([view convertRect:view.bounds toView:view.window], view.window.bounds))
+        return view;
+    for (UIView *child in view.subviews) {
+        UIView *found = CAPFindSwiftBoard(child);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static UIView *CAPVisibleSwiftBoard(void) {
+    UIView *selected = nil;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class] ||
+            scene.activationState != UISceneActivationStateForegroundActive) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            UIView *found = CAPFindSwiftBoard(window);
+            if (!found) continue;
+            if (selected && selected != found) {
+                NSLog(@"[ChessAssistantPro] Auto-Play: multiple visible Swift boards; refusing to tap");
+                return nil;
+            }
+            selected = found;
+        }
+    }
+    return selected;
+}
+
+static BOOL CAPVisibleSettingsPanel(UIView *view) {
+    if (view.hidden || view.alpha < 0.05) return NO;
+    Class panelClass = NSClassFromString(@"CHSettingsPanel");
+    if (panelClass && [view isKindOfClass:panelClass] && view.window &&
+        CGRectIntersectsRect([view convertRect:view.bounds toView:view.window], view.window.bounds))
+        return YES;
+    for (UIView *child in view.subviews)
+        if (CAPVisibleSettingsPanel(child)) return YES;
+    return NO;
+}
+
+static NSString *CAPFenFromObject(id object) {
+    if (!object) return nil;
+    for (NSString *name in @[@"getCurrentFen", @"currentFEN", @"currentFen",
+                            @"fenString", @"boardFEN", @"positionFEN", @"gameFEN"]) {
+        SEL selector = NSSelectorFromString(name);
+        if (![object respondsToSelector:selector]) continue;
+        @try {
+            id value = ((id (*)(id, SEL))objc_msgSend)(object, selector);
+            if ([value isKindOfClass:NSString.class] && CAPPositionKey(value)) return value;
+        } @catch (NSException *exception) {}
+    }
+    return nil;
+}
+
+static BOOL CAPSwiftBoardMatchesPosition(UIView *board, NSString *fen) {
+    NSString *expected = CAPPositionKey(fen);
+    if (!expected || ![lastObservedPosition isEqualToString:expected]) return NO;
+    for (UIResponder *item = board; item; item = item.nextResponder) {
+        NSString *current = CAPFenFromObject(item);
+        if (current) return [CAPPositionKey(current) isEqualToString:expected];
+        if ([item isKindOfClass:UIView.class]) {
+            UIView *view = (UIView *)item;
+            for (NSString *name in @[@"chessBoardModel", @"boardModel", @"boardOwner", @"game"]) {
+                SEL selector = NSSelectorFromString(name);
+                if (![view respondsToSelector:selector]) continue;
+                @try {
+                    id model = ((id (*)(id, SEL))objc_msgSend)(view, selector);
+                    current = CAPFenFromObject(model);
+                    if (current) return [CAPPositionKey(current) isEqualToString:expected];
+                } @catch (NSException *exception) {}
+            }
+        }
+    }
+    // The original mod may have obtained FEN through a native Swift hook
+    // whose method is not exposed to Objective-C. In that case the newest
+    // engine request plus a single visible board are our freshness checks.
+    return YES;
+}
+
+static BOOL CAPBoardIsFlipped(UIView *board, NSString *fen) {
+    for (UIResponder *item = board; item; item = item.nextResponder) {
+        for (NSString *name in @[@"isFlipped", @"boardFlipped", @"flipped"]) {
+            SEL selector = NSSelectorFromString(name);
+            if ([item respondsToSelector:selector])
+                return ((BOOL (*)(id, SEL))objc_msgSend)(item, selector);
+        }
+    }
+    // A live game normally keeps the player's pieces at the bottom.
+    return [fen containsString:@" b "];
+}
+
+static CGPoint CAPSquarePoint(UIView *board, int file, int rank, BOOL flipped) {
+    CGFloat square = board.bounds.size.width / 8.0;
+    CGFloat x = board.bounds.origin.x + (flipped ? 7 - file : file) * square + square / 2.0;
+    CGFloat y = board.bounds.origin.y + (flipped ? rank : 7 - rank) * square + square / 2.0;
+    return [board convertPoint:CGPointMake(x, y) toView:nil];
+}
+
+static void CAPTouchTap(CGPoint point, dispatch_block_t completion) {
+    simulateTouch(TOUCH_DOWN, point.x, point.y);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 45 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        simulateTouch(TOUCH_UP, point.x, point.y);
+        if (completion) completion();
+    });
+}
+
+static BOOL CAPSwiftBoardMove(NSString *uci, NSString *fen) {
+    UIView *board = CAPVisibleSwiftBoard();
+    if (!board || !CAPSwiftBoardMatchesPosition(board, fen) || !touchSimulatorAvailable()) {
+        NSLog(@"[ChessAssistantPro] Auto-Play: Swift board, FEN, or touch backend unavailable");
+        return NO;
+    }
+    if (uci.length == 5) {
+        NSLog(@"[ChessAssistantPro] Auto-Play: promotion needs a device-verified popup path");
+        return NO;
+    }
+    BOOL flipped = CAPBoardIsFlipped(board, fen);
+    CGPoint from = CAPSquarePoint(board, [uci characterAtIndex:0] - 'a',
+                                 [uci characterAtIndex:1] - '1', flipped);
+    CGPoint to = CAPSquarePoint(board, [uci characterAtIndex:2] - 'a',
+                               [uci characterAtIndex:3] - '1', flipped);
+    UIWindow *window = board.window;
+    if (!CGRectContainsPoint(window.bounds, from) || !CGRectContainsPoint(window.bounds, to))
+        return NO;
+    for (UIWindow *candidate in ((UIWindowScene *)window.windowScene).windows) {
+        if (CAPVisibleSettingsPanel(candidate)) {
+            NSLog(@"[ChessAssistantPro] Auto-Play: settings sheet still covers board");
+            return NO;
+        }
+    }
+    touchSimulatorSetTargetWindow(window);
+    NSLog(@"[ChessAssistantPro] Auto-Play: tapping %@ from %@ to %@", uci,
+          NSStringFromCGPoint(from), NSStringFromCGPoint(to));
+    CAPTouchTap(from, ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            if (!CAPSwiftBoardMatchesPosition(board, fen) || !board.window) return;
+            CAPTouchTap(to, nil);
+        });
+    });
+    return YES;
+}
+
 static BOOL CAPAutoPlay(NSString *uci, NSString *fen, CAPMoveSource source) {
     if (![[NSUserDefaults standardUserDefaults] boolForKey:kAutoPlayKey] ||
         !CAPSourceEnabled(source) || [lastPlayedFEN isEqualToString:fen]) return NO;
@@ -290,7 +479,11 @@ static BOOL CAPAutoPlay(NSString *uci, NSString *fen, CAPMoveSource source) {
     int df = [uci characterAtIndex:2] - 'a', dr = [uci characterAtIndex:3] - '1';
     @try {
         UIView *board = CAPVisibleBoardForFEN(fen);
-        if (!board) { NSLog(@"[ChessAssistantPro] Auto-Play: no matching live board for FEN"); return NO; }
+        if (!board) {
+            if (!CAPSwiftBoardMove(uci, fen)) return NO;
+            lastPlayedFEN = [fen copy];
+            return YES;
+        }
         BOOL whiteToMove = [fen containsString:@" w "];
         SEL permission = whiteToMove ? @selector(allowUserToMakeWhiteMoves)
                                      : @selector(allowUserToMakeBlackMoves);
@@ -346,7 +539,8 @@ static void CAPScheduleAutoPlay(NSString *move, NSString *fen, CAPMoveSource sou
     dispatch_async(dispatch_get_main_queue(), ^{
         if (![[NSUserDefaults standardUserDefaults] boolForKey:kAutoPlayKey] ||
             !CAPSourceEnabled(source) || [lastPlayedFEN isEqualToString:fen] ||
-            [lastScheduledFEN isEqualToString:fen]) return;
+            [lastScheduledFEN isEqualToString:fen] ||
+            ![CAPPositionKey(fen) isEqualToString:lastObservedPosition]) return;
         lastScheduledFEN = [fen copy];
         uint64_t generation = ++autoPlayGeneration;
         double minimum = CAPDelay(kAutoPlayMinDelayKey, 1.0);
@@ -368,6 +562,7 @@ static void CAPMaiaGo(const char *fen, uintptr_t selfElo, uintptr_t oppoElo,
     size_t length = fen ? strnlen(fen, 256) : 0;
     NSString *position = length > 0 && length < 256 ?
         [[NSString alloc] initWithBytes:fen length:length encoding:NSUTF8StringEncoding] : nil;
+    CAPObservePosition(position);
     MaiaCallback forwarded = ^(MaiaResult result) {
         if (callback) callback(result);
         if (!position) return;
@@ -532,6 +727,7 @@ static void CAPEngineGo(const char *fen, uintptr_t arg1, uintptr_t arg2,
     size_t length = fen ? strnlen(fen, 256) : 0;
     NSString *position = length > 0 && length < 256 ?
         [[NSString alloc] initWithBytes:fen length:length encoding:NSUTF8StringEncoding] : nil;
+    CAPObservePosition(position);
     EngineCallback originalCallback = [callback copy];
     EngineCallback forwarded = [^(const EngineLine *lines, int count) {
         if (originalCallback) originalCallback(lines, count);
@@ -547,7 +743,11 @@ static void CAPEngineGo(const char *fen, uintptr_t arg1, uintptr_t arg2,
         originalEngineGo(fen, arg1, arg2, arg3, forwarded);
         return;
     }
-    BOOL useTriumviratus = [[NSUserDefaults standardUserDefaults] integerForKey:kGodEngineKey] == 1;
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    BOOL useTriumviratus = [defaults boolForKey:kAutoPlayKey] &&
+        CAPSelectedAutoEngine() != CAPAutoEngineMaia ?
+        CAPSelectedAutoEngine() == CAPAutoEngineTriumviratus :
+        [defaults integerForKey:kGodEngineKey] == 1;
     if (access(useTriumviratus ? kTriumviratusPath : kStockfish19Path, X_OK) != 0 &&
         access(kStockfish19Path, X_OK) != 0) {
         originalEngineGo(fen, arg1, arg2, arg3, forwarded);
@@ -598,7 +798,59 @@ static UIButton *CAPFindPauseButton(UIView *view) {
     return nil;
 }
 
-static char kAutoPlayRowKey, kDelayRowKey, kMinDelayFieldKey, kMaxDelayFieldKey;
+static char kAutoPlayRowKey, kAutoEngineRowKey, kDelayRowKey,
+            kMinDelayFieldKey, kMaxDelayFieldKey;
+static char kGodEngineRowKey;
+
+static UISwitch *CAPFindSwitch(UIView *view) {
+    if ([view isKindOfClass:UISwitch.class]) return (UISwitch *)view;
+    for (UIView *child in view.subviews) {
+        UISwitch *found = CAPFindSwitch(child);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static UILabel *CAPFindLabel(UIView *view, NSString *text) {
+    if ([view isKindOfClass:UILabel.class] &&
+        [((UILabel *)view).text isEqualToString:text]) return (UILabel *)view;
+    for (UIView *child in view.subviews) {
+        UILabel *found = CAPFindLabel(child, text);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static UISegmentedControl *CAPFindSegment(UIView *view) {
+    if ([view isKindOfClass:UISegmentedControl.class]) return (UISegmentedControl *)view;
+    for (UIView *child in view.subviews) {
+        UISegmentedControl *found = CAPFindSegment(child);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static void CAPSyncEngineChoiceUI(id panel) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    CAPAutoEngine selected = CAPSelectedAutoEngine();
+    [defaults setBool:selected == CAPAutoEngineMaia forKey:@"ChessAssist_UseMaia"];
+    if (selected != CAPAutoEngineMaia)
+        [defaults setInteger:selected == CAPAutoEngineTriumviratus ? 1 : 0 forKey:kGodEngineKey];
+    if (![panel isKindOfClass:UIView.class]) return;
+    UILabel *maia = CAPFindLabel(panel, @"Maia (human-like)");
+    UISwitch *switchView = maia ? CAPFindSwitch(maia.superview) : nil;
+    if (switchView && switchView.on != (selected == CAPAutoEngineMaia)) {
+        [switchView setOn:selected == CAPAutoEngineMaia animated:YES];
+        // Let the original mod refresh its engine after the selection changes.
+        [switchView sendActionsForControlEvents:UIControlEventValueChanged];
+    }
+    UIView *godRow = objc_getAssociatedObject(panel, &kGodEngineRowKey);
+    UISegmentedControl *god = godRow ? CAPFindSegment(godRow) : nil;
+    if (god) god.selectedSegmentIndex = selected == CAPAutoEngineTriumviratus ? 1 : 0;
+    UIView *autoRow = objc_getAssociatedObject(panel, &kAutoEngineRowKey);
+    UISegmentedControl *autoChoice = autoRow ? CAPFindSegment(autoRow) : nil;
+    if (autoChoice) autoChoice.selectedSegmentIndex = selected;
+}
 
 static NSString *CAPDelayText(double seconds) {
     NSMutableString *text = [[NSString stringWithFormat:@"%.6f", seconds] mutableCopy];
@@ -656,6 +908,21 @@ static void CAPInsertAutoPlay(id panel) {
         ![panel respondsToSelector:@selector(rowTitle:control:)]) return;
     NSUInteger index = [stack.arrangedSubviews indexOfObject:child];
     if (index == NSNotFound) return;
+    UIView *autoEngineRow = objc_getAssociatedObject(panel, &kAutoEngineRowKey);
+    if (![autoEngineRow isDescendantOfView:(UIView *)panel]) {
+        UISegmentedControl *choice = [[UISegmentedControl alloc]
+            initWithItems:@[@"Maia", @"SF 19", @"Trium"]];
+        choice.selectedSegmentIndex = CAPSelectedAutoEngine();
+        [choice addTarget:panel action:@selector(cap_autoEngineChanged:)
+             forControlEvents:UIControlEventValueChanged];
+        if ([panel respondsToSelector:@selector(styleSeg:)])
+            ((void (*)(id, SEL, id))objc_msgSend)(panel, @selector(styleSeg:), choice);
+        UIView *row = ((id (*)(id, SEL, id, id))objc_msgSend)
+            (panel, @selector(rowTitle:control:), @"Auto Engine", choice);
+        if (![row isKindOfClass:UIView.class]) return;
+        [stack insertArrangedSubview:row atIndex:index++];
+        objc_setAssociatedObject(panel, &kAutoEngineRowKey, row, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
     if (![existing isDescendantOfView:(UIView *)panel]) {
         UISwitch *toggle = ((id (*)(id, SEL, BOOL, SEL))objc_msgSend)
             (panel, @selector(switchOn:sel:),
@@ -688,7 +955,6 @@ static void CAPInsertAutoPlay(id panel) {
     }
 }
 
-static char kGodEngineRowKey;
 static void CAPInsertGodEngine(id panel) {
     if (![panel isKindOfClass:UIView.class]) return;
     UIView *existing = objc_getAssociatedObject(panel, &kGodEngineRowKey);
@@ -734,19 +1000,55 @@ static void CAPInsertGodEngine(id panel) {
     CAPInsertGodEngine(self);
     CAPInsertAutoPlay(self);
 }
+- (void)swMaia:(UISwitch *)sender {
+    %orig;
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:kAutoPlayKey]) {
+        CAPAutoEngine selected = sender.on ? CAPAutoEngineMaia :
+            ([[NSUserDefaults standardUserDefaults] integerForKey:kGodEngineKey] == 1 ?
+             CAPAutoEngineTriumviratus : CAPAutoEngineStockfish19);
+        [[NSUserDefaults standardUserDefaults] setInteger:selected forKey:kAutoEngineKey];
+        CAPSyncEngineChoiceUI(self);
+        ++autoPlayGeneration;
+        lastScheduledFEN = nil;
+        lastPlayedFEN = nil;
+    }
+}
 %new
 - (void)cap_godEngineChanged:(UISegmentedControl *)sender {
     [[NSUserDefaults standardUserDefaults] setInteger:(sender.selectedSegmentIndex == 1 ? 1 : 0)
                                                forKey:kGodEngineKey];
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:kAutoPlayKey]) {
+        [[NSUserDefaults standardUserDefaults] setInteger:
+            (sender.selectedSegmentIndex == 1 ? CAPAutoEngineTriumviratus : CAPAutoEngineStockfish19)
+                                              forKey:kAutoEngineKey];
+        CAPSyncEngineChoiceUI(self);
+    }
     ++autoPlayGeneration;
     lastScheduledFEN = nil;
+    lastPlayedFEN = nil;
+}
+%new
+- (void)cap_autoEngineChanged:(UISegmentedControl *)sender {
+    if (sender.selectedSegmentIndex < 0 || sender.selectedSegmentIndex > 2) return;
+    [[NSUserDefaults standardUserDefaults] setInteger:sender.selectedSegmentIndex forKey:kAutoEngineKey];
+    CAPSyncEngineChoiceUI(self);
+    ++autoPlayGeneration;
+    lastScheduledFEN = nil;
+    lastPlayedFEN = nil;
 }
 %new
 - (void)cap_autoPlayChanged:(UISwitch *)sender {
     [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:kAutoPlayKey];
-    if (!sender.on) {
-        ++autoPlayGeneration;
-        lastScheduledFEN = nil;
+    ++autoPlayGeneration;
+    lastScheduledFEN = nil;
+    lastPlayedFEN = nil;
+    if (sender.on) {
+        CAPSyncEngineChoiceUI(self);
+        // The bottom sheet covers the board and would consume synthetic taps.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if ([self respondsToSelector:@selector(closeTap)])
+                ((void (*)(id, SEL))objc_msgSend)(self, @selector(closeTap));
+        });
     }
 }
 %new
@@ -780,6 +1082,27 @@ static void CAPInsertGodEngine(id panel) {
 }
 %end
 
+// Only recolor shapes whose setter is called by the injected original
+// Chess.dylib. This keeps system, board, and bottom-sheet shape layers intact.
+typedef void (*CAPColorIMP)(CAShapeLayer *, SEL, CGColorRef);
+static CAPColorIMP originalStrokeColor = nullptr, originalFillColor = nullptr;
+static BOOL CAPOriginalArrowCaller(void *caller) {
+    Dl_info info = {};
+    return caller && dladdr(caller, &info) && info.dli_fname &&
+           strstr(info.dli_fname, "/Chess.dylib");
+}
+static CGColorRef CAPMidnightBlue(void) {
+    return [UIColor colorWithRed:25.0/255.0 green:25.0/255.0 blue:112.0/255.0 alpha:1].CGColor;
+}
+static void CAPSetStrokeColor(CAShapeLayer *layer, SEL selector, CGColorRef color) {
+    originalStrokeColor(layer, selector,
+        CAPOriginalArrowCaller(__builtin_return_address(0)) ? CAPMidnightBlue() : color);
+}
+static void CAPSetFillColor(CAShapeLayer *layer, SEL selector, CGColorRef color) {
+    originalFillColor(layer, selector,
+        CAPOriginalArrowCaller(__builtin_return_address(0)) ? CAPMidnightBlue() : color);
+}
+
 %ctor {
     @autoreleasepool {
         %init;
@@ -790,6 +1113,13 @@ static void CAPInsertGodEngine(id panel) {
         if (maia) MSHookFunction(maia, (void *)CAPMaiaGo, (void **)&originalMaiaGo);
         void *engine = dlsym(RTLD_DEFAULT, "EngineGo");
         if (engine) MSHookFunction(engine, (void *)CAPEngineGo, (void **)&originalEngineGo);
+        Class shape = objc_getClass("CAShapeLayer");
+        if (shape) {
+            MSHookMessageEx(shape, @selector(setStrokeColor:), (IMP)CAPSetStrokeColor,
+                            (IMP *)&originalStrokeColor);
+            MSHookMessageEx(shape, @selector(setFillColor:), (IMP)CAPSetFillColor,
+                            (IMP *)&originalFillColor);
+        }
         NSLog(@"[ChessAssistantPro] Maia=%p Engine=%p", maia, engine);
     }
 }

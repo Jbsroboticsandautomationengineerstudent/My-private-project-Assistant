@@ -9,6 +9,7 @@
 #include <onnxruntime_c_api.h>
 #include <stdint.h>
 #include <string.h>
+#include <ctype.h>
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
@@ -16,6 +17,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <math.h>
 #include <atomic>
 #include <string>
 
@@ -23,6 +25,8 @@ extern char **environ;
 
 static NSString *const kModelPath = @"/var/jb/Library/Application Support/ChessAssistantPro/maia3_79m_int32.onnx";
 static NSString *const kAutoPlayKey = @"ChessAssistantPro_AutoPlay";
+static NSString *const kAutoPlayMinDelayKey = @"ChessAssistantPro_AutoPlayMinDelay";
+static NSString *const kAutoPlayMaxDelayKey = @"ChessAssistantPro_AutoPlayMaxDelay";
 static NSString *const kGodEngineKey = @"godEngineChoice";
 static const char *kStockfish19Path = "/var/jb/usr/bin/stockfish19";
 static const char *kTriumviratusPath = "/var/jb/usr/bin/triumviratus";
@@ -181,8 +185,14 @@ static_assert(sizeof(MaiaResult) == 96, "Maia callback ABI changed");
 typedef void (^MaiaCallback)(MaiaResult);
 typedef void (*MaiaGoFn)(const char *, uintptr_t, uintptr_t, MaiaCallback);
 static MaiaGoFn originalMaiaGo = nullptr;
-static NSString *lastRequestedFEN = nil;
+static NSString *lastScheduledFEN = nil;
 static NSString *lastPlayedFEN = nil;
+static uint64_t autoPlayGeneration = 0; // Main queue only.
+
+typedef NS_ENUM(NSInteger, CAPMoveSource) {
+    CAPMoveSourceMaia,
+    CAPMoveSourceGod
+};
 
 static NSString *CAPNormalizeMove(NSString *move) {
     if (!move) return nil;
@@ -195,72 +205,153 @@ static NSString *CAPNormalizeMove(NSString *move) {
     return normalized.lowercaseString;
 }
 
-static UIView *CAPFindBoard(UIView *view) {
+// Compare the pieces and side to move. FEN counters and en-passant formatting
+// can differ between the assistant and the host board for the same position.
+static NSString *CAPPositionKey(NSString *fen) {
+    if (!fen.length) return nil;
+    NSArray<NSString *> *parts = [fen componentsSeparatedByCharactersInSet:
+        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSMutableArray<NSString *> *fields = [NSMutableArray arrayWithCapacity:2];
+    for (NSString *part in parts) {
+        if (part.length && fields.count < 2) [fields addObject:part];
+    }
+    return fields.count == 2 ? [fields componentsJoinedByString:@" "] : nil;
+}
+
+static BOOL CAPSourceEnabled(CAPMoveSource source) {
+    BOOL maiaSelected = [[NSUserDefaults standardUserDefaults] boolForKey:@"ChessAssist_UseMaia"];
+    return source == CAPMoveSourceMaia ? maiaSelected : !maiaSelected;
+}
+
+static double CAPDelay(NSString *key, double fallback) {
+    id stored = [[NSUserDefaults standardUserDefaults] objectForKey:key];
+    double value = stored ? [stored doubleValue] : fallback;
+    return isfinite(value) ? fmin(3.0, fmax(0.000001, value)) : fallback;
+}
+
+static BOOL CAPBoardMatchesPosition(id board, id game, NSString *positionKey) {
+    SEL selector = @selector(fenForCurrentPosition:flipped:);
+    for (id source in @[game, board]) {
+        if (![source respondsToSelector:selector]) continue;
+        id value = ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)(source, selector, YES, NO);
+        if ([value isKindOfClass:NSString.class] &&
+            [CAPPositionKey(value) isEqualToString:positionKey]) return YES;
+    }
+    return NO;
+}
+
+static UIView *CAPFindMatchingBoard(UIView *view, NSString *positionKey) {
+    if (view.hidden || view.alpha < 0.05) return nil;
     Class boardClass = NSClassFromString(@"CHBoardView");
-    if (boardClass && [view isKindOfClass:boardClass] && !view.hidden) return view;
+    Class analysisClass = NSClassFromString(@"CHAnalysisBoardView");
+    if (boardClass && [view isKindOfClass:boardClass] &&
+        !(analysisClass && [view isKindOfClass:analysisClass]) &&
+        view.window && CGRectIntersectsRect([view convertRect:view.bounds toView:view.window],
+                                            view.window.bounds) &&
+        [view respondsToSelector:@selector(chessGame)] &&
+        [view respondsToSelector:@selector(makeMove:throughTouches:)]) {
+        id game = ((id (*)(id, SEL))objc_msgSend)(view, @selector(chessGame));
+        if (game && CAPBoardMatchesPosition(view, game, positionKey))
+            return view;
+    }
     for (UIView *child in view.subviews) {
-        UIView *found = CAPFindBoard(child);
+        UIView *found = CAPFindMatchingBoard(child, positionKey);
         if (found) return found;
     }
     return nil;
 }
 
-static UIView *CAPVisibleBoard(void) {
+static UIView *CAPVisibleBoardForFEN(NSString *fen) {
+    NSString *key = CAPPositionKey(fen);
+    if (!key) return nil;
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if (![scene isKindOfClass:UIWindowScene.class]) continue;
+        if (![scene isKindOfClass:UIWindowScene.class] ||
+            scene.activationState != UISceneActivationStateForegroundActive) continue;
         for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-            UIView *found = CAPFindBoard(window);
-            if (found) return found;
+            UIView *board = CAPFindMatchingBoard(window, key);
+            if (board) return board;
         }
     }
     return nil;
 }
 
-static void CAPAutoPlay(NSString *move, NSString *fen) {
+static BOOL CAPAutoPlay(NSString *uci, NSString *fen, CAPMoveSource source) {
     if (![[NSUserDefaults standardUserDefaults] boolForKey:kAutoPlayKey] ||
-        !fen.length || ![lastRequestedFEN isEqualToString:fen] ||
-        [lastPlayedFEN isEqualToString:fen]) return;
-    NSString *uci = CAPNormalizeMove(move);
-    if (uci.length != 4 && uci.length != 5) return;
+        !CAPSourceEnabled(source) || [lastPlayedFEN isEqualToString:fen]) return NO;
     int sf = [uci characterAtIndex:0] - 'a', sr = [uci characterAtIndex:1] - '1';
     int df = [uci characterAtIndex:2] - 'a', dr = [uci characterAtIndex:3] - '1';
-    if (sf < 0 || sf > 7 || sr < 0 || sr > 7 ||
-        df < 0 || df > 7 || dr < 0 || dr > 7) return;
     @try {
-        UIView *board = CAPVisibleBoard();
-        if (!board || ![board respondsToSelector:@selector(makeMove:throughTouches:)] ||
-            ![board respondsToSelector:@selector(chessGame)]) return;
+        UIView *board = CAPVisibleBoardForFEN(fen);
+        if (!board) { NSLog(@"[ChessAssistantPro] Auto-Play: no matching live board for FEN"); return NO; }
         BOOL whiteToMove = [fen containsString:@" w "];
         SEL permission = whiteToMove ? @selector(allowUserToMakeWhiteMoves)
                                      : @selector(allowUserToMakeBlackMoves);
-        if ([board respondsToSelector:permission] &&
-            !((BOOL (*)(id, SEL))objc_msgSend)(board, permission)) return;
+        if (![board respondsToSelector:permission] ||
+            !((BOOL (*)(id, SEL))objc_msgSend)(board, permission)) {
+            NSLog(@"[ChessAssistantPro] Auto-Play: player cannot move on this board");
+            return NO;
+        }
         id game = ((id (*)(id, SEL))objc_msgSend)(board, @selector(chessGame));
         SEL validMove = @selector(isValidMoveFromSourceRank:SourceFile:DestRank:DestFile:);
-        Class moveClass = NSClassFromString(@"CHMoveSourceDestination");
         SEL initializer = @selector(initSR:SF:DR:DF:PP:);
-        if (!game || ![game respondsToSelector:validMove] ||
-            !moveClass || ![moveClass instancesRespondToSelector:initializer]) return;
-        char promotion = uci.length == 5 ? (char)[uci characterAtIndex:4] : 0;
-        for (int base = 0; base <= 1; ++base) {
-            char sourceRank = (char)(sr + base), sourceFile = (char)(sf + base);
-            char destRank = (char)(dr + base), destFile = (char)(df + base);
-            id candidate = ((id (*)(id, SEL, char, char, char, char, char))objc_msgSend)
-                ([moveClass alloc], initializer, sourceRank, sourceFile, destRank, destFile, promotion);
-            if (![candidate respondsToSelector:@selector(lanMove)]) continue;
-            NSString *lan = ((id (*)(id, SEL))objc_msgSend)(candidate, @selector(lanMove));
-            if (![[CAPNormalizeMove(lan) lowercaseString] isEqualToString:uci]) continue;
-            BOOL legal = ((BOOL (*)(id, SEL, char, char, char, char))objc_msgSend)
-                (game, validMove, sourceRank, sourceFile, destRank, destFile);
-            if (!legal) return;
-            ((void (*)(id, SEL, id, BOOL))objc_msgSend)
-                (board, @selector(makeMove:throughTouches:), candidate, YES);
-            lastPlayedFEN = [fen copy];
-            return;
+        Class moveClass = NSClassFromString(@"CHMoveSourceDestination");
+        if (!game || ![game respondsToSelector:validMove] || !moveClass ||
+            ![moveClass instancesRespondToSelector:initializer]) return NO;
+        // CHMoveSourceDestination's lanMove implementation adds 'a'/'1' to its
+        // stored file/rank, proving this app uses zero-based square values.
+        char sourceRank = (char)sr, sourceFile = (char)sf;
+        char destRank = (char)dr, destFile = (char)df;
+        char promotion = uci.length == 5 ? (char)[uci characterAtIndex:4] : -1;
+        if (promotion != -1 && whiteToMove) promotion = (char)toupper(promotion);
+        id candidate = ((id (*)(id, SEL, char, char, char, char, char))objc_msgSend)
+            ([moveClass alloc], initializer, sourceRank, sourceFile, destRank, destFile, promotion);
+        if (!candidate || ![candidate respondsToSelector:@selector(lanMove)] ||
+            ![CAPNormalizeMove(((id (*)(id, SEL))objc_msgSend)(candidate, @selector(lanMove)))
+                isEqualToString:uci]) {
+            NSLog(@"[ChessAssistantPro] Auto-Play: move encoding mismatch for %@", uci);
+            return NO;
         }
+        if (!((BOOL (*)(id, SEL, char, char, char, char))objc_msgSend)
+              (game, validMove, sourceRank, sourceFile, destRank, destFile)) {
+            NSLog(@"[ChessAssistantPro] Auto-Play: %@ is not legal in live board", uci);
+            return NO;
+        }
+        ((void (*)(id, SEL, id, BOOL))objc_msgSend)
+            (board, @selector(makeMove:throughTouches:), candidate, YES);
+        lastPlayedFEN = [fen copy];
+        NSLog(@"[ChessAssistantPro] Auto-Play submitted %@", uci);
+        return YES;
     } @catch (NSException *exception) {
         NSLog(@"[ChessAssistantPro] Auto-Play skipped: %@", exception);
     }
+    return NO;
+}
+
+static void CAPScheduleAutoPlay(NSString *move, NSString *fen, CAPMoveSource source) {
+    NSString *uci = CAPNormalizeMove(move);
+    if (!fen.length || (uci.length != 4 && uci.length != 5)) return;
+    if ([uci characterAtIndex:0] < 'a' || [uci characterAtIndex:0] > 'h' ||
+        [uci characterAtIndex:2] < 'a' || [uci characterAtIndex:2] > 'h' ||
+        [uci characterAtIndex:1] < '1' || [uci characterAtIndex:1] > '8' ||
+        [uci characterAtIndex:3] < '1' || [uci characterAtIndex:3] > '8' ||
+        (uci.length == 5 && [@"qrbn" rangeOfString:[uci substringFromIndex:4]].location == NSNotFound)) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (![[NSUserDefaults standardUserDefaults] boolForKey:kAutoPlayKey] ||
+            !CAPSourceEnabled(source) || [lastPlayedFEN isEqualToString:fen] ||
+            [lastScheduledFEN isEqualToString:fen]) return;
+        lastScheduledFEN = [fen copy];
+        uint64_t generation = ++autoPlayGeneration;
+        double minimum = CAPDelay(kAutoPlayMinDelayKey, 1.0);
+        double maximum = fmax(minimum, CAPDelay(kAutoPlayMaxDelayKey, 3.0));
+        double fraction = (double)arc4random() / (double)UINT32_MAX;
+        double delay = minimum + fraction * (maximum - minimum);
+        NSLog(@"[ChessAssistantPro] Auto-Play queued %@ in %.3f s", uci, delay);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (generation != autoPlayGeneration) return;
+            if (!CAPAutoPlay(uci, fen, source)) lastScheduledFEN = nil;
+        });
+    });
 }
 
 static void CAPMaiaGo(const char *fen, uintptr_t selfElo, uintptr_t oppoElo,
@@ -269,22 +360,15 @@ static void CAPMaiaGo(const char *fen, uintptr_t selfElo, uintptr_t oppoElo,
     size_t length = fen ? strnlen(fen, 256) : 0;
     NSString *position = length > 0 && length < 256 ?
         [[NSString alloc] initWithBytes:fen length:length encoding:NSUTF8StringEncoding] : nil;
-    if (position) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (![lastRequestedFEN isEqualToString:position]) lastPlayedFEN = nil;
-            lastRequestedFEN = [position copy];
-        });
-    }
     MaiaCallback forwarded = ^(MaiaResult result) {
-        if (position && [[NSUserDefaults standardUserDefaults] boolForKey:kAutoPlayKey]) {
-            size_t moveLength = strnlen(result.move, sizeof(result.move));
-            if (moveLength >= 4 && moveLength <= 5) {
-                NSString *move = [[NSString alloc] initWithBytes:result.move length:moveLength
-                                                        encoding:NSASCIIStringEncoding];
-                dispatch_async(dispatch_get_main_queue(), ^{ CAPAutoPlay(move, position); });
-            }
-        }
         if (callback) callback(result);
+        if (!position) return;
+        size_t moveLength = strnlen(result.move, sizeof(result.move));
+        if (moveLength >= 4 && moveLength <= 5) {
+            NSString *move = [[NSString alloc] initWithBytes:result.move length:moveLength
+                                                    encoding:NSASCIIStringEncoding];
+            CAPScheduleAutoPlay(move, position, CAPMoveSourceMaia);
+        }
     };
     originalMaiaGo(fen, selfElo, oppoElo, [forwarded copy]);
 }
@@ -438,19 +522,30 @@ static void CAPEngineGo(const char *fen, uintptr_t arg1, uintptr_t arg2,
     if (!originalEngineGo) return;
     uint64_t request = engineGeneration.fetch_add(1) + 1;
     size_t length = fen ? strnlen(fen, 256) : 0;
+    NSString *position = length > 0 && length < 256 ?
+        [[NSString alloc] initWithBytes:fen length:length encoding:NSUTF8StringEncoding] : nil;
+    EngineCallback originalCallback = [callback copy];
+    EngineCallback forwarded = [^(const EngineLine *lines, int count) {
+        if (originalCallback) originalCallback(lines, count);
+        if (!position || !lines || count <= 0) return;
+        size_t moveLength = strnlen(lines[0].move, sizeof(lines[0].move));
+        if (moveLength >= 4 && moveLength <= 5) {
+            NSString *move = [[NSString alloc] initWithBytes:lines[0].move length:moveLength
+                                                    encoding:NSASCIIStringEncoding];
+            CAPScheduleAutoPlay(move, position, CAPMoveSourceGod);
+        }
+    } copy];
     if (length == 0 || length >= 256 || strpbrk(fen, "\r\n")) {
-        originalEngineGo(fen, arg1, arg2, arg3, callback);
+        originalEngineGo(fen, arg1, arg2, arg3, forwarded);
         return;
     }
     BOOL useTriumviratus = [[NSUserDefaults standardUserDefaults] integerForKey:kGodEngineKey] == 1;
     if (access(useTriumviratus ? kTriumviratusPath : kStockfish19Path, X_OK) != 0 &&
         access(kStockfish19Path, X_OK) != 0) {
-        originalEngineGo(fen, arg1, arg2, arg3, callback);
+        originalEngineGo(fen, arg1, arg2, arg3, forwarded);
         return;
     }
-    NSString *position = [[NSString alloc] initWithBytes:fen length:length encoding:NSUTF8StringEncoding];
-    if (!position) { originalEngineGo(fen, arg1, arg2, arg3, callback); return; }
-    EngineCallback copied = [callback copy];
+    if (!position) { originalEngineGo(fen, arg1, arg2, arg3, forwarded); return; }
     static dispatch_queue_t queue;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ queue = dispatch_queue_create("com.jerich.chessassistantpro.godengine", DISPATCH_QUEUE_SERIAL); });
@@ -470,12 +565,12 @@ static void CAPEngineGo(const char *fen, uintptr_t arg1, uintptr_t arg2,
             if (engineGeneration.load() != request) return;
             if (!found) {
                 NSLog(@"[ChessAssistantPro] External engine unavailable; using embedded Stockfish 16");
-                originalEngineGo(position.UTF8String, arg1, arg2, arg3, copied);
+                originalEngineGo(position.UTF8String, arg1, arg2, arg3, forwarded);
                 return;
             }
             EngineLine result = {};
             strlcpy(result.move, move.c_str(), sizeof(result.move));
-            if (copied) copied(&result, 1);
+            forwarded(&result, 1);
         });
     });
 }
@@ -494,11 +589,47 @@ static UIButton *CAPFindPauseButton(UIView *view) {
     return nil;
 }
 
-static char kAutoPlayRowKey;
+static char kAutoPlayRowKey, kDelayRowKey, kMinDelayFieldKey, kMaxDelayFieldKey;
+
+static NSString *CAPDelayText(double seconds) {
+    NSMutableString *text = [[NSString stringWithFormat:@"%.6f", seconds] mutableCopy];
+    while ([text hasSuffix:@"0"]) [text deleteCharactersInRange:NSMakeRange(text.length - 1, 1)];
+    if ([text hasSuffix:@"."]) [text deleteCharactersInRange:NSMakeRange(text.length - 1, 1)];
+    return text;
+}
+
+static UITextField *CAPDelayField(id panel, NSString *placeholder, double value, NSInteger tag) {
+    UITextField *field = [[UITextField alloc] initWithFrame:CGRectZero];
+    field.tag = tag;
+    field.text = CAPDelayText(value);
+    field.placeholder = placeholder;
+    field.keyboardType = UIKeyboardTypeDecimalPad;
+    field.textAlignment = NSTextAlignmentCenter;
+    field.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightMedium];
+    field.textColor = UIColor.labelColor;
+    field.backgroundColor = UIColor.tertiarySystemFillColor;
+    field.layer.cornerRadius = 7;
+    [field.widthAnchor constraintEqualToConstant:64].active = YES;
+    [field.heightAnchor constraintEqualToConstant:32].active = YES;
+    [field addTarget:panel action:@selector(cap_delayChanged:)
+        forControlEvents:UIControlEventEditingDidEnd];
+    UIToolbar *toolbar = [[UIToolbar alloc] initWithFrame:CGRectMake(0, 0, 320, 44)];
+    UIBarButtonItem *space = [[UIBarButtonItem alloc]
+        initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil];
+    UIBarButtonItem *done = [[UIBarButtonItem alloc]
+        initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+        target:panel action:@selector(cap_delayDone:)];
+    toolbar.items = @[space, done];
+    field.inputAccessoryView = toolbar;
+    return field;
+}
+
 static void CAPInsertAutoPlay(id panel) {
     if (![panel isKindOfClass:UIView.class]) return;
     UIView *existing = objc_getAssociatedObject(panel, &kAutoPlayRowKey);
-    if ([existing isDescendantOfView:(UIView *)panel]) return;
+    UIView *delayRow = objc_getAssociatedObject(panel, &kDelayRowKey);
+    if ([existing isDescendantOfView:(UIView *)panel] &&
+        [delayRow isDescendantOfView:(UIView *)panel]) return;
     UIButton *pause = CAPFindPauseButton((UIView *)panel);
     if (!pause) return;
     UIView *child = pause;
@@ -514,17 +645,38 @@ static void CAPInsertAutoPlay(id panel) {
     }
     if (!stack || ![panel respondsToSelector:@selector(switchOn:sel:)] ||
         ![panel respondsToSelector:@selector(rowTitle:control:)]) return;
-    UISwitch *toggle = ((id (*)(id, SEL, BOOL, SEL))objc_msgSend)
-        (panel, @selector(switchOn:sel:),
-         [[NSUserDefaults standardUserDefaults] boolForKey:kAutoPlayKey],
-         @selector(cap_autoPlayChanged:));
-    UIView *row = ((id (*)(id, SEL, id, id))objc_msgSend)
-        (panel, @selector(rowTitle:control:), @"Auto-Play", toggle);
-    if (![row isKindOfClass:UIView.class]) return;
     NSUInteger index = [stack.arrangedSubviews indexOfObject:child];
     if (index == NSNotFound) return;
-    [stack insertArrangedSubview:row atIndex:index];
-    objc_setAssociatedObject(panel, &kAutoPlayRowKey, row, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (![existing isDescendantOfView:(UIView *)panel]) {
+        UISwitch *toggle = ((id (*)(id, SEL, BOOL, SEL))objc_msgSend)
+            (panel, @selector(switchOn:sel:),
+             [[NSUserDefaults standardUserDefaults] boolForKey:kAutoPlayKey],
+             @selector(cap_autoPlayChanged:));
+        UIView *row = ((id (*)(id, SEL, id, id))objc_msgSend)
+            (panel, @selector(rowTitle:control:), @"Auto-Play", toggle);
+        if (![row isKindOfClass:UIView.class]) return;
+        [stack insertArrangedSubview:row atIndex:index++];
+        objc_setAssociatedObject(panel, &kAutoPlayRowKey, row, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (![delayRow isDescendantOfView:(UIView *)panel]) {
+        UITextField *minimum = CAPDelayField(panel, @"Min", CAPDelay(kAutoPlayMinDelayKey, 1.0), 1);
+        UITextField *maximum = CAPDelayField(panel, @"Max", CAPDelay(kAutoPlayMaxDelayKey, 3.0), 2);
+        UILabel *separator = [[UILabel alloc] initWithFrame:CGRectZero];
+        separator.text = @"–";
+        separator.textColor = UIColor.secondaryLabelColor;
+        UIStackView *range = [[UIStackView alloc]
+            initWithArrangedSubviews:@[minimum, separator, maximum]];
+        range.axis = UILayoutConstraintAxisHorizontal;
+        range.alignment = UIStackViewAlignmentCenter;
+        range.spacing = 5;
+        UIView *row = ((id (*)(id, SEL, id, id))objc_msgSend)
+            (panel, @selector(rowTitle:control:), @"Delay (s)", range);
+        if (![row isKindOfClass:UIView.class]) return;
+        [stack insertArrangedSubview:row atIndex:index];
+        objc_setAssociatedObject(panel, &kDelayRowKey, row, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(panel, &kMinDelayFieldKey, minimum, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(panel, &kMaxDelayFieldKey, maximum, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
 }
 
 static char kGodEngineRowKey;
@@ -563,6 +715,11 @@ static void CAPInsertGodEngine(id panel) {
 }
 
 %hook CHSettingsPanel
+- (void)build {
+    %orig;
+    CAPInsertGodEngine(self);
+    CAPInsertAutoPlay(self);
+}
 - (void)populate {
     %orig;
     CAPInsertGodEngine(self);
@@ -572,10 +729,45 @@ static void CAPInsertGodEngine(id panel) {
 - (void)cap_godEngineChanged:(UISegmentedControl *)sender {
     [[NSUserDefaults standardUserDefaults] setInteger:(sender.selectedSegmentIndex == 1 ? 1 : 0)
                                                forKey:kGodEngineKey];
+    ++autoPlayGeneration;
+    lastScheduledFEN = nil;
 }
 %new
 - (void)cap_autoPlayChanged:(UISwitch *)sender {
     [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:kAutoPlayKey];
+    if (!sender.on) {
+        ++autoPlayGeneration;
+        lastScheduledFEN = nil;
+    }
+}
+%new
+- (void)cap_delayDone:(id)sender {
+    [self endEditing:YES];
+}
+%new
+- (void)cap_delayChanged:(UITextField *)sender {
+    NSString *raw = [sender.text stringByReplacingOccurrencesOfString:@"," withString:@"."];
+    NSScanner *scanner = [NSScanner scannerWithString:raw ?: @""];
+    scanner.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    double value = 0;
+    if (![scanner scanDouble:&value] || !scanner.isAtEnd || !isfinite(value)) {
+        sender.text = CAPDelayText(CAPDelay(sender.tag == 1 ? kAutoPlayMinDelayKey :
+                                           kAutoPlayMaxDelayKey, sender.tag == 1 ? 1.0 : 3.0));
+        return;
+    }
+    value = fmin(3.0, fmax(0.000001, value));
+    UITextField *minimum = objc_getAssociatedObject(self, &kMinDelayFieldKey);
+    UITextField *maximum = objc_getAssociatedObject(self, &kMaxDelayFieldKey);
+    double low = sender.tag == 1 ? value : CAPDelay(kAutoPlayMinDelayKey, 1.0);
+    double high = sender.tag == 2 ? value : CAPDelay(kAutoPlayMaxDelayKey, 3.0);
+    if (low > high) {
+        if (sender.tag == 1) high = low;
+        else low = high;
+    }
+    [[NSUserDefaults standardUserDefaults] setDouble:low forKey:kAutoPlayMinDelayKey];
+    [[NSUserDefaults standardUserDefaults] setDouble:high forKey:kAutoPlayMaxDelayKey];
+    minimum.text = CAPDelayText(low);
+    maximum.text = CAPDelayText(high);
 }
 %end
 

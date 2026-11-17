@@ -204,6 +204,9 @@ typedef NS_ENUM(NSInteger, CAPAutoEngine) {
 };
 
 static NSString *lastObservedPosition = nil; // Main queue only.
+static NSString *cachedMaiaMove = nil, *cachedMaiaFEN = nil;
+static NSString *cachedGodMove = nil, *cachedGodFEN = nil;
+static NSInteger cachedGodChoice = -1;
 static NSString *CAPPositionKey(NSString *fen);
 
 static CAPAutoEngine CAPSelectedAutoEngine(void) {
@@ -225,6 +228,9 @@ static void CAPObservePosition(NSString *fen) {
             lastObservedPosition = [key copy];
             ++autoPlayGeneration;
             lastScheduledFEN = nil;
+            cachedMaiaMove = cachedMaiaFEN = nil;
+            cachedGodMove = cachedGodFEN = nil;
+            cachedGodChoice = -1;
         }
     });
 }
@@ -374,6 +380,8 @@ static NSString *CAPFenFromObject(id object) {
                             @"fenString", @"boardFEN", @"positionFEN", @"gameFEN"]) {
         SEL selector = NSSelectorFromString(name);
         if (![object respondsToSelector:selector]) continue;
+        NSMethodSignature *signature = [object methodSignatureForSelector:selector];
+        if (!signature || signature.methodReturnType[0] != '@') continue;
         @try {
             id value = ((id (*)(id, SEL))objc_msgSend)(object, selector);
             if ([value isKindOfClass:NSString.class] && CAPPositionKey(value)) return value;
@@ -382,25 +390,33 @@ static NSString *CAPFenFromObject(id object) {
     return nil;
 }
 
-static BOOL CAPSwiftBoardMatchesPosition(UIView *board, NSString *fen) {
-    NSString *expected = CAPPositionKey(fen);
-    if (!expected || ![lastObservedPosition isEqualToString:expected]) return NO;
+static NSString *CAPCurrentBoardPosition(UIView *board) {
     for (UIResponder *item = board; item; item = item.nextResponder) {
         NSString *current = CAPFenFromObject(item);
-        if (current) return [CAPPositionKey(current) isEqualToString:expected];
+        if (current) return CAPPositionKey(current);
         if ([item isKindOfClass:UIView.class]) {
             UIView *view = (UIView *)item;
             for (NSString *name in @[@"chessBoardModel", @"boardModel", @"boardOwner", @"game"]) {
                 SEL selector = NSSelectorFromString(name);
                 if (![view respondsToSelector:selector]) continue;
+                NSMethodSignature *signature = [view methodSignatureForSelector:selector];
+                if (!signature || signature.methodReturnType[0] != '@') continue;
                 @try {
                     id model = ((id (*)(id, SEL))objc_msgSend)(view, selector);
                     current = CAPFenFromObject(model);
-                    if (current) return [CAPPositionKey(current) isEqualToString:expected];
+                    if (current) return CAPPositionKey(current);
                 } @catch (NSException *exception) {}
             }
         }
     }
+    return nil;
+}
+
+static BOOL CAPSwiftBoardMatchesPosition(UIView *board, NSString *fen) {
+    NSString *expected = CAPPositionKey(fen);
+    if (!expected || ![lastObservedPosition isEqualToString:expected]) return NO;
+    NSString *current = CAPCurrentBoardPosition(board);
+    if (current) return [current isEqualToString:expected];
     // The original mod may have obtained FEN through a native Swift hook
     // whose method is not exposed to Objective-C. In that case the newest
     // engine request plus a single visible board are our freshness checks.
@@ -411,7 +427,10 @@ static BOOL CAPBoardIsFlipped(UIView *board, NSString *fen) {
     for (UIResponder *item = board; item; item = item.nextResponder) {
         for (NSString *name in @[@"isFlipped", @"boardFlipped", @"flipped"]) {
             SEL selector = NSSelectorFromString(name);
-            if ([item respondsToSelector:selector])
+            NSMethodSignature *signature = [item respondsToSelector:selector] ?
+                [item methodSignatureForSelector:selector] : nil;
+            if (signature && (signature.methodReturnType[0] == 'B' ||
+                              signature.methodReturnType[0] == 'c'))
                 return ((BOOL (*)(id, SEL))objc_msgSend)(item, selector);
         }
     }
@@ -437,8 +456,13 @@ static void CAPTouchTap(CGPoint point, dispatch_block_t completion) {
 
 static BOOL CAPSwiftBoardMove(NSString *uci, NSString *fen) {
     UIView *board = CAPVisibleSwiftBoard();
-    if (!board || !CAPSwiftBoardMatchesPosition(board, fen) || !touchSimulatorAvailable()) {
+    if (!board || !CAPSwiftBoardMatchesPosition(board, fen)) {
         NSLog(@"[ChessAssistantPro] Auto-Play: Swift board, FEN, or touch backend unavailable");
+        return NO;
+    }
+    touchSimulatorSetTargetWindow(board.window);
+    if (!touchSimulatorAvailable()) {
+        NSLog(@"[ChessAssistantPro] Auto-Play: private touch API unavailable");
         return NO;
     }
     if (uci.length == 5) {
@@ -459,14 +483,24 @@ static BOOL CAPSwiftBoardMove(NSString *uci, NSString *fen) {
             return NO;
         }
     }
-    touchSimulatorSetTargetWindow(window);
     NSLog(@"[ChessAssistantPro] Auto-Play: tapping %@ from %@ to %@", uci,
           NSStringFromCGPoint(from), NSStringFromCGPoint(to));
     CAPTouchTap(from, ^{
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
             if (!CAPSwiftBoardMatchesPosition(board, fen) || !board.window) return;
-            CAPTouchTap(to, nil);
+            for (UIWindow *candidate in ((UIWindowScene *)board.window.windowScene).windows)
+                if (CAPVisibleSettingsPanel(candidate)) return;
+            CAPTouchTap(to, ^{
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 650 * NSEC_PER_MSEC),
+                               dispatch_get_main_queue(), ^{
+                    NSString *after = CAPCurrentBoardPosition(board);
+                    if (!after) NSLog(@"[ChessAssistantPro] Auto-Play: touches sent; board FEN unavailable for confirmation");
+                    else if ([after isEqualToString:CAPPositionKey(fen)])
+                        NSLog(@"[ChessAssistantPro] Auto-Play: board FEN unchanged after %@", uci);
+                    else NSLog(@"[ChessAssistantPro] Auto-Play: board FEN advanced after %@", uci);
+                });
+            });
         });
     });
     return YES;
@@ -556,6 +590,29 @@ static void CAPScheduleAutoPlay(NSString *move, NSString *fen, CAPMoveSource sou
     });
 }
 
+static void CAPScheduleCachedMove(void) {
+    if (![[NSUserDefaults standardUserDefaults] boolForKey:kAutoPlayKey]) return;
+    CAPAutoEngine selected = CAPSelectedAutoEngine();
+    if (selected == CAPAutoEngineMaia)
+        CAPScheduleAutoPlay(cachedMaiaMove, cachedMaiaFEN, CAPMoveSourceMaia);
+    else if (cachedGodChoice == (selected == CAPAutoEngineTriumviratus ? 1 : 0))
+        CAPScheduleAutoPlay(cachedGodMove, cachedGodFEN, CAPMoveSourceGod);
+}
+
+static void CAPRememberMove(NSString *move, NSString *fen, CAPMoveSource source) {
+    if (!move.length || !fen.length) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (![CAPPositionKey(fen) isEqualToString:lastObservedPosition]) return;
+        if (source == CAPMoveSourceMaia) {
+            cachedMaiaMove = [move copy]; cachedMaiaFEN = [fen copy];
+        } else {
+            cachedGodMove = [move copy]; cachedGodFEN = [fen copy];
+            cachedGodChoice = [[NSUserDefaults standardUserDefaults] integerForKey:kGodEngineKey] == 1 ? 1 : 0;
+        }
+        CAPScheduleAutoPlay(move, fen, source);
+    });
+}
+
 static void CAPMaiaGo(const char *fen, uintptr_t selfElo, uintptr_t oppoElo,
                       MaiaCallback callback) {
     if (!originalMaiaGo) return;
@@ -570,7 +627,7 @@ static void CAPMaiaGo(const char *fen, uintptr_t selfElo, uintptr_t oppoElo,
         if (moveLength >= 4 && moveLength <= 5) {
             NSString *move = [[NSString alloc] initWithBytes:result.move length:moveLength
                                                     encoding:NSASCIIStringEncoding];
-            CAPScheduleAutoPlay(move, position, CAPMoveSourceMaia);
+            CAPRememberMove(move, position, CAPMoveSourceMaia);
         }
     };
     originalMaiaGo(fen, selfElo, oppoElo, [forwarded copy]);
@@ -736,7 +793,7 @@ static void CAPEngineGo(const char *fen, uintptr_t arg1, uintptr_t arg2,
         if (moveLength >= 4 && moveLength <= 5) {
             NSString *move = [[NSString alloc] initWithBytes:lines[0].move length:moveLength
                                                     encoding:NSASCIIStringEncoding];
-            CAPScheduleAutoPlay(move, position, CAPMoveSourceGod);
+            CAPRememberMove(move, position, CAPMoveSourceGod);
         }
     } copy];
     if (length == 0 || length >= 256 || strpbrk(fen, "\r\n")) {
@@ -1011,6 +1068,7 @@ static void CAPInsertGodEngine(id panel) {
         ++autoPlayGeneration;
         lastScheduledFEN = nil;
         lastPlayedFEN = nil;
+        CAPScheduleCachedMove();
     }
 }
 %new
@@ -1026,6 +1084,7 @@ static void CAPInsertGodEngine(id panel) {
     ++autoPlayGeneration;
     lastScheduledFEN = nil;
     lastPlayedFEN = nil;
+    CAPScheduleCachedMove();
 }
 %new
 - (void)cap_autoEngineChanged:(UISegmentedControl *)sender {
@@ -1035,6 +1094,7 @@ static void CAPInsertGodEngine(id panel) {
     ++autoPlayGeneration;
     lastScheduledFEN = nil;
     lastPlayedFEN = nil;
+    CAPScheduleCachedMove();
 }
 %new
 - (void)cap_autoPlayChanged:(UISwitch *)sender {
@@ -1046,8 +1106,10 @@ static void CAPInsertGodEngine(id panel) {
         CAPSyncEngineChoiceUI(self);
         // The bottom sheet covers the board and would consume synthetic taps.
         dispatch_async(dispatch_get_main_queue(), ^{
-            if ([self respondsToSelector:@selector(closeTap)])
+            if ([(id)self respondsToSelector:@selector(closeTap)])
                 ((void (*)(id, SEL))objc_msgSend)(self, @selector(closeTap));
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{ CAPScheduleCachedMove(); });
         });
     }
 }

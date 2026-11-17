@@ -15,7 +15,7 @@ ChessAssistantPro_FILES = Tweak.xm VendorTouch/TouchSimulator.mm
 ChessAssistantPro_FRAMEWORKS = Foundation UIKit CoreML QuartzCore
 ChessAssistantPro_PRIVATE_FRAMEWORKS = IOKit
 ChessAssistantPro_LIBRARIES = substrate
-ChessAssistantPro_CFLAGS = -fobjc-arc -fblocks -I$(CURDIR)/.asset-cache/ort/ios-arm64/onnxruntime.framework/Headers
+ChessAssistantPro_CFLAGS = -fobjc-arc -fblocks -Wno-module-import-in-extern-c -I$(CURDIR)/.asset-cache/ort/ios-arm64/onnxruntime.framework/Headers
 ChessAssistantPro_CCFLAGS = -std=c++17
 ChessAssistantPro_LDFLAGS = -F$(CURDIR)/.asset-cache/ort/ios-arm64 -framework onnxruntime
 

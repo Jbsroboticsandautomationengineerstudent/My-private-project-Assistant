@@ -9,6 +9,7 @@ static void execute();
 static IOHIDEventRef parent = NULL;
 static uint64_t gSenderID = 0;
 static __weak UIWindow *gTargetWindow = nil;
+static UIWindow *getKeyWindow(void);
 
 void touchSimulatorSetTargetWindow(UIWindow *window) {
     gTargetWindow = window;
@@ -18,7 +19,9 @@ bool touchSimulatorAvailable(void) {
     UIApplication *app = UIApplication.sharedApplication;
     if (![app respondsToSelector:@selector(_enqueueHIDEvent:)]) return false;
     void *handle = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
-    return handle && dlsym(handle, "BKSHIDEventSetDigitizerInfo");
+    UIWindow *window = gTargetWindow ?: getKeyWindow();
+    return handle && dlsym(handle, "BKSHIDEventSetDigitizerInfo") &&
+           [window respondsToSelector:@selector(_contextId)];
 }
 
 // Read real Multitouch ID from IORegistry so the kernel accepts the event as
@@ -81,6 +84,7 @@ void simulateTouch(int type, float x, float y) {
             0,
             0.0, 0.0, 0.0, 0.0, 0.0,
             0, (type != TOUCH_UP), 0);
+        if (!parent) return;
         IOHIDEventSetIntegerValue(parent, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
     }
 
@@ -99,6 +103,7 @@ void simulateTouch(int type, float x, float y) {
         childMask,
         x, y, 0.0f, 0.0f, 0.0f,
         isTouch, isTouch, 0);
+    if (!child) { CFRelease(parent); parent = NULL; return; }
     // 5.0mm matches real hardware contact area; 0.04 is sub-threshold and
     // can cause the OS to classify the event as noise.
     IOHIDEventSetFloatValue(child, kIOHIDEventFieldDigitizerMajorRadius, 5.0f);
@@ -146,7 +151,9 @@ static void postEvent(IOHIDEventRef event) {
     IOHIDEventSetSenderID(event, gSenderID);
     // UIKit enqueue path: routes the touch into the target app's responder chain
     // via the window's contextId. Skip when no scene is active yet.
-    if (event != NULL && keyWindow != nil) {
+    if (event != NULL && keyWindow != nil &&
+        [keyWindow respondsToSelector:@selector(_contextId)] &&
+        [[UIApplication sharedApplication] respondsToSelector:@selector(_enqueueHIDEvent:)]) {
         uint32_t contextID = keyWindow._contextId;
         void *handle = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
         if (handle) {

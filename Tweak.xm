@@ -219,7 +219,10 @@ static NSString *CAPPositionKey(NSString *fen) {
 }
 
 static BOOL CAPSourceEnabled(CAPMoveSource source) {
-    BOOL maiaSelected = [[NSUserDefaults standardUserDefaults] boolForKey:@"ChessAssist_UseMaia"];
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    id assistantEnabled = [defaults objectForKey:@"ChessAssist_Enabled"];
+    if (assistantEnabled && ![assistantEnabled boolValue]) return NO;
+    BOOL maiaSelected = [defaults boolForKey:@"ChessAssist_UseMaia"];
     return source == CAPMoveSourceMaia ? maiaSelected : !maiaSelected;
 }
 
@@ -742,7 +745,7 @@ static void CAPInsertGodEngine(id panel) {
 }
 %new
 - (void)cap_delayDone:(id)sender {
-    [self endEditing:YES];
+    [(UIView *)self endEditing:YES];
 }
 %new
 - (void)cap_delayChanged:(UITextField *)sender {

@@ -322,7 +322,7 @@ static BOOL CAPAutoPlay(NSString *uci, NSString *fen, CAPMoveSource source) {
         ((void (*)(id, SEL, id, BOOL))objc_msgSend)
             (board, @selector(makeMove:throughTouches:), candidate, YES);
         lastPlayedFEN = [fen copy];
-        NSLog(@"[ChessAssistantPro] Auto-Play submitted %@", uci);
+        NSLog(@"[ChessAssistantPro] Auto-Play requested %@ through CHBoardView", uci);
         return YES;
     } @catch (NSException *exception) {
         NSLog(@"[ChessAssistantPro] Auto-Play skipped: %@", exception);
@@ -582,7 +582,8 @@ static UIButton *CAPFindPauseButton(UIView *view) {
     if ([view isKindOfClass:UIButton.class]) {
         UIButton *button = (UIButton *)view;
         NSString *title = [button titleForState:UIControlStateNormal] ?: button.titleLabel.text;
-        if ([title rangeOfString:@"Pause Assistant" options:NSCaseInsensitiveSearch].location != NSNotFound)
+        if ([title rangeOfString:@"Pause Assistant" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [title rangeOfString:@"Enable Assistant" options:NSCaseInsensitiveSearch].location != NSNotFound)
             return button;
     }
     for (UIView *child in view.subviews) {

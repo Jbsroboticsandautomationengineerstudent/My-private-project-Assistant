@@ -907,6 +907,10 @@ static void CAPSyncEngineChoiceUI(id panel) {
     UIView *autoRow = objc_getAssociatedObject(panel, &kAutoEngineRowKey);
     UISegmentedControl *autoChoice = autoRow ? CAPFindSegment(autoRow) : nil;
     if (autoChoice) autoChoice.selectedSegmentIndex = selected;
+    // The original assistant fetches recommendations from its board layout
+    // hooks. Refresh after an engine switch so this position gets a new arrow.
+    UIView *board = CAPVisibleSwiftBoard();
+    if (board) { [board setNeedsLayout]; [board layoutIfNeeded]; }
 }
 
 static NSString *CAPDelayText(double seconds) {

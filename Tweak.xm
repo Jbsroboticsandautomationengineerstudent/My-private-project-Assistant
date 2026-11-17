@@ -205,17 +205,17 @@ static NSString *CAPNormalizeMove(NSString *move) {
     return normalized.lowercaseString;
 }
 
-// Compare the pieces and side to move. FEN counters and en-passant formatting
-// can differ between the assistant and the host board for the same position.
+// Compare the position, turn, castling rights, and en-passant square. Ignore
+// only the halfmove and fullmove counters, which do not change legal moves.
 static NSString *CAPPositionKey(NSString *fen) {
     if (!fen.length) return nil;
     NSArray<NSString *> *parts = [fen componentsSeparatedByCharactersInSet:
         [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    NSMutableArray<NSString *> *fields = [NSMutableArray arrayWithCapacity:2];
+    NSMutableArray<NSString *> *fields = [NSMutableArray arrayWithCapacity:4];
     for (NSString *part in parts) {
-        if (part.length && fields.count < 2) [fields addObject:part];
+        if (part.length && fields.count < 4) [fields addObject:part];
     }
-    return fields.count == 2 ? [fields componentsJoinedByString:@" "] : nil;
+    return fields.count == 4 ? [fields componentsJoinedByString:@" "] : nil;
 }
 
 static BOOL CAPSourceEnabled(CAPMoveSource source) {
@@ -243,7 +243,7 @@ static BOOL CAPBoardMatchesPosition(id board, id game, NSString *positionKey) {
     return NO;
 }
 
-static UIView *CAPFindMatchingBoard(UIView *view, NSString *positionKey) {
+static UIView *CAPFindMatchingBoard(UIView *view, NSString *positionKey, BOOL whiteToMove) {
     if (view.hidden || view.alpha < 0.05) return nil;
     Class boardClass = NSClassFromString(@"CHBoardView");
     Class analysisClass = NSClassFromString(@"CHAnalysisBoardView");
@@ -253,12 +253,16 @@ static UIView *CAPFindMatchingBoard(UIView *view, NSString *positionKey) {
                                             view.window.bounds) &&
         [view respondsToSelector:@selector(chessGame)] &&
         [view respondsToSelector:@selector(makeMove:throughTouches:)]) {
+        SEL permission = whiteToMove ? @selector(allowUserToMakeWhiteMoves)
+                                     : @selector(allowUserToMakeBlackMoves);
         id game = ((id (*)(id, SEL))objc_msgSend)(view, @selector(chessGame));
-        if (game && CAPBoardMatchesPosition(view, game, positionKey))
+        if (game && [view respondsToSelector:permission] &&
+            ((BOOL (*)(id, SEL))objc_msgSend)(view, permission) &&
+            CAPBoardMatchesPosition(view, game, positionKey))
             return view;
     }
     for (UIView *child in view.subviews) {
-        UIView *found = CAPFindMatchingBoard(child, positionKey);
+        UIView *found = CAPFindMatchingBoard(child, positionKey, whiteToMove);
         if (found) return found;
     }
     return nil;
@@ -267,11 +271,12 @@ static UIView *CAPFindMatchingBoard(UIView *view, NSString *positionKey) {
 static UIView *CAPVisibleBoardForFEN(NSString *fen) {
     NSString *key = CAPPositionKey(fen);
     if (!key) return nil;
+    BOOL whiteToMove = [fen containsString:@" w "];
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (![scene isKindOfClass:UIWindowScene.class] ||
             scene.activationState != UISceneActivationStateForegroundActive) continue;
         for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-            UIView *board = CAPFindMatchingBoard(window, key);
+            UIView *board = CAPFindMatchingBoard(window, key, whiteToMove);
             if (board) return board;
         }
     }

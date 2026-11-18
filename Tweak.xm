@@ -1106,7 +1106,7 @@ static void CAPSyntheticStep(UIView *overlay, CAPFakeTouch *touch, CAPFakeEvent 
         NSLog(@"[CAP-AP] touch exception %@", e);
     }
     if (step + 1 >= total) return;
-    int64_t gap = (tapMode && step + 1 == 2) ? 150 : 16;
+    int64_t gap = tapMode ? (step + 1 == 2 ? 150 : 16) : 45;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, gap * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
         CAPSyntheticStep(overlay, touch, event, from, to, tapMode, step + 1);
     });
@@ -1206,22 +1206,22 @@ static BOOL CAPAutoPlaySwiftBot(NSString *uci, NSString *fen) {
     CGFloat size = overlay.bounds.size.width;
     CGPoint from = CAPSquareCenter(size, sf, sr, flipped);
     CGPoint to = CAPSquareCenter(size, df, dr, flipped);
-    CAPToast([NSString stringWithFormat:@"tapping %@ (flip %d, pieces %lu)", uci, flipped, (unsigned long)pieces.count]);
-    // Same order as the proven web script: click source, click destination,
-    // check at 450 ms, then fall back to a drag, then a final check at 1.2 s.
-    CAPSyntheticMove(overlay, from, to, YES);
+    CAPToast([NSString stringWithFormat:@"dragging %@ (flip %d, pieces %lu)", uci, flipped, (unsigned long)pieces.count]);
+    // The board's own touch handlers implement drag (began on piece, moved, ended
+    // on target) via locationInView: only, so drag goes first; taps are the fallback.
+    CAPSyntheticMove(overlay, from, to, NO);
 
     __weak UIView *weakOverlay = overlay;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 450 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 900 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
         UIView *o = weakOverlay;
         if (!o.window || !pieceClass) return;
         NSMutableArray *now = [NSMutableArray array];
         CAPCollectPieces(o.superview ?: o, pieceClass, now);
         BOOL stillThere = CAPPieceAt(now, o, sf, sr, flipped);
-        CAPToast(stillThere ? @"tap ignored, trying drag" : @"tap worked");
-        if (stillThere) CAPSyntheticMove(o, from, to, NO);
+        CAPToast(stillThere ? @"drag ignored, trying taps" : @"drag worked");
+        if (stillThere) CAPSyntheticMove(o, from, to, YES);
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
         UIView *o = weakOverlay;
         if (!o.window || !pieceClass) return;
         NSMutableArray *now = [NSMutableArray array];

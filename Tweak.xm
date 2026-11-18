@@ -587,7 +587,7 @@ static void CAPDumpGesture(UIGestureRecognizer *gesture) {
 }
 
 static void CAPDumpSubviewTree(UIView *view, NSUInteger depth, NSUInteger *count) {
-    if (!view || depth > 4 || *count >= 2000) return;
+    if (!view || depth > 8 || *count >= 2000) return;
     ++*count;
     CAPDiscLog(@"VIEW depth=%lu %@ %p frame=%@ hidden=%d alpha=%.2f",
                (unsigned long)depth, NSStringFromClass([view class]), view,
@@ -795,11 +795,103 @@ static UIView *CAPVisibleSwiftBoard(void) {
     return selected;
 }
 
+
+// ---- Read-only observers on the Swift board's real touch handlers ----
+typedef void (*CAPTouchIMP)(UIView *, SEL, NSSet<UITouch *> *, UIEvent *);
+static CAPTouchIMP capOrigTouchBegan = nullptr, capOrigTouchMoved = nullptr,
+                   capOrigTouchEnded = nullptr;
+static NSUInteger capTouchMovedCount = 0;
+
+static void CAPLogTouches(NSString *phase, UIView *view, NSSet<UITouch *> *touches,
+                          UIEvent *event) {
+    for (UITouch *touch in touches) {
+        CGPoint p = [touch locationInView:view], q = [touch previousLocationInView:view];
+        CAPDiscLog(@"TOUCH %@ view=%@ %p touchClass=%@ loc=%@ prev=%@ ts=%.4f tapCount=%lu "
+                   @"radius=%.2f type=%ld phase=%ld touchView=%@ gestures=%lu eventClass=%@ "
+                   @"eventType=%ld allTouches=%lu",
+                   phase, NSStringFromClass([view class]), view,
+                   NSStringFromClass([touch class]), NSStringFromCGPoint(p),
+                   NSStringFromCGPoint(q), touch.timestamp, (unsigned long)touch.tapCount,
+                   touch.majorRadius, (long)touch.type, (long)touch.phase,
+                   NSStringFromClass([touch.view class]),
+                   (unsigned long)touch.gestureRecognizers.count,
+                   NSStringFromClass([event class]), (long)event.type,
+                   (unsigned long)event.allTouches.count);
+    }
+}
+
+static void CAPLogPieceViewsIn(UIView *view, UIView *overlay, CGFloat square,
+                               Class pieceClass, NSUInteger *count) {
+    if (!view || *count >= 80) return;
+    if ([view isKindOfClass:pieceClass] && view.superview) {
+        CGPoint c = [view.superview convertPoint:view.center toView:overlay];
+        if (CGRectContainsPoint(overlay.bounds, c) && square > 0) {
+            CAPDiscLog(@"PIECE %p col=%d rowFromTop=%d center=%@ hidden=%d alpha=%.2f",
+                       view, (int)floor(c.x / square), (int)floor(c.y / square),
+                       NSStringFromCGPoint(c), view.hidden, view.alpha);
+            ++*count;
+        }
+    }
+    for (UIView *child in view.subviews)
+        CAPLogPieceViewsIn(child, overlay, square, pieceClass, count);
+}
+
+static void CAPLogPieceViews(UIView *overlay) {
+    Class pieceClass = NSClassFromString(@"_TtC15SwiftChessBoard9PieceView");
+    if (!overlay || !overlay.window || !pieceClass) return;
+    NSUInteger count = 0;
+    CAPDiscLog(@"PIECES after touch (overlay=%@)", NSStringFromCGRect(overlay.bounds));
+    CAPLogPieceViewsIn(overlay.window, overlay, overlay.bounds.size.width / 8.0,
+                       pieceClass, &count);
+    CAPDiscLog(@"PIECES logged=%lu", (unsigned long)count);
+}
+
+static void CAPOverlayTouchBegan(UIView *self, SEL selector, NSSet<UITouch *> *touches,
+                                 UIEvent *event) {
+    capTouchMovedCount = 0;
+    @try { CAPLogTouches(@"began", self, touches, event); } @catch (NSException *e) {}
+    if (capOrigTouchBegan) capOrigTouchBegan(self, selector, touches, event);
+}
+static void CAPOverlayTouchMoved(UIView *self, SEL selector, NSSet<UITouch *> *touches,
+                                 UIEvent *event) {
+    if (++capTouchMovedCount % 5 == 1) {
+        @try { CAPLogTouches(@"moved", self, touches, event); } @catch (NSException *e) {}
+    }
+    if (capOrigTouchMoved) capOrigTouchMoved(self, selector, touches, event);
+}
+static void CAPOverlayTouchEnded(UIView *self, SEL selector, NSSet<UITouch *> *touches,
+                                 UIEvent *event) {
+    @try { CAPLogTouches(@"ended", self, touches, event); } @catch (NSException *e) {}
+    if (capOrigTouchEnded) capOrigTouchEnded(self, selector, touches, event);
+    __weak UIView *weakOverlay = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        UIView *overlay = weakOverlay;
+        @try { CAPLogPieceViews(overlay); } @catch (NSException *e) {}
+    });
+}
+
+static void CAPInstallTouchObservers(void) {
+    static BOOL installed = NO;
+    if (installed) return;
+    Class overlay = NSClassFromString(@"_TtC15SwiftChessBoard28PiecesOverlayWithTouchEvents");
+    if (!overlay) return;
+    installed = YES;
+    MSHookMessageEx(overlay, @selector(touchesBegan:withEvent:),
+                    (IMP)CAPOverlayTouchBegan, (IMP *)&capOrigTouchBegan);
+    MSHookMessageEx(overlay, @selector(touchesMoved:withEvent:),
+                    (IMP)CAPOverlayTouchMoved, (IMP *)&capOrigTouchMoved);
+    MSHookMessageEx(overlay, @selector(touchesEnded:withEvent:),
+                    (IMP)CAPOverlayTouchEnded, (IMP *)&capOrigTouchEnded);
+    CAPDiscLog(@"touch observers installed on %@", NSStringFromClass(overlay));
+}
+
 typedef void (*CAPLayoutIMP)(UIView *, SEL);
 static CAPLayoutIMP originalSwiftBoardLayout = nullptr;
 static BOOL capBoardProbeQueued = NO; // UIKit layout runs on the main thread.
 static void CAPSwiftBoardLayout(UIView *board, SEL selector) {
     originalSwiftBoardLayout(board, selector);
+    CAPInstallTouchObservers();
     if (!board.window || capBoardProbeQueued) return;
     capBoardProbeQueued = YES;
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1522,6 +1614,7 @@ static void CAPSetFillColor(CAShapeLayer *layer, SEL selector, CGColorRef color)
             MSHookMessageEx(shape, @selector(setFillColor:), (IMP)CAPSetFillColor,
                             (IMP *)&originalFillColor);
         }
+        CAPInstallTouchObservers();
         CAPDiscLog(@"diagnostics installed SwiftBoard=%p WebSocket=%p", swiftBoard, webSocketTask);
         NSLog(@"[ChessAssistantPro] Maia=%p Engine=%p", maia, engine);
     }

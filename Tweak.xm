@@ -1084,44 +1084,40 @@ static void CAPSendTouch(UIView *overlay, CAPFakeTouch *touch, CAPFakeEvent *eve
 }
 
 // Synthetic drag (or tap-tap) from one point to another on the pieces overlay.
+static void CAPSyntheticStep(UIView *overlay, CAPFakeTouch *touch, CAPFakeEvent *event,
+                             CGPoint from, CGPoint to, BOOL tapMode, int step) {
+    int total = tapMode ? 4 : 6;
+    @try {
+        if (tapMode) {
+            if (step == 0) CAPSendTouch(overlay, touch, event, UITouchPhaseBegan, from);
+            else if (step == 1) CAPSendTouch(overlay, touch, event, UITouchPhaseEnded, from);
+            else if (step == 2) CAPSendTouch(overlay, touch, event, UITouchPhaseBegan, to);
+            else CAPSendTouch(overlay, touch, event, UITouchPhaseEnded, to);
+        } else if (step == 0) {
+            CAPSendTouch(overlay, touch, event, UITouchPhaseBegan, from);
+        } else if (step <= 4) {
+            CGFloat t = step / 4.0;
+            CAPSendTouch(overlay, touch, event, UITouchPhaseMoved,
+                         CGPointMake(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t));
+        } else {
+            CAPSendTouch(overlay, touch, event, UITouchPhaseEnded, to);
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[CAP-AP] touch exception %@", e);
+    }
+    if (step + 1 >= total) return;
+    int64_t gap = (tapMode && step + 1 == 2) ? 150 : 16;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, gap * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        CAPSyntheticStep(overlay, touch, event, from, to, tapMode, step + 1);
+    });
+}
+
 static void CAPSyntheticMove(UIView *overlay, CGPoint from, CGPoint to, BOOL tapMode) {
     CAPFakeTouch *touch = [[CAPFakeTouch alloc] init];
     CAPFakeEvent *event = [[CAPFakeEvent alloc] init];
     touch.capView = overlay;
     event.capTouches = [NSSet setWithObject:touch];
-    __block int step = 0;
-    int total = tapMode ? 4 : 6;
-    __block void (^run)(void) = nil;
-    run = ^{
-        @try {
-            if (tapMode) {
-                if (step == 0) CAPSendTouch(overlay, touch, event, UITouchPhaseBegan, from);
-                else if (step == 1) CAPSendTouch(overlay, touch, event, UITouchPhaseEnded, from);
-                else if (step == 2) CAPSendTouch(overlay, touch, event, UITouchPhaseBegan, to);
-                else CAPSendTouch(overlay, touch, event, UITouchPhaseEnded, to);
-            } else if (step == 0) {
-                CAPSendTouch(overlay, touch, event, UITouchPhaseBegan, from);
-            } else if (step <= 4) {
-                CGFloat t = step / 4.0;
-                CAPSendTouch(overlay, touch, event, UITouchPhaseMoved,
-                             CGPointMake(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t));
-            } else {
-                CAPSendTouch(overlay, touch, event, UITouchPhaseEnded, to);
-            }
-        } @catch (NSException *e) {
-            NSLog(@"[CAP-AP] touch exception %@", e);
-        }
-        step++;
-        if (step < total) {
-            int64_t gap = (tapMode && step == 2) ? 150 : 16;
-            void (^next)(void) = run;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, gap * NSEC_PER_MSEC),
-                           dispatch_get_main_queue(), next);
-        } else {
-            run = nil;
-        }
-    };
-    run();
+    CAPSyntheticStep(overlay, touch, event, from, to, tapMode, 0);
 }
 
 // On-screen Auto-Play status (no log access on a sideloaded phone).

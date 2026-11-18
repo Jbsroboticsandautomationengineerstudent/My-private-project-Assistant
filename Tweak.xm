@@ -26,6 +26,8 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <atomic>
+#include <map>
+#include <sstream>
 #include <string>
 
 extern char **environ;
@@ -34,6 +36,7 @@ static NSString *const kModelPath = @"/var/jb/Library/Application Support/ChessA
 static NSString *const kAutoPlayKey = @"ChessAssistantPro_AutoPlay";
 static NSString *const kAutoPlayMinDelayKey = @"ChessAssistantPro_AutoPlayMinDelay";
 static NSString *const kAutoPlayMaxDelayKey = @"ChessAssistantPro_AutoPlayMaxDelay";
+static NSString *const kStrengthEloKey = @"ChessAssist_ELO";
 static NSString *const kGodEngineKey = @"godEngineChoice";
 static NSString *const kAutoEngineKey = @"ChessAssistantPro_AutoPlayEngine";
 static const char *kStockfish19Path = "/var/jb/usr/bin/stockfish19";
@@ -1438,8 +1441,81 @@ static BOOL CAPUciMove(const std::string &move) {
            move[4] == 'b' || move[4] == 'n';
 }
 
+static int CAPRequestedStockfishElo(void) {
+    id saved = [[NSUserDefaults standardUserDefaults] objectForKey:kStrengthEloKey];
+    // The original panel defaults to its maximum when there is no saved value.
+    return saved && [saved respondsToSelector:@selector(integerValue)] ?
+        (int)MAX(600, MIN(10000, [saved integerValue])) : 3200;
+}
+
+static double CAPStockfishSkillForElo(int elo) {
+    if (elo < 1320) return 0;
+    if (elo >= 3190) return 20;
+    double e = (double)(elo - 1320) / (3190 - 1320);
+    return fmax(0.0, fmin(19.0,
+        (((37.2473 * e - 40.8525) * e + 22.2943) * e - 0.311438)));
+}
+
+struct CAPRootMove {
+    std::string move;
+    int score;
+};
+
+static void CAPRecordRootMove(const std::string &line,
+                              std::map<int, std::map<int, CAPRootMove>> &byDepth) {
+    if (line.compare(0, 5, "info ") != 0) return;
+    std::istringstream stream(line);
+    std::string word, move;
+    int depth = 0, multipv = 1, score = 0;
+    bool hasScore = false;
+    while (stream >> word) {
+        if (word == "depth") stream >> depth;
+        else if (word == "multipv") stream >> multipv;
+        else if (word == "score") {
+            std::string kind;
+            int value = 0;
+            if (!(stream >> kind >> value)) return;
+            if (kind == "cp") { score = value; hasScore = true; }
+            else if (kind == "mate") {
+                score = value > 0 ? 10000 - value : -10000 - value;
+                hasScore = true;
+            }
+        } else if (word == "pv") {
+            stream >> move;
+            break;
+        }
+    }
+    if (depth > 0 && multipv > 0 && multipv <= 64 && hasScore && CAPUciMove(move))
+        byDepth[depth][multipv] = {move, score};
+}
+
+static std::string CAPChooseLowEloMove(
+    const std::map<int, std::map<int, CAPRootMove>> &byDepth, int elo,
+    const std::string &engineMove) {
+    // This broadens the legal root moves below Stockfish's 1320-Elo floor.
+    // The temperature is a strength control, not a calibrated Elo guarantee.
+    for (auto depth = byDepth.rbegin(); depth != byDepth.rend(); ++depth) {
+        if (depth->second.size() < 2) continue;
+        int bestScore = -10000;
+        for (const auto &entry : depth->second)
+            bestScore = MAX(bestScore, entry.second.score);
+        double temperature = 30.0 + (1320.0 - elo) * 0.32;
+        double total = 0;
+        for (const auto &entry : depth->second)
+            total += exp(MAX(-20.0, (entry.second.score - bestScore) / temperature));
+        double draw = ((double)arc4random() / (double)UINT32_MAX) * total;
+        for (const auto &entry : depth->second) {
+            draw -= exp(MAX(-20.0, (entry.second.score - bestScore) / temperature));
+            if (draw <= 0) return entry.second.move;
+        }
+        return depth->second.rbegin()->second.move;
+    }
+    return engineMove;
+}
+
 static BOOL CAPExternalEngineMove(const char *path, const char *fen,
-                                  BOOL stockfish19, std::string &bestMove) {
+                                  BOOL stockfish19, int requestedElo,
+                                  std::string &bestMove) {
     if (!path || !fen || access(path, X_OK) != 0) return NO;
     CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
     // Accessed only from the serial God Engine queue. Keep Stockfish warm so
@@ -1487,26 +1563,47 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
     }
     BOOL success = NO;
     std::string line;
+    std::map<int, std::map<int, CAPRootMove>> lowEloMoves;
+    BOOL lowElo = stockfish19 && requestedElo < 1320;
     CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 5.0;
     if (!reused) {
         if (!CAPWrite(input[1], "uci\n") || !CAPWaitForLine(output[0], "uciok", deadline)) goto done;
         if (stockfish19 &&
             (!CAPWrite(input[1], "setoption name Threads value 2\n") ||
-             !CAPWrite(input[1], "setoption name Hash value 32\n") ||
-             !CAPWrite(input[1], "setoption name MultiPV value 1\n") ||
-             !CAPWrite(input[1], "setoption name Skill Level value 20\n") ||
-             !CAPWrite(input[1], "setoption name UCI_LimitStrength value false\n"))) goto done;
-        if (!CAPWrite(input[1], "isready\n") || !CAPWaitForLine(output[0], "readyok", deadline)) goto done;
+             !CAPWrite(input[1], "setoption name Hash value 32\n"))) goto done;
     }
+    if (stockfish19) {
+        // Reapply on every position: the engine process is reused after slider changes.
+        int uciElo = MAX(1320, MIN(3190, requestedElo));
+        int pvCount = lowElo ? (requestedElo < 800 ? 64 :
+                                requestedElo < 1100 ? 48 : 24) : 1;
+        if (!CAPWrite(input[1], "setoption name MultiPV value " +
+                                std::to_string(pvCount) + "\n") ||
+            !CAPWrite(input[1], "setoption name Skill Level value " +
+                                std::to_string(lowElo ? 0 : 20) + "\n") ||
+            !CAPWrite(input[1], std::string("setoption name UCI_LimitStrength value ") +
+                                (requestedElo >= 3190 ? "false\n" : "true\n")) ||
+            !CAPWrite(input[1], "setoption name UCI_Elo value " +
+                                std::to_string(uciElo) + "\n")) goto done;
+        NSLog(@"[ChessAssistantPro] Stockfish strength slider=%d UCI_Elo=%d skill=%.1f/20 MultiPV=%d%@",
+              requestedElo, uciElo, CAPStockfishSkillForElo(requestedElo), pvCount,
+              lowElo ? @" (estimated low-Elo mode)" : @"");
+    }
+    if (!CAPWrite(input[1], "isready\n") || !CAPWaitForLine(output[0], "readyok", deadline)) goto done;
     if (!CAPWrite(input[1], std::string("position fen ") + fen + "\n")) goto done;
     if (!CAPWrite(input[1], stockfish19 ? "go movetime 200\n" : "go depth 16\n")) goto done;
     deadline = CFAbsoluteTimeGetCurrent() + (stockfish19 ? 3.0 : 15.0);
     while (CAPReadLine(output[0], line, deadline)) {
         if (line.find("CRITICAL ERROR") != std::string::npos) break;
-        if (line.compare(0, 9, "bestmove ") != 0) continue;
+        if (line.compare(0, 9, "bestmove ") != 0) {
+            if (lowElo) CAPRecordRootMove(line, lowEloMoves);
+            continue;
+        }
         size_t end = line.find(' ', 9);
         bestMove = line.substr(9, end == std::string::npos ? end : end - 9);
         success = CAPUciMove(bestMove);
+        if (success && lowElo)
+            bestMove = CAPChooseLowEloMove(lowEloMoves, requestedElo, bestMove);
         break;
     }
 done:
@@ -1551,6 +1648,7 @@ static void CAPEngineGo(const char *fen, uintptr_t arg1, uintptr_t arg2,
         return;
     }
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    int requestedElo = CAPRequestedStockfishElo();
     BOOL useTriumviratus = [defaults boolForKey:kAutoPlayKey] &&
         CAPSelectedAutoEngine() != CAPAutoEngineMaia ?
         CAPSelectedAutoEngine() == CAPAutoEngineTriumviratus :
@@ -1570,9 +1668,11 @@ static void CAPEngineGo(const char *fen, uintptr_t arg1, uintptr_t arg2,
         BOOL found = NO;
         @try {
             if (useTriumviratus)
-                found = CAPExternalEngineMove(kTriumviratusPath, position.UTF8String, NO, move);
+                found = CAPExternalEngineMove(kTriumviratusPath, position.UTF8String,
+                                              NO, requestedElo, move);
             if (!found)
-                found = CAPExternalEngineMove(kStockfish19Path, position.UTF8String, YES, move);
+                found = CAPExternalEngineMove(kStockfish19Path, position.UTF8String,
+                                              YES, requestedElo, move);
         } @catch (NSException *exception) {
             NSLog(@"[ChessAssistantPro] External engine failed: %@", exception);
         }
@@ -1607,7 +1707,7 @@ static UIButton *CAPFindPauseButton(UIView *view) {
 
 static char kAutoPlayRowKey, kAutoEngineRowKey, kDelayRowKey,
             kMinDelayFieldKey, kMaxDelayFieldKey;
-static char kGodEngineRowKey;
+static char kGodEngineRowKey, kStockfishSkillRowKey, kStockfishSkillLabelKey;
 
 static UISegmentedControl *CAPFindSegment(UIView *view) {
     if ([view isKindOfClass:UISegmentedControl.class]) return (UISegmentedControl *)view;
@@ -1773,6 +1873,59 @@ static void CAPInsertGodEngine(id panel) {
     objc_setAssociatedObject(panel, &kGodEngineRowKey, row, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+static void CAPUpdateStockfishSkillUI(id panel, UISlider *slider) {
+    int elo = CAPRequestedStockfishElo();
+    // Keep the number shown during a drag and the engine's next UCI request in sync.
+    if ([slider isKindOfClass:UISlider.class] && slider.value >= 600 &&
+        slider.value <= 10000 && slider.maximumValue >= 3190) {
+        elo = (int)lroundf(slider.value);
+        [[NSUserDefaults standardUserDefaults] setInteger:elo forKey:kStrengthEloKey];
+    }
+    UILabel *label = objc_getAssociatedObject(panel, &kStockfishSkillLabelKey);
+    if (!label) return;
+    if (elo >= 3190) {
+        label.text = @"Max · Skill 20/20";
+        label.accessibilityLabel = @"Stockfish 19 full strength, skill level 20 of 20, no fixed Elo rating";
+    } else if (elo >= 1320) {
+        label.text = [NSString stringWithFormat:@"%d · Skill ~%.1f/20",
+                      elo, CAPStockfishSkillForElo(elo)];
+        label.accessibilityLabel = [NSString stringWithFormat:
+            @"Stockfish 19 ELO limit %d, approximate effective skill %.1f of 20",
+            elo, CAPStockfishSkillForElo(elo)];
+    } else {
+        label.text = [NSString stringWithFormat:@"~%d · Skill 0 + variety", elo];
+        label.accessibilityLabel = [NSString stringWithFormat:
+            @"Stockfish 19 estimated low strength %d, skill 0 with varied legal moves", elo];
+    }
+}
+
+static void CAPInsertStockfishSkill(id panel) {
+    if (![panel isKindOfClass:UIView.class] ||
+        ![panel respondsToSelector:@selector(rowTitle:control:)]) return;
+    UIView *godRow = objc_getAssociatedObject(panel, &kGodEngineRowKey);
+    if (![godRow.superview isKindOfClass:UIStackView.class]) return;
+    UIStackView *stack = (UIStackView *)godRow.superview;
+    UIView *existing = objc_getAssociatedObject(panel, &kStockfishSkillRowKey);
+    if (![existing isDescendantOfView:(UIView *)panel]) {
+        UILabel *label = [[UILabel alloc] initWithFrame:CGRectZero];
+        label.font = [UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightMedium];
+        label.textColor = UIColor.secondaryLabelColor;
+        label.textAlignment = NSTextAlignmentRight;
+        label.adjustsFontSizeToFitWidth = YES;
+        label.minimumScaleFactor = 0.8;
+        UIView *row = ((id (*)(id, SEL, id, id))objc_msgSend)
+            (panel, @selector(rowTitle:control:), @"Stockfish Skill", label);
+        NSUInteger index = [stack.arrangedSubviews indexOfObject:godRow];
+        if (![row isKindOfClass:UIView.class] || index == NSNotFound) return;
+        [stack insertArrangedSubview:row atIndex:index + 1];
+        objc_setAssociatedObject(panel, &kStockfishSkillRowKey, row,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(panel, &kStockfishSkillLabelKey, label,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    CAPUpdateStockfishSkillUI(panel, nil);
+}
+
 static char kDumpGestureKey;
 static void CAPInstallDumpGesture(id panel) {
     if (![panel isKindOfClass:UIView.class] ||
@@ -1789,14 +1942,24 @@ static void CAPInstallDumpGesture(id panel) {
 - (void)build {
     %orig;
     CAPInsertGodEngine(self);
+    CAPInsertStockfishSkill(self);
     CAPInsertAutoPlay(self);
     CAPInstallDumpGesture(self);
 }
 - (void)populate {
     %orig;
     CAPInsertGodEngine(self);
+    CAPInsertStockfishSkill(self);
     CAPInsertAutoPlay(self);
     CAPInstallDumpGesture(self);
+}
+- (void)eloSlide:(UISlider *)sender {
+    %orig;
+    CAPUpdateStockfishSkillUI(self, sender);
+}
+- (void)eloDone:(UISlider *)sender {
+    %orig;
+    CAPUpdateStockfishSkillUI(self, sender);
 }
 %new
 - (void)cap_dumpLongPress:(UILongPressGestureRecognizer *)gesture {

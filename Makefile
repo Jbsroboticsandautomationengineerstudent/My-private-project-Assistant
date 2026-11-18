@@ -11,7 +11,7 @@ export MAIA79_ONNX_SHA256
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = ChessAssistantPro
-ChessAssistantPro_FILES = Tweak.xm HumanEngine.mm
+ChessAssistantPro_FILES = Tweak.xm
 ChessAssistantPro_FRAMEWORKS = Foundation UIKit CoreML QuartzCore
 ChessAssistantPro_LIBRARIES = substrate
 ChessAssistantPro_CFLAGS = -fobjc-arc -fblocks -I$(CURDIR)/.asset-cache/ort/ios-arm64/onnxruntime.framework/Headers

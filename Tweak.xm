@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import "HumanEngine.h"
 #import <UIKit/UIKit.h>
 #import <CoreML/CoreML.h>
 #import <objc/runtime.h>
@@ -26,7 +27,6 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <atomic>
-#include <map>
 #include <sstream>
 #include <string>
 
@@ -1449,257 +1449,26 @@ static int CAPRequestedStockfishElo(void) {
 }
 
 static double CAPStockfishSkillForElo(int elo) {
-    if (elo < 1320) return lround(3.0 * fmax(0.0, fmin(1.0, (elo - 600) / 719.0)));
+    if (elo < 1320) {
+        NSNumber *skill = HEDescribeElo(elo)[@"skill"];
+        return skill.doubleValue;
+    }
     if (elo >= 3190) return 20;
     double e = (double)(elo - 1320) / (3190 - 1320);
     return fmax(0.0, fmin(19.0,
         (((37.2473 * e - 40.8525) * e + 22.2943) * e - 0.311438)));
 }
 
-struct CAPHumanParams {
-    double t;
-    int skill, depth, multipv;
-    double temperature, quietWeight, greed, aggression, fear;
-    int conversionThreshold;
-};
-
-static CAPHumanParams CAPHumanParamsForElo(int elo) {
-    double t = fmax(0.0, fmin(1.0, (elo - 600) / 719.0));
-    return {t, (int)lround(3 * t), (int)lround(5 + 5 * t),
-            (int)lround(10 - 4 * t), 145 - 100 * t,
-            0.50 + 0.45 * t, 1.50 - 0.40 * t,
-            1.45 - 0.35 * t, 0.40 + 0.40 * t,
-            (int)lround(600 - 250 * t)};
-}
-
-struct CAPFenBoard {
-    char squares[64] = {};
-    char side = 0;
-    std::string enPassant;
-    int fullmove = 1;
-    bool valid = false;
-};
-
-static CAPFenBoard CAPParseFenBoard(const char *fen) {
-    CAPFenBoard board;
-    if (!fen) return board;
+// FEN fullmove starts at 1. Search heuristics need half-moves played so far.
+static int CAPFenPly(const char *fen) {
+    if (!fen) return -1;
     std::istringstream fields(fen);
-    std::string placement, side, castling;
-    int halfmove = 0;
-    if (!(fields >> placement >> side >> castling >> board.enPassant >> halfmove >> board.fullmove) ||
-        (side != "w" && side != "b")) return board;
-    int rank = 7, file = 0;
-    for (char c : placement) {
-        if (c == '/') {
-            if (file != 8 || rank == 0) return board;
-            --rank; file = 0;
-        } else if (c >= '1' && c <= '8') {
-            file += c - '0';
-            if (file > 8) return board;
-        } else if (strchr("PNBRQKpnbrqk", c) && file < 8) {
-            board.squares[rank * 8 + file++] = c;
-        } else return board;
-    }
-    board.valid = rank == 0 && file == 8;
-    board.side = side[0];
-    return board;
-}
-
-static int CAPSquareIndex(char file, char rank) {
-    return (rank - '1') * 8 + file - 'a';
-}
-
-static int CAPPieceValue(char piece) {
-    switch (tolower((unsigned char)piece)) {
-        case 'p': return 1;
-        case 'n': case 'b': return 3;
-        case 'r': return 5;
-        case 'q': return 9;
-        default: return 0;
-    }
-}
-
-static bool CAPAttacksSquare(const CAPFenBoard &board, int from, int to) {
-    char piece = board.squares[from];
-    if (!piece || from == to) return false;
-    int dx = to % 8 - from % 8, dy = to / 8 - from / 8;
-    int ax = abs(dx), ay = abs(dy);
-    switch (tolower((unsigned char)piece)) {
-        case 'p': return ax == 1 && dy == (isupper((unsigned char)piece) ? 1 : -1);
-        case 'n': return (ax == 1 && ay == 2) || (ax == 2 && ay == 1);
-        case 'k': return ax <= 1 && ay <= 1;
-        case 'b': if (ax != ay) return false; break;
-        case 'r': if (dx && dy) return false; break;
-        case 'q': if (dx && dy && ax != ay) return false; break;
-        default: return false;
-    }
-    int stepX = (dx > 0) - (dx < 0), stepY = (dy > 0) - (dy < 0);
-    for (int x = from % 8 + stepX, y = from / 8 + stepY;
-         x != to % 8 || y != to / 8; x += stepX, y += stepY) {
-        if (board.squares[y * 8 + x]) return false;
-    }
-    return true;
-}
-
-static void CAPMoveTactics(const CAPFenBoard &before, const std::string &move,
-                           bool &check, bool &queenThreat) {
-    check = queenThreat = false;
-    CAPFenBoard after = before;
-    int from = CAPSquareIndex(move[0], move[1]);
-    int to = CAPSquareIndex(move[2], move[3]);
-    char piece = after.squares[from];
-    if (tolower((unsigned char)piece) == 'p' && move[0] != move[2] &&
-        !after.squares[to] && before.enPassant == move.substr(2, 2))
-        after.squares[from / 8 * 8 + to % 8] = 0;
-    after.squares[from] = 0;
-    after.squares[to] = move.size() == 5 ?
-        (before.side == 'w' ? toupper((unsigned char)move[4]) : move[4]) : piece;
-    if (tolower((unsigned char)piece) == 'k' && abs(move[2] - move[0]) == 2) {
-        int home = from / 8 * 8;
-        int rookFrom = home + (move[2] > move[0] ? 7 : 0);
-        int rookTo = home + (move[2] > move[0] ? 5 : 3);
-        after.squares[rookTo] = after.squares[rookFrom];
-        after.squares[rookFrom] = 0;
-    }
-    char enemyKing = before.side == 'w' ? 'k' : 'K';
-    char enemyQueen = before.side == 'w' ? 'q' : 'Q';
-    int kingSquare = -1, queenSquare = -1;
-    for (int i = 0; i < 64; ++i) {
-        if (after.squares[i] == enemyKing) kingSquare = i;
-        if (after.squares[i] == enemyQueen) queenSquare = i;
-    }
-    if (queenSquare >= 0) queenThreat = CAPAttacksSquare(after, to, queenSquare);
-    if (kingSquare >= 0) {
-        for (int i = 0; i < 64; ++i) {
-            char candidate = after.squares[i];
-            if (candidate &&
-                (isupper((unsigned char)candidate) == (before.side == 'w')) &&
-                CAPAttacksSquare(after, i, kingSquare)) {
-                check = true;
-                break;
-            }
-        }
-    }
-}
-
-static double CAPHumanMoveWeight(const std::string &move,
-                                  const CAPFenBoard &board,
-                                  const CAPHumanParams &params) {
-    if (!board.valid || !CAPUciMove(move)) return 1.0;
-    int from = CAPSquareIndex(move[0], move[1]);
-    int to = CAPSquareIndex(move[2], move[3]);
-    char piece = board.squares[from], captured = board.squares[to];
-    if (!piece) return 1.0;
-    char kind = tolower((unsigned char)piece);
-    double weight = 1.0;
-    bool pawn = kind == 'p';
-    bool enPassant = pawn && move[0] != move[2] && !captured &&
-                     board.enPassant == move.substr(2, 2);
-    bool capture = captured || enPassant;
-    if (capture) {
-        weight *= params.greed;
-        if (captured && CAPPieceValue(captured) > CAPPieceValue(piece))
-            weight *= 1.0 + 0.6 * (1.0 - params.t);
-    } else {
-        weight *= params.quietWeight;
-    }
-    bool givesCheck = false, attacksQueen = false;
-    CAPMoveTactics(board, move, givesCheck, attacksQueen);
-    if (givesCheck) weight *= params.aggression;
-    if (attacksQueen) weight *= 1.0 + 0.3 * (1.0 - params.t);
-    if (pawn && move[1] != move[3]) weight *= 1.0 + 0.2 * (1.0 - params.t);
-    if (!pawn && kind != 'k' &&
-        ((board.side == 'w' && move[3] < move[1]) ||
-         (board.side == 'b' && move[3] > move[1]))) weight *= params.fear;
-    if (board.fullmove <= 8) {
-        bool homeMinor = (kind == 'n' || kind == 'b') &&
-                         move[1] == (board.side == 'w' ? '1' : '8');
-        if (homeMinor) weight *= 1.15 + 0.35 * params.t;
-        if (kind == 'k' && abs(move[2] - move[0]) == 2)
-            weight *= 0.65 + 0.45 * params.t;
-        if (kind == 'q') weight *= 1.0 + 0.55 * (1.0 - params.t);
-        if (pawn && (move[0] == 'a' || move[0] == 'h'))
-            weight *= 0.45 + 0.45 * params.t;
-    }
-    return weight;
-}
-
-struct CAPRootMove {
-    std::string move;
-    int score;
-};
-
-static void CAPRecordRootMove(const std::string &line,
-                              std::map<int, std::map<int, CAPRootMove>> &byDepth) {
-    if (line.compare(0, 5, "info ") != 0) return;
-    std::istringstream stream(line);
-    std::string word, move;
-    int depth = 0, multipv = 1, score = 0;
-    bool hasScore = false;
-    while (stream >> word) {
-        if (word == "depth") stream >> depth;
-        else if (word == "multipv") stream >> multipv;
-        else if (word == "score") {
-            std::string kind;
-            int value = 0;
-            if (!(stream >> kind >> value)) return;
-            if (kind == "cp") { score = value; hasScore = true; }
-            else if (kind == "mate") {
-                score = value > 0 ? 10000 - value : -10000 - value;
-                hasScore = true;
-            }
-        } else if (word == "pv") {
-            stream >> move;
-            break;
-        }
-    }
-    if (depth > 0 && multipv > 0 && multipv <= 64 && hasScore && CAPUciMove(move))
-        byDepth[depth][multipv] = {move, score};
-}
-
-static std::string CAPChooseLowEloMove(
-    const std::map<int, std::map<int, CAPRootMove>> &byDepth, int elo,
-    const std::string &engineMove, const char *fen) {
-    // MultiPV moves are legal root moves. Their score and simple FEN features
-    // shape a human-like distribution; this is not an Elo calibration.
-    CAPHumanParams params = CAPHumanParamsForElo(elo);
-    CAPFenBoard board = CAPParseFenBoard(fen);
-    for (auto depth = byDepth.rbegin(); depth != byDepth.rend(); ++depth) {
-        if (depth->second.size() < 2) continue;
-        int bestScore = -10000;
-        for (const auto &entry : depth->second)
-            bestScore = MAX(bestScore, entry.second.score);
-        // Favor forced wins, defenses, and already won positions.
-        if (bestScore > params.conversionThreshold || bestScore < -500) {
-            for (const auto &entry : depth->second)
-                if (entry.second.score == bestScore) return entry.second.move;
-        }
-        if (board.valid) {
-            int pieceCount = 0;
-            for (char piece : board.squares) if (piece) ++pieceCount;
-            if (pieceCount <= 7 + (int)(3 * params.t)) {
-                for (const auto &entry : depth->second)
-                    if (entry.second.score == bestScore) return entry.second.move;
-            }
-        }
-        double total = 0;
-        for (const auto &entry : depth->second) {
-            double loss = (double)bestScore - entry.second.score;
-            double perceived = loss * (0.30 + 0.70 * params.t);
-            total += exp(MAX(-20.0, -perceived / params.temperature)) *
-                     CAPHumanMoveWeight(entry.second.move, board, params);
-        }
-        double draw = ((double)arc4random() / (double)UINT32_MAX) * total;
-        for (const auto &entry : depth->second) {
-            double loss = (double)bestScore - entry.second.score;
-            double perceived = loss * (0.30 + 0.70 * params.t);
-            draw -= exp(MAX(-20.0, -perceived / params.temperature)) *
-                    CAPHumanMoveWeight(entry.second.move, board, params);
-            if (draw <= 0) return entry.second.move;
-        }
-        return depth->second.rbegin()->second.move;
-    }
-    return engineMove;
+    std::string placement, side, castling, ep;
+    int halfmove = 0, fullmove = 0;
+    if (!(fields >> placement >> side >> castling >> ep >> halfmove >> fullmove) ||
+        (side != "w" && side != "b") || fullmove < 1 || fullmove > 10000)
+        return -1;
+    return 2 * (fullmove - 1) + (side == "b" ? 1 : 0);
 }
 
 static BOOL CAPExternalEngineMove(const char *path, const char *fen,
@@ -1711,6 +1480,8 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
     // later positions do not pay process launch and NNUE initialization costs.
     static int cachedInput = -1, cachedOutput = -1, cachedThreads = 0;
     static pid_t cachedPid = 0;
+    static std::string humanLastFen, humanLastMove;
+    static int humanLastPly = -1, humanLastElo = -1;
     if (stockfish19 && cachedPid > 0) {
         int status = 0;
         pid_t exited;
@@ -1753,8 +1524,31 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
     }
     BOOL success = NO;
     std::string line;
-    std::map<int, std::map<int, CAPRootMove>> lowEloMoves;
     BOOL lowElo = stockfish19 && requestedElo < 1320;
+    int ply = lowElo ? CAPFenPly(fen) : -1;
+    NSString *humanGo = nil;
+    if (lowElo) {
+        BOOL newGame = humanLastPly < 0 || ply < humanLastPly ||
+            (ply <= 1 && humanLastPly > 1);
+        if (newGame) {
+            HENewGame(strstr(fen, " b ") == nullptr, requestedElo);
+            humanLastFen.clear(); humanLastMove.clear();
+            NSLog(@"[ChessAssistantPro] Human band new game, ply=%d", ply);
+        } else if (ply == humanLastPly + 2 && !humanLastFen.empty() &&
+                   !humanLastMove.empty()) {
+            NSString *opponent = HEInferOpponentMove(humanLastFen.c_str(),
+                humanLastMove.c_str(), fen);
+            if (opponent) {
+                HENoteOpponentMove(opponent.UTF8String);
+                NSLog(@"[ChessAssistantPro] Human band opponent move %@", opponent);
+            } else {
+                HENoteOpponentMove(nullptr);
+                NSLog(@"[ChessAssistantPro] Human band opponent move unavailable from FEN transition");
+            }
+        } else if (ply > humanLastPly && ply != humanLastPly + 2) {
+            HENoteOpponentMove(nullptr);
+        }
+    }
     CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 5.0;
     if (!reused) {
         if (!CAPWrite(input[1], "uci\n") || !CAPWaitForLine(output[0], "uciok", deadline)) goto done;
@@ -1763,48 +1557,63 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
     if (stockfish19) {
         // Reapply on every position: the engine process is reused after slider changes.
         int uciElo = MAX(1320, MIN(3190, requestedElo));
-        CAPHumanParams params = CAPHumanParamsForElo(requestedElo);
-        int pvCount = lowElo ? params.multipv : 1;
-        int desiredThreads = lowElo ? 1 : 2;
-        if (cachedThreads != desiredThreads) {
-            if (!CAPWrite(input[1], "setoption name Threads value " +
-                                    std::to_string(desiredThreads) + "\n")) goto done;
-            cachedThreads = desiredThreads;
+        if (!lowElo && cachedThreads != 2) {
+            if (!CAPWrite(input[1], "setoption name Threads value 2\n")) goto done;
+            cachedThreads = 2;
         }
-        if (!CAPWrite(input[1], "setoption name MultiPV value " +
-                                std::to_string(pvCount) + "\n") ||
-            !CAPWrite(input[1], "setoption name Skill Level value " +
-                                std::to_string(lowElo ? params.skill : 20) + "\n") ||
-            !CAPWrite(input[1], std::string("setoption name UCI_LimitStrength value ") +
-                                (lowElo || requestedElo >= 3190 ? "false\n" : "true\n")) ||
-            !CAPWrite(input[1], "setoption name UCI_Elo value " +
-                                std::to_string(uciElo) + "\n")) goto done;
-        NSLog(@"[ChessAssistantPro] Stockfish strength slider=%d UCI_Elo=%d skill=%.1f/20 MultiPV=%d%@",
-              requestedElo, uciElo, CAPStockfishSkillForElo(requestedElo), pvCount,
-              lowElo ? @" (uncalibrated human band)" : @"");
+        if (lowElo) {
+            for (NSString *command in HEConfigureCommands(requestedElo)) {
+                if ([command hasPrefix:@"go "]) {
+                    humanGo = command;
+                } else if ([command isEqualToString:@"setoption name Threads value 1"]) {
+                    if (cachedThreads != 1) {
+                        if (!CAPWrite(input[1], "setoption name Threads value 1\n")) goto done;
+                        cachedThreads = 1;
+                    }
+                } else if (!CAPWrite(input[1], std::string(command.UTF8String) + "\n")) goto done;
+            }
+            if (!humanGo) goto done;
+            HEResetLines();
+            NSLog(@"[ChessAssistantPro] Stockfish human band ELO=%d ply=%d %@",
+                  requestedElo, ply, humanGo);
+        } else {
+            if (!CAPWrite(input[1], "setoption name MultiPV value 1\n") ||
+                !CAPWrite(input[1], "setoption name Skill Level value 20\n") ||
+                !CAPWrite(input[1], std::string("setoption name UCI_LimitStrength value ") +
+                                    (requestedElo >= 3190 ? "false\n" : "true\n")) ||
+                !CAPWrite(input[1], "setoption name UCI_Elo value " +
+                                    std::to_string(uciElo) + "\n")) goto done;
+            NSLog(@"[ChessAssistantPro] Stockfish strength slider=%d UCI_Elo=%d skill=%.1f/20 MultiPV=1",
+                  requestedElo, uciElo, CAPStockfishSkillForElo(requestedElo));
+        }
     }
     if (!CAPWrite(input[1], "isready\n") || !CAPWaitForLine(output[0], "readyok", deadline)) goto done;
     if (!CAPWrite(input[1], std::string("position fen ") + fen + "\n")) goto done;
-    if (lowElo) {
-        CAPHumanParams params = CAPHumanParamsForElo(requestedElo);
-        int depth = params.depth + (int)arc4random_uniform(3);
-        int moveTime = 110 + (int)arc4random_uniform(140);
-        NSLog(@"[ChessAssistantPro] Stockfish human band depth=%d movetime=%d ms", depth, moveTime);
-        if (!CAPWrite(input[1], "go depth " + std::to_string(depth) +
-                                " movetime " + std::to_string(moveTime) + "\n")) goto done;
-    } else if (!CAPWrite(input[1], stockfish19 ? "go movetime 200\n" : "go depth 16\n")) goto done;
+    if (!CAPWrite(input[1], lowElo ? std::string(humanGo.UTF8String) + "\n" :
+                          (stockfish19 ? "go movetime 200\n" : "go depth 16\n"))) goto done;
     deadline = CFAbsoluteTimeGetCurrent() + (stockfish19 ? 3.0 : 15.0);
     while (CAPReadLine(output[0], line, deadline)) {
         if (line.find("CRITICAL ERROR") != std::string::npos) break;
         if (line.compare(0, 9, "bestmove ") != 0) {
-            if (lowElo) CAPRecordRootMove(line, lowEloMoves);
+            if (lowElo) HEParseInfo(line.c_str());
             continue;
         }
         size_t end = line.find(' ', 9);
         bestMove = line.substr(9, end == std::string::npos ? end : end - 9);
         success = CAPUciMove(bestMove);
-        if (success && lowElo)
-            bestMove = CAPChooseLowEloMove(lowEloMoves, requestedElo, bestMove, fen);
+        if (success && lowElo) {
+            if (humanLastFen == fen && humanLastElo == requestedElo &&
+                CAPUciMove(humanLastMove)) {
+                bestMove = humanLastMove;
+            } else {
+                NSString *chosen = HEChooseMove(fen, MAX(ply, 0), requestedElo);
+                if (chosen && CAPUciMove(chosen.UTF8String)) bestMove = chosen.UTF8String;
+                humanLastFen = fen;
+                humanLastMove = bestMove;
+                humanLastPly = ply;
+                humanLastElo = requestedElo;
+            }
+        }
         break;
     }
 done:

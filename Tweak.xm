@@ -1047,25 +1047,6 @@ static char kAutoPlayRowKey, kAutoEngineRowKey, kDelayRowKey,
             kMinDelayFieldKey, kMaxDelayFieldKey;
 static char kGodEngineRowKey;
 
-static UISwitch *CAPFindSwitch(UIView *view) {
-    if ([view isKindOfClass:UISwitch.class]) return (UISwitch *)view;
-    for (UIView *child in view.subviews) {
-        UISwitch *found = CAPFindSwitch(child);
-        if (found) return found;
-    }
-    return nil;
-}
-
-static UILabel *CAPFindLabel(UIView *view, NSString *text) {
-    if ([view isKindOfClass:UILabel.class] &&
-        [((UILabel *)view).text isEqualToString:text]) return (UILabel *)view;
-    for (UIView *child in view.subviews) {
-        UILabel *found = CAPFindLabel(child, text);
-        if (found) return found;
-    }
-    return nil;
-}
-
 static UISegmentedControl *CAPFindSegment(UIView *view) {
     if ([view isKindOfClass:UISegmentedControl.class]) return (UISegmentedControl *)view;
     for (UIView *child in view.subviews) {
@@ -1078,17 +1059,9 @@ static UISegmentedControl *CAPFindSegment(UIView *view) {
 static void CAPSyncEngineChoiceUI(id panel) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     CAPAutoEngine selected = CAPSelectedAutoEngine();
-    [defaults setBool:selected == CAPAutoEngineMaia forKey:@"ChessAssist_UseMaia"];
     if (selected != CAPAutoEngineMaia)
         [defaults setInteger:selected == CAPAutoEngineTriumviratus ? 1 : 0 forKey:kGodEngineKey];
     if (![panel isKindOfClass:UIView.class]) return;
-    UILabel *maia = CAPFindLabel(panel, @"Maia (human-like)");
-    UISwitch *switchView = maia ? CAPFindSwitch(maia.superview) : nil;
-    if (switchView && switchView.on != (selected == CAPAutoEngineMaia)) {
-        [switchView setOn:selected == CAPAutoEngineMaia animated:YES];
-        // Let the original mod refresh its engine after the selection changes.
-        [switchView sendActionsForControlEvents:UIControlEventValueChanged];
-    }
     UIView *godRow = objc_getAssociatedObject(panel, &kGodEngineRowKey);
     UISegmentedControl *god = godRow ? CAPFindSegment(godRow) : nil;
     if (god) god.selectedSegmentIndex = selected == CAPAutoEngineTriumviratus ? 1 : 0;

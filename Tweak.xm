@@ -1449,11 +1449,179 @@ static int CAPRequestedStockfishElo(void) {
 }
 
 static double CAPStockfishSkillForElo(int elo) {
-    if (elo < 1320) return 0;
+    if (elo < 1320) return lround(3.0 * fmax(0.0, fmin(1.0, (elo - 600) / 719.0)));
     if (elo >= 3190) return 20;
     double e = (double)(elo - 1320) / (3190 - 1320);
     return fmax(0.0, fmin(19.0,
         (((37.2473 * e - 40.8525) * e + 22.2943) * e - 0.311438)));
+}
+
+struct CAPHumanParams {
+    double t;
+    int skill, depth, multipv;
+    double temperature, quietWeight, greed, aggression, fear;
+    int conversionThreshold;
+};
+
+static CAPHumanParams CAPHumanParamsForElo(int elo) {
+    double t = fmax(0.0, fmin(1.0, (elo - 600) / 719.0));
+    return {t, (int)lround(3 * t), (int)lround(5 + 5 * t),
+            (int)lround(10 - 4 * t), 145 - 100 * t,
+            0.50 + 0.45 * t, 1.50 - 0.40 * t,
+            1.45 - 0.35 * t, 0.40 + 0.40 * t,
+            (int)lround(600 - 250 * t)};
+}
+
+struct CAPFenBoard {
+    char squares[64] = {};
+    char side = 0;
+    std::string enPassant;
+    int fullmove = 1;
+    bool valid = false;
+};
+
+static CAPFenBoard CAPParseFenBoard(const char *fen) {
+    CAPFenBoard board;
+    if (!fen) return board;
+    std::istringstream fields(fen);
+    std::string placement, side, castling;
+    int halfmove = 0;
+    if (!(fields >> placement >> side >> castling >> board.enPassant >> halfmove >> board.fullmove) ||
+        (side != "w" && side != "b")) return board;
+    int rank = 7, file = 0;
+    for (char c : placement) {
+        if (c == '/') {
+            if (file != 8 || rank == 0) return board;
+            --rank; file = 0;
+        } else if (c >= '1' && c <= '8') {
+            file += c - '0';
+            if (file > 8) return board;
+        } else if (strchr("PNBRQKpnbrqk", c) && file < 8) {
+            board.squares[rank * 8 + file++] = c;
+        } else return board;
+    }
+    board.valid = rank == 0 && file == 8;
+    board.side = side[0];
+    return board;
+}
+
+static int CAPSquareIndex(char file, char rank) {
+    return (rank - '1') * 8 + file - 'a';
+}
+
+static int CAPPieceValue(char piece) {
+    switch (tolower((unsigned char)piece)) {
+        case 'p': return 1;
+        case 'n': case 'b': return 3;
+        case 'r': return 5;
+        case 'q': return 9;
+        default: return 0;
+    }
+}
+
+static bool CAPAttacksSquare(const CAPFenBoard &board, int from, int to) {
+    char piece = board.squares[from];
+    if (!piece || from == to) return false;
+    int dx = to % 8 - from % 8, dy = to / 8 - from / 8;
+    int ax = abs(dx), ay = abs(dy);
+    switch (tolower((unsigned char)piece)) {
+        case 'p': return ax == 1 && dy == (isupper((unsigned char)piece) ? 1 : -1);
+        case 'n': return (ax == 1 && ay == 2) || (ax == 2 && ay == 1);
+        case 'k': return ax <= 1 && ay <= 1;
+        case 'b': if (ax != ay) return false; break;
+        case 'r': if (dx && dy) return false; break;
+        case 'q': if (dx && dy && ax != ay) return false; break;
+        default: return false;
+    }
+    int stepX = (dx > 0) - (dx < 0), stepY = (dy > 0) - (dy < 0);
+    for (int x = from % 8 + stepX, y = from / 8 + stepY;
+         x != to % 8 || y != to / 8; x += stepX, y += stepY) {
+        if (board.squares[y * 8 + x]) return false;
+    }
+    return true;
+}
+
+static void CAPMoveTactics(const CAPFenBoard &before, const std::string &move,
+                           bool &check, bool &queenThreat) {
+    check = queenThreat = false;
+    CAPFenBoard after = before;
+    int from = CAPSquareIndex(move[0], move[1]);
+    int to = CAPSquareIndex(move[2], move[3]);
+    char piece = after.squares[from];
+    if (tolower((unsigned char)piece) == 'p' && move[0] != move[2] &&
+        !after.squares[to] && before.enPassant == move.substr(2, 2))
+        after.squares[from / 8 * 8 + to % 8] = 0;
+    after.squares[from] = 0;
+    after.squares[to] = move.size() == 5 ?
+        (before.side == 'w' ? toupper((unsigned char)move[4]) : move[4]) : piece;
+    if (tolower((unsigned char)piece) == 'k' && abs(move[2] - move[0]) == 2) {
+        int home = from / 8 * 8;
+        int rookFrom = home + (move[2] > move[0] ? 7 : 0);
+        int rookTo = home + (move[2] > move[0] ? 5 : 3);
+        after.squares[rookTo] = after.squares[rookFrom];
+        after.squares[rookFrom] = 0;
+    }
+    char enemyKing = before.side == 'w' ? 'k' : 'K';
+    char enemyQueen = before.side == 'w' ? 'q' : 'Q';
+    int kingSquare = -1, queenSquare = -1;
+    for (int i = 0; i < 64; ++i) {
+        if (after.squares[i] == enemyKing) kingSquare = i;
+        if (after.squares[i] == enemyQueen) queenSquare = i;
+    }
+    if (queenSquare >= 0) queenThreat = CAPAttacksSquare(after, to, queenSquare);
+    if (kingSquare >= 0) {
+        for (int i = 0; i < 64; ++i) {
+            char candidate = after.squares[i];
+            if (candidate &&
+                (isupper((unsigned char)candidate) == (before.side == 'w')) &&
+                CAPAttacksSquare(after, i, kingSquare)) {
+                check = true;
+                break;
+            }
+        }
+    }
+}
+
+static double CAPHumanMoveWeight(const std::string &move,
+                                  const CAPFenBoard &board,
+                                  const CAPHumanParams &params) {
+    if (!board.valid || !CAPUciMove(move)) return 1.0;
+    int from = CAPSquareIndex(move[0], move[1]);
+    int to = CAPSquareIndex(move[2], move[3]);
+    char piece = board.squares[from], captured = board.squares[to];
+    if (!piece) return 1.0;
+    char kind = tolower((unsigned char)piece);
+    double weight = 1.0;
+    bool pawn = kind == 'p';
+    bool enPassant = pawn && move[0] != move[2] && !captured &&
+                     board.enPassant == move.substr(2, 2);
+    bool capture = captured || enPassant;
+    if (capture) {
+        weight *= params.greed;
+        if (captured && CAPPieceValue(captured) > CAPPieceValue(piece))
+            weight *= 1.0 + 0.6 * (1.0 - params.t);
+    } else {
+        weight *= params.quietWeight;
+    }
+    bool givesCheck = false, attacksQueen = false;
+    CAPMoveTactics(board, move, givesCheck, attacksQueen);
+    if (givesCheck) weight *= params.aggression;
+    if (attacksQueen) weight *= 1.0 + 0.3 * (1.0 - params.t);
+    if (pawn && move[1] != move[3]) weight *= 1.0 + 0.2 * (1.0 - params.t);
+    if (!pawn && kind != 'k' &&
+        ((board.side == 'w' && move[3] < move[1]) ||
+         (board.side == 'b' && move[3] > move[1]))) weight *= params.fear;
+    if (board.fullmove <= 8) {
+        bool homeMinor = (kind == 'n' || kind == 'b') &&
+                         move[1] == (board.side == 'w' ? '1' : '8');
+        if (homeMinor) weight *= 1.15 + 0.35 * params.t;
+        if (kind == 'k' && abs(move[2] - move[0]) == 2)
+            weight *= 0.65 + 0.45 * params.t;
+        if (kind == 'q') weight *= 1.0 + 0.55 * (1.0 - params.t);
+        if (pawn && (move[0] == 'a' || move[0] == 'h'))
+            weight *= 0.45 + 0.45 * params.t;
+    }
+    return weight;
 }
 
 struct CAPRootMove {
@@ -1491,21 +1659,42 @@ static void CAPRecordRootMove(const std::string &line,
 
 static std::string CAPChooseLowEloMove(
     const std::map<int, std::map<int, CAPRootMove>> &byDepth, int elo,
-    const std::string &engineMove) {
-    // This broadens the legal root moves below Stockfish's 1320-Elo floor.
-    // The temperature is a strength control, not a calibrated Elo guarantee.
+    const std::string &engineMove, const char *fen) {
+    // MultiPV moves are legal root moves. Their score and simple FEN features
+    // shape a human-like distribution; this is not an Elo calibration.
+    CAPHumanParams params = CAPHumanParamsForElo(elo);
+    CAPFenBoard board = CAPParseFenBoard(fen);
     for (auto depth = byDepth.rbegin(); depth != byDepth.rend(); ++depth) {
         if (depth->second.size() < 2) continue;
         int bestScore = -10000;
         for (const auto &entry : depth->second)
             bestScore = MAX(bestScore, entry.second.score);
-        double temperature = 30.0 + (1320.0 - elo) * 0.32;
+        // Favor forced wins, defenses, and already won positions.
+        if (bestScore > params.conversionThreshold || bestScore < -500) {
+            for (const auto &entry : depth->second)
+                if (entry.second.score == bestScore) return entry.second.move;
+        }
+        if (board.valid) {
+            int pieceCount = 0;
+            for (char piece : board.squares) if (piece) ++pieceCount;
+            if (pieceCount <= 7 + (int)(3 * params.t)) {
+                for (const auto &entry : depth->second)
+                    if (entry.second.score == bestScore) return entry.second.move;
+            }
+        }
         double total = 0;
-        for (const auto &entry : depth->second)
-            total += exp(MAX(-20.0, (entry.second.score - bestScore) / temperature));
+        for (const auto &entry : depth->second) {
+            double loss = (double)bestScore - entry.second.score;
+            double perceived = loss * (0.30 + 0.70 * params.t);
+            total += exp(MAX(-20.0, -perceived / params.temperature)) *
+                     CAPHumanMoveWeight(entry.second.move, board, params);
+        }
         double draw = ((double)arc4random() / (double)UINT32_MAX) * total;
         for (const auto &entry : depth->second) {
-            draw -= exp(MAX(-20.0, (entry.second.score - bestScore) / temperature));
+            double loss = (double)bestScore - entry.second.score;
+            double perceived = loss * (0.30 + 0.70 * params.t);
+            draw -= exp(MAX(-20.0, -perceived / params.temperature)) *
+                    CAPHumanMoveWeight(entry.second.move, board, params);
             if (draw <= 0) return entry.second.move;
         }
         return depth->second.rbegin()->second.move;
@@ -1520,7 +1709,7 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
     CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
     // Accessed only from the serial God Engine queue. Keep Stockfish warm so
     // later positions do not pay process launch and NNUE initialization costs.
-    static int cachedInput = -1, cachedOutput = -1;
+    static int cachedInput = -1, cachedOutput = -1, cachedThreads = 0;
     static pid_t cachedPid = 0;
     if (stockfish19 && cachedPid > 0) {
         int status = 0;
@@ -1531,6 +1720,7 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
             close(cachedInput); close(cachedOutput);
             cachedInput = cachedOutput = -1;
             cachedPid = 0;
+            cachedThreads = 0;
         }
     }
     int input[2] = {-1, -1}, output[2] = {-1, -1};
@@ -1568,30 +1758,41 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
     CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 5.0;
     if (!reused) {
         if (!CAPWrite(input[1], "uci\n") || !CAPWaitForLine(output[0], "uciok", deadline)) goto done;
-        if (stockfish19 &&
-            (!CAPWrite(input[1], "setoption name Threads value 2\n") ||
-             !CAPWrite(input[1], "setoption name Hash value 32\n"))) goto done;
+        if (stockfish19 && !CAPWrite(input[1], "setoption name Hash value 32\n")) goto done;
     }
     if (stockfish19) {
         // Reapply on every position: the engine process is reused after slider changes.
         int uciElo = MAX(1320, MIN(3190, requestedElo));
-        int pvCount = lowElo ? (requestedElo < 800 ? 64 :
-                                requestedElo < 1100 ? 48 : 24) : 1;
+        CAPHumanParams params = CAPHumanParamsForElo(requestedElo);
+        int pvCount = lowElo ? params.multipv : 1;
+        int desiredThreads = lowElo ? 1 : 2;
+        if (cachedThreads != desiredThreads) {
+            if (!CAPWrite(input[1], "setoption name Threads value " +
+                                    std::to_string(desiredThreads) + "\n")) goto done;
+            cachedThreads = desiredThreads;
+        }
         if (!CAPWrite(input[1], "setoption name MultiPV value " +
                                 std::to_string(pvCount) + "\n") ||
             !CAPWrite(input[1], "setoption name Skill Level value " +
-                                std::to_string(lowElo ? 0 : 20) + "\n") ||
+                                std::to_string(lowElo ? params.skill : 20) + "\n") ||
             !CAPWrite(input[1], std::string("setoption name UCI_LimitStrength value ") +
-                                (requestedElo >= 3190 ? "false\n" : "true\n")) ||
+                                (lowElo || requestedElo >= 3190 ? "false\n" : "true\n")) ||
             !CAPWrite(input[1], "setoption name UCI_Elo value " +
                                 std::to_string(uciElo) + "\n")) goto done;
         NSLog(@"[ChessAssistantPro] Stockfish strength slider=%d UCI_Elo=%d skill=%.1f/20 MultiPV=%d%@",
               requestedElo, uciElo, CAPStockfishSkillForElo(requestedElo), pvCount,
-              lowElo ? @" (estimated low-Elo mode)" : @"");
+              lowElo ? @" (uncalibrated human band)" : @"");
     }
     if (!CAPWrite(input[1], "isready\n") || !CAPWaitForLine(output[0], "readyok", deadline)) goto done;
     if (!CAPWrite(input[1], std::string("position fen ") + fen + "\n")) goto done;
-    if (!CAPWrite(input[1], stockfish19 ? "go movetime 200\n" : "go depth 16\n")) goto done;
+    if (lowElo) {
+        CAPHumanParams params = CAPHumanParamsForElo(requestedElo);
+        int depth = params.depth + (int)arc4random_uniform(3);
+        int moveTime = 110 + (int)arc4random_uniform(140);
+        NSLog(@"[ChessAssistantPro] Stockfish human band depth=%d movetime=%d ms", depth, moveTime);
+        if (!CAPWrite(input[1], "go depth " + std::to_string(depth) +
+                                " movetime " + std::to_string(moveTime) + "\n")) goto done;
+    } else if (!CAPWrite(input[1], stockfish19 ? "go movetime 200\n" : "go depth 16\n")) goto done;
     deadline = CFAbsoluteTimeGetCurrent() + (stockfish19 ? 3.0 : 15.0);
     while (CAPReadLine(output[0], line, deadline)) {
         if (line.find("CRITICAL ERROR") != std::string::npos) break;
@@ -1603,7 +1804,7 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
         bestMove = line.substr(9, end == std::string::npos ? end : end - 9);
         success = CAPUciMove(bestMove);
         if (success && lowElo)
-            bestMove = CAPChooseLowEloMove(lowEloMoves, requestedElo, bestMove);
+            bestMove = CAPChooseLowEloMove(lowEloMoves, requestedElo, bestMove, fen);
         break;
     }
 done:
@@ -1617,6 +1818,7 @@ done:
     if (stockfish19) {
         cachedInput = cachedOutput = -1;
         cachedPid = 0;
+        cachedThreads = 0;
     }
     close(input[1]); close(output[0]);
     kill(pid, SIGKILL);
@@ -1893,9 +2095,11 @@ static void CAPUpdateStockfishSkillUI(id panel, UISlider *slider) {
             @"Stockfish 19 ELO limit %d, approximate effective skill %.1f of 20",
             elo, CAPStockfishSkillForElo(elo)];
     } else {
-        label.text = [NSString stringWithFormat:@"~%d · Skill 0 + variety", elo];
+        label.text = [NSString stringWithFormat:@"~%d · Skill %.0f/20 + variety",
+                      elo, CAPStockfishSkillForElo(elo)];
         label.accessibilityLabel = [NSString stringWithFormat:
-            @"Stockfish 19 estimated low strength %d, skill 0 with varied legal moves", elo];
+            @"Stockfish 19 uncalibrated low strength %d, skill %.0f of 20 with varied legal moves",
+            elo, CAPStockfishSkillForElo(elo)];
     }
 }
 

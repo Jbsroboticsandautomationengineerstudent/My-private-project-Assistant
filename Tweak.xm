@@ -7,7 +7,6 @@
 #import <dlfcn.h>
 #import <dispatch/dispatch.h>
 #import <QuartzCore/QuartzCore.h>
-#import "VendorTouch/TouchSimulator.h"
 #include <onnxruntime_c_api.h>
 #include <stdint.h>
 #include <string.h>
@@ -327,9 +326,7 @@ static UIView *CAPVisibleBoardForFEN(NSString *fen) {
     return nil;
 }
 
-// The current Chess.com live board is SwiftChessBoard.ChessBoard. The older
-// CHBoardView path above remains useful in legacy modes but is absent in the
-// live-game screenshot, so an Objective-C makeMove: call cannot move it.
+// Detect the native Swift board so an unsupported move path fails explicitly.
 static UIView *CAPFindSwiftBoard(UIView *view) {
     if (view.hidden || view.alpha < 0.05 || !view.window) return nil;
     Class swiftBoard = NSClassFromString(@"_TtC15SwiftChessBoard10ChessBoard");
@@ -354,7 +351,7 @@ static UIView *CAPVisibleSwiftBoard(void) {
             UIView *found = CAPFindSwiftBoard(window);
             if (!found) continue;
             if (selected && selected != found) {
-                NSLog(@"[ChessAssistantPro] Auto-Play: multiple visible Swift boards; refusing to tap");
+                NSLog(@"[ChessAssistantPro] Auto-Play [board] multiple visible Swift boards");
                 return nil;
             }
             selected = found;
@@ -363,345 +360,20 @@ static UIView *CAPVisibleSwiftBoard(void) {
     return selected;
 }
 
-static BOOL CAPVisibleSettingsPanel(UIView *view) {
-    if (view.hidden || view.alpha < 0.05) return NO;
-    Class panelClass = NSClassFromString(@"CHSettingsPanel");
-    if (panelClass && [view isKindOfClass:panelClass] && view.window &&
-        CGRectIntersectsRect([view convertRect:view.bounds toView:view.window], view.window.bounds))
-        return YES;
-    for (UIView *child in view.subviews)
-        if (CAPVisibleSettingsPanel(child)) return YES;
-    return NO;
-}
-
-static NSString *CAPFenFromObject(id object) {
-    if (!object) return nil;
-    for (NSString *name in @[@"getCurrentFen", @"currentFEN", @"currentFen",
-                            @"fenString", @"boardFEN", @"positionFEN", @"gameFEN"]) {
-        SEL selector = NSSelectorFromString(name);
-        if (![object respondsToSelector:selector]) continue;
-        NSMethodSignature *signature = [object methodSignatureForSelector:selector];
-        if (!signature || signature.methodReturnType[0] != '@') continue;
-        @try {
-            id value = ((id (*)(id, SEL))objc_msgSend)(object, selector);
-            if ([value isKindOfClass:NSString.class] && CAPPositionKey(value)) return value;
-        } @catch (NSException *exception) {}
-    }
-    return nil;
-}
-
-static NSString *CAPCurrentBoardPosition(UIView *board) {
-    for (UIResponder *item = board; item; item = item.nextResponder) {
-        NSString *current = CAPFenFromObject(item);
-        if (current) return CAPPositionKey(current);
-        if ([item isKindOfClass:UIView.class]) {
-            UIView *view = (UIView *)item;
-            for (NSString *name in @[@"chessBoardModel", @"boardModel", @"boardOwner", @"game"]) {
-                SEL selector = NSSelectorFromString(name);
-                if (![view respondsToSelector:selector]) continue;
-                NSMethodSignature *signature = [view methodSignatureForSelector:selector];
-                if (!signature || signature.methodReturnType[0] != '@') continue;
-                @try {
-                    id model = ((id (*)(id, SEL))objc_msgSend)(view, selector);
-                    current = CAPFenFromObject(model);
-                    if (current) return CAPPositionKey(current);
-                } @catch (NSException *exception) {}
-            }
-        }
-    }
-    return nil;
-}
-
-static BOOL CAPSwiftBoardMatchesPosition(UIView *board, NSString *fen) {
-    NSString *expected = CAPPositionKey(fen);
-    if (!expected || ![lastObservedPosition isEqualToString:expected]) return NO;
-    NSString *current = CAPCurrentBoardPosition(board);
-    if (current) return [current isEqualToString:expected];
-    // The original mod may have obtained FEN through a native Swift hook
-    // whose method is not exposed to Objective-C. In that case the newest
-    // engine request plus a single visible board are our freshness checks.
-    return YES;
-}
-
-static BOOL CAPBoardIsFlipped(UIView *board, NSString *fen) {
-    for (UIResponder *item = board; item; item = item.nextResponder) {
-        for (NSString *name in @[@"isFlipped", @"boardFlipped", @"flipped"]) {
-            SEL selector = NSSelectorFromString(name);
-            NSMethodSignature *signature = [item respondsToSelector:selector] ?
-                [item methodSignatureForSelector:selector] : nil;
-            if (signature && (signature.methodReturnType[0] == 'B' ||
-                              signature.methodReturnType[0] == 'c'))
-                return ((BOOL (*)(id, SEL))objc_msgSend)(item, selector);
-        }
-    }
-    // A live game normally keeps the player's pieces at the bottom.
-    return [fen containsString:@" b "];
-}
-
-static BOOL CAPMoveSourceMatchesFEN(NSString *uci, NSString *fen) {
-    NSArray<NSString *> *parts = [fen componentsSeparatedByString:@" "];
-    if (parts.count < 2 || uci.length < 4) return NO;
-    NSArray<NSString *> *ranks = [parts[0] componentsSeparatedByString:@"/"];
-    if (ranks.count != 8) return NO;
-    NSInteger file = [uci characterAtIndex:0] - 'a';
-    NSInteger rank = 8 - ([uci characterAtIndex:1] - '0');
-    if (file < 0 || file > 7 || rank < 0 || rank > 7) return NO;
-    NSInteger column = 0;
-    NSString *row = ranks[rank];
-    for (NSUInteger i = 0; i < row.length; ++i) {
-        unichar piece = [row characterAtIndex:i];
-        if (piece >= '1' && piece <= '8') { column += piece - '0'; continue; }
-        if (column == file)
-            return [parts[1] isEqualToString:@"w"] ?
-                (piece >= 'A' && piece <= 'Z') : (piece >= 'a' && piece <= 'z');
-        ++column;
-    }
-    return NO;
-}
-
-static CGPoint CAPSquarePoint(UIView *board, int file, int rank, BOOL flipped) {
-    CGFloat square = board.bounds.size.width / 8.0;
-    CGFloat x = board.bounds.origin.x + (flipped ? 7 - file : file) * square + square / 2.0;
-    CGFloat y = board.bounds.origin.y + (flipped ? rank : 7 - rank) * square + square / 2.0;
-    return [board convertPoint:CGPointMake(x, y) toView:nil];
-}
-
-static __weak UIView *activeSwiftBoard = nil;
-static NSUInteger swiftTouchBegan = 0, swiftTouchMoved = 0, swiftTouchEnded = 0;
-typedef void (*CAPTouchesIMP)(id, SEL, NSSet<UITouch *> *, UIEvent *);
-static CAPTouchesIMP originalSwiftBegan = nullptr, originalSwiftMoved = nullptr,
-                     originalSwiftEnded = nullptr;
-typedef void (*CAPTapGestureIMP)(id, SEL, UIGestureRecognizer *);
-static CAPTapGestureIMP originalSwiftTap = nullptr;
-static NSUInteger swiftGestureTaps = 0;
-
-static void CAPObserveSwiftTouch(id view, NSSet<UITouch *> *touches, NSString *phase) {
-    UIView *board = activeSwiftBoard;
-    if (!board || ![view isKindOfClass:UIView.class] ||
-        ![(UIView *)view isDescendantOfView:board]) return;
-    if ([phase isEqualToString:@"began"]) ++swiftTouchBegan;
-    else if ([phase isEqualToString:@"moved"]) ++swiftTouchMoved;
-    else ++swiftTouchEnded;
-    UITouch *touch = touches.anyObject;
-    NSLog(@"[ChessAssistantPro] Auto-Play [receiver] %@ %@ at %@", phase,
-          NSStringFromClass([view class]),
-          touch ? NSStringFromCGPoint([touch locationInView:board]) : @"unknown");
-}
-static void CAPSwiftTouchesBegan(id view, SEL selector, NSSet<UITouch *> *touches, UIEvent *event) {
-    CAPObserveSwiftTouch(view, touches, @"began");
-    originalSwiftBegan(view, selector, touches, event);
-}
-static void CAPSwiftTouchesMoved(id view, SEL selector, NSSet<UITouch *> *touches, UIEvent *event) {
-    CAPObserveSwiftTouch(view, touches, @"moved");
-    originalSwiftMoved(view, selector, touches, event);
-}
-static void CAPSwiftTouchesEnded(id view, SEL selector, NSSet<UITouch *> *touches, UIEvent *event) {
-    CAPObserveSwiftTouch(view, touches, @"ended");
-    originalSwiftEnded(view, selector, touches, event);
-}
-static void CAPSwiftTapGesture(id view, SEL selector, UIGestureRecognizer *gesture) {
-    UIView *board = activeSwiftBoard;
-    if (board && [view isKindOfClass:UIView.class] &&
-        [(UIView *)view isDescendantOfView:board]) {
-        ++swiftGestureTaps;
-        NSLog(@"[ChessAssistantPro] Auto-Play [receiver] tap gesture %@ at %@",
-              NSStringFromClass([view class]),
-              NSStringFromCGPoint([gesture locationInView:board]));
-    }
-    originalSwiftTap(view, selector, gesture);
-}
-
-static BOOL CAPValidBoardTarget(UIView *board, CGPoint point) {
-    UIView *target = [board.window hitTest:point withEvent:nil];
-    BOOL valid = target && (target == board || [target isDescendantOfView:board]);
-    NSLog(@"[ChessAssistantPro] Auto-Play [target] %@ at %@ (%@)",
-          NSStringFromClass(target.class), NSStringFromCGPoint(point),
-          valid ? @"board" : @"blocked");
-    return valid;
-}
-
-static BOOL CAPPieceAtPoint(UIView *view, UIView *board, CGPoint point) {
-    if (view.hidden || view.alpha < 0.05) return NO;
-    Class pieceClass = NSClassFromString(@"_TtC15SwiftChessBoard9PieceView");
-    if (pieceClass && [view isKindOfClass:pieceClass]) {
-        CGPoint center = [view.superview convertPoint:view.center toView:nil];
-        CGFloat radius = board.bounds.size.width / 16.0;
-        if (fabs(center.x - point.x) < radius && fabs(center.y - point.y) < radius)
-            return YES;
-    }
-    for (UIView *child in view.subviews)
-        if (CAPPieceAtPoint(child, board, point)) return YES;
-    return NO;
-}
-
-static void CAPTouchTap(CGPoint point, void (^completion)(BOOL)) {
-    BOOL down = simulateTouch(TOUCH_DOWN, point.x, point.y);
-    if (!down) { if (completion) completion(NO); return; }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 45 * NSEC_PER_MSEC),
-                   dispatch_get_main_queue(), ^{
-        BOOL up = simulateTouch(TOUCH_UP, point.x, point.y);
-        if (!up) simulateTouchHandReset();
-        if (completion) completion(up);
-    });
-}
-
-static void CAPTouchDragStep(CGPoint from, CGPoint to, NSInteger step,
-                             void (^completion)(BOOL)) {
-    CGPoint point = CGPointMake(from.x + (to.x - from.x) * step / 4.0,
-                                from.y + (to.y - from.y) * step / 4.0);
-    BOOL sent = simulateTouch(step == 4 ? TOUCH_UP : TOUCH_MOVE, point.x, point.y);
-    if (!sent) simulateTouchHandReset();
-    if (!sent || step == 4) {
-        if (completion) completion(sent);
-        return;
-    }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 40 * NSEC_PER_MSEC),
-                   dispatch_get_main_queue(), ^{ CAPTouchDragStep(from, to, step + 1, completion); });
-}
-
-static void CAPTouchDrag(CGPoint from, CGPoint to, void (^completion)(BOOL)) {
-    if (!simulateTouch(TOUCH_DOWN, from.x, from.y)) {
-        if (completion) completion(NO);
-        return;
-    }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 40 * NSEC_PER_MSEC),
-                   dispatch_get_main_queue(), ^{ CAPTouchDragStep(from, to, 1, completion); });
-}
-
-static BOOL CAPPositionUnchanged(UIView *board, NSString *expected, BOOL *known) {
-    NSString *current = CAPCurrentBoardPosition(board);
-    if (!current) current = lastObservedPosition;
-    *known = current != nil;
-    return [current isEqualToString:expected];
-}
-
-static BOOL CAPSwiftBoardMove(NSString *uci, NSString *fen) {
-    if (!CAPMoveSourceMatchesFEN(uci, fen)) {
-        NSLog(@"[ChessAssistantPro] Auto-Play [position] source square or side-to-move mismatch for %@", uci);
-        return NO;
-    }
-    UIView *board = CAPVisibleSwiftBoard();
-    if (!board || !CAPSwiftBoardMatchesPosition(board, fen)) {
-        NSLog(@"[ChessAssistantPro] Auto-Play [board] missing or position mismatch for %@", uci);
-        return NO;
-    }
-    touchSimulatorSetTargetWindow(board.window);
-    if (!touchSimulatorAvailable()) {
-        NSLog(@"[ChessAssistantPro] Auto-Play [input] HID backend unavailable");
-        return NO;
-    }
-    if (uci.length == 5) {
-        NSLog(@"[ChessAssistantPro] Auto-Play [promotion] native popup choice unverified for %@", uci);
-        return NO;
-    }
-    BOOL flipped = CAPBoardIsFlipped(board, fen);
-    CGPoint from = CAPSquarePoint(board, [uci characterAtIndex:0] - 'a',
-                                 [uci characterAtIndex:1] - '1', flipped);
-    CGPoint to = CAPSquarePoint(board, [uci characterAtIndex:2] - 'a',
-                               [uci characterAtIndex:3] - '1', flipped);
-    UIWindow *window = board.window;
-    if (!CGRectContainsPoint(window.bounds, from) || !CGRectContainsPoint(window.bounds, to)) {
-        NSLog(@"[ChessAssistantPro] Auto-Play [target] squares outside board window");
-        return NO;
-    }
-    for (UIWindow *candidate in ((UIWindowScene *)window.windowScene).windows) {
-        if (CAPVisibleSettingsPanel(candidate)) {
-            NSLog(@"[ChessAssistantPro] Auto-Play [target] settings sheet covers board");
-            return NO;
-        }
-    }
-    if (!CAPValidBoardTarget(board, from) || !CAPValidBoardTarget(board, to)) return NO;
-    NSString *expected = CAPPositionKey(fen);
-    BOOL pieceBefore = CAPPieceAtPoint(board, board, from);
-    NSLog(@"[ChessAssistantPro] Auto-Play [attempt] %@ orientation=%@ sourcePiece=%d",
-          uci, flipped ? @"flipped" : @"normal", pieceBefore);
-    activeSwiftBoard = board;
-    swiftTouchBegan = swiftTouchMoved = swiftTouchEnded = swiftGestureTaps = 0;
-    CAPTouchTap(from, ^(BOOL sourceSent) {
-        if (!sourceSent) {
-            NSLog(@"[ChessAssistantPro] Auto-Play [input] source tap enqueue failed");
-            activeSwiftBoard = nil;
-            return;
-        }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
-                       dispatch_get_main_queue(), ^{
-            if (!CAPSwiftBoardMatchesPosition(board, fen) || !board.window) {
-                NSLog(@"[ChessAssistantPro] Auto-Play [recheck] board changed before destination tap");
-                activeSwiftBoard = nil;
-                return;
-            }
-            for (UIWindow *candidate in ((UIWindowScene *)board.window.windowScene).windows)
-                if (CAPVisibleSettingsPanel(candidate)) {
-                    NSLog(@"[ChessAssistantPro] Auto-Play [recheck] settings sheet reopened");
-                    activeSwiftBoard = nil;
-                    return;
-                }
-            CAPTouchTap(to, ^(BOOL destinationSent) {
-                if (!destinationSent) {
-                    NSLog(@"[ChessAssistantPro] Auto-Play [input] destination tap enqueue failed");
-                    activeSwiftBoard = nil;
-                    return;
-                }
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 550 * NSEC_PER_MSEC),
-                               dispatch_get_main_queue(), ^{
-                    BOOL known = NO;
-                    BOOL unchanged = CAPPositionUnchanged(board, expected, &known);
-                    BOOL pieceStillThere = CAPPieceAtPoint(board, board, from);
-                    NSLog(@"[ChessAssistantPro] Auto-Play [rescan] tap receiver began=%lu ended=%lu gestures=%lu FEN=%@ sourcePiece=%d",
-                          (unsigned long)swiftTouchBegan, (unsigned long)swiftTouchEnded,
-                          (unsigned long)swiftGestureTaps,
-                          !known ? @"unknown" : (unchanged ? @"unchanged" : @"advanced"), pieceStillThere);
-                    if (known && !unchanged) {
-                        NSLog(@"[ChessAssistantPro] Auto-Play [accepted] %@ after taps", uci);
-                        activeSwiftBoard = nil;
-                        return;
-                    }
-                    if (!pieceBefore || !pieceStillThere || !board.window ||
-                        !CAPSwiftBoardMatchesPosition(board, fen) ||
-                        !CAPValidBoardTarget(board, from) || !CAPValidBoardTarget(board, to)) {
-                        NSLog(@"[ChessAssistantPro] Auto-Play [rescan] no safe drag retry for %@", uci);
-                        activeSwiftBoard = nil;
-                        return;
-                    }
-                    NSLog(@"[ChessAssistantPro] Auto-Play [retry] dragging %@", uci);
-                    CAPTouchDrag(from, to, ^(BOOL dragSent) {
-                        if (!dragSent)
-                            NSLog(@"[ChessAssistantPro] Auto-Play [input] drag enqueue failed");
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 650 * NSEC_PER_MSEC),
-                                       dispatch_get_main_queue(), ^{
-                            BOOL finalKnown = NO;
-                            BOOL finalUnchanged = CAPPositionUnchanged(board, expected, &finalKnown);
-                            BOOL finalPiece = CAPPieceAtPoint(board, board, from);
-                            NSLog(@"[ChessAssistantPro] Auto-Play [final] %@ FEN=%@ sourcePiece=%d receiver began=%lu moved=%lu ended=%lu",
-                                  uci, !finalKnown ? @"unknown" : (finalUnchanged ? @"unchanged" : @"advanced"),
-                                  finalPiece, (unsigned long)swiftTouchBegan,
-                                  (unsigned long)swiftTouchMoved, (unsigned long)swiftTouchEnded);
-                            if (finalKnown && !finalUnchanged)
-                                NSLog(@"[ChessAssistantPro] Auto-Play [accepted] %@ after drag", uci);
-                            else if (finalPiece)
-                                NSLog(@"[ChessAssistantPro] Auto-Play [failed] source piece remains after %@", uci);
-                            else NSLog(@"[ChessAssistantPro] Auto-Play [unverified] board FEN unavailable after %@", uci);
-                            activeSwiftBoard = nil;
-                        });
-                    });
-                });
-            });
-        });
-    });
-    return YES;
-}
-
 static BOOL CAPAutoPlay(NSString *uci, NSString *fen, CAPMoveSource source) {
     if (![[NSUserDefaults standardUserDefaults] boolForKey:kAutoPlayKey] ||
-        !CAPSourceEnabled(source) || [lastPlayedFEN isEqualToString:fen]) return NO;
+        !CAPSourceEnabled(source) || [lastPlayedFEN isEqualToString:fen]) {
+        NSLog(@"[ChessAssistantPro] Auto-Play [selection] disabled, wrong engine, or position already attempted");
+        return NO;
+    }
     int sf = [uci characterAtIndex:0] - 'a', sr = [uci characterAtIndex:1] - '1';
     int df = [uci characterAtIndex:2] - 'a', dr = [uci characterAtIndex:3] - '1';
     @try {
         UIView *board = CAPVisibleBoardForFEN(fen);
         if (!board) {
-            if (!CAPSwiftBoardMove(uci, fen)) return NO;
-            lastPlayedFEN = [fen copy];
-            return YES;
+            NSLog(@"[ChessAssistantPro] Auto-Play [direct] %@; no verified move API for %@",
+                  CAPVisibleSwiftBoard() ? @"Swift board detected" : @"matching board not found", uci);
+            return NO;
         }
         BOOL whiteToMove = [fen containsString:@" w "];
         SEL permission = whiteToMove ? @selector(allowUserToMakeWhiteMoves)
@@ -736,10 +408,28 @@ static BOOL CAPAutoPlay(NSString *uci, NSString *fen, CAPMoveSource source) {
             NSLog(@"[ChessAssistantPro] Auto-Play: %@ is not legal in live board", uci);
             return NO;
         }
+        NSString *before = CAPPositionKey(fen);
+        NSLog(@"[ChessAssistantPro] Auto-Play [direct] invoking CHBoardView for %@", uci);
         ((void (*)(id, SEL, id, BOOL))objc_msgSend)
-            (board, @selector(makeMove:throughTouches:), candidate, YES);
+            (board, @selector(makeMove:throughTouches:), candidate, NO);
         lastPlayedFEN = [fen copy];
-        NSLog(@"[ChessAssistantPro] Auto-Play requested %@ through CHBoardView", uci);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            NSString *after = nil;
+            id currentGame = board.window ?
+                ((id (*)(id, SEL))objc_msgSend)(board, @selector(chessGame)) : nil;
+            if (currentGame && [currentGame respondsToSelector:@selector(fenForCurrentPosition:flipped:)])
+                after = ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)
+                    (currentGame, @selector(fenForCurrentPosition:flipped:), YES, NO);
+            if (!after && board.window &&
+                [board respondsToSelector:@selector(fenForCurrentPosition:flipped:)])
+                after = ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)
+                    (board, @selector(fenForCurrentPosition:flipped:), YES, NO);
+            NSString *position = [after isKindOfClass:NSString.class] ? CAPPositionKey(after) : nil;
+            NSLog(@"[ChessAssistantPro] Auto-Play [verify] %@ %@", uci,
+                  !position ? @"position unavailable" :
+                  ([position isEqualToString:before] ? @"unchanged" : @"advanced"));
+        });
         return YES;
     } @catch (NSException *exception) {
         NSLog(@"[ChessAssistantPro] Auto-Play skipped: %@", exception);
@@ -749,7 +439,11 @@ static BOOL CAPAutoPlay(NSString *uci, NSString *fen, CAPMoveSource source) {
 
 static void CAPScheduleAutoPlay(NSString *move, NSString *fen, CAPMoveSource source) {
     NSString *uci = CAPNormalizeMove(move);
-    if (!fen.length || (uci.length != 4 && uci.length != 5)) return;
+    if (!fen.length || (uci.length != 4 && uci.length != 5)) {
+        if ([[NSUserDefaults standardUserDefaults] boolForKey:kAutoPlayKey])
+            NSLog(@"[ChessAssistantPro] Auto-Play [selection] missing FEN or invalid engine move %@", move);
+        return;
+    }
     if ([uci characterAtIndex:0] < 'a' || [uci characterAtIndex:0] > 'h' ||
         [uci characterAtIndex:2] < 'a' || [uci characterAtIndex:2] > 'h' ||
         [uci characterAtIndex:1] < '1' || [uci characterAtIndex:1] > '8' ||

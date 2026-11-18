@@ -1031,18 +1031,6 @@ static void CAPSetFillColor(CAShapeLayer *layer, SEL selector, CGColorRef color)
         if (maia) MSHookFunction(maia, (void *)CAPMaiaGo, (void **)&originalMaiaGo);
         void *engine = dlsym(RTLD_DEFAULT, "EngineGo");
         if (engine) MSHookFunction(engine, (void *)CAPEngineGo, (void **)&originalEngineGo);
-        Class touchOverlay = NSClassFromString(@"_TtC15SwiftChessBoard28PiecesOverlayWithTouchEvents");
-        if (touchOverlay) {
-            MSHookMessageEx(touchOverlay, @selector(touchesBegan:withEvent:),
-                            (IMP)CAPSwiftTouchesBegan, (IMP *)&originalSwiftBegan);
-            MSHookMessageEx(touchOverlay, @selector(touchesMoved:withEvent:),
-                            (IMP)CAPSwiftTouchesMoved, (IMP *)&originalSwiftMoved);
-            MSHookMessageEx(touchOverlay, @selector(touchesEnded:withEvent:),
-                            (IMP)CAPSwiftTouchesEnded, (IMP *)&originalSwiftEnded);
-        } else NSLog(@"[ChessAssistantPro] Auto-Play [receiver] Swift touch overlay class missing");
-        Class tappableView = NSClassFromString(@"_TtC15SwiftChessBoard12TappableView");
-        if (tappableView) MSHookMessageEx(tappableView, @selector(tapGestureProcessWithGesture:),
-                                         (IMP)CAPSwiftTapGesture, (IMP *)&originalSwiftTap);
         Class shape = objc_getClass("CAShapeLayer");
         if (shape) {
             MSHookMessageEx(shape, @selector(setStrokeColor:), (IMP)CAPSetStrokeColor,
@@ -1050,6 +1038,6 @@ static void CAPSetFillColor(CAShapeLayer *layer, SEL selector, CGColorRef color)
             MSHookMessageEx(shape, @selector(setFillColor:), (IMP)CAPSetFillColor,
                             (IMP *)&originalFillColor);
         }
-        NSLog(@"[ChessAssistantPro] Maia=%p Engine=%p SwiftTouch=%p", maia, engine, touchOverlay);
+        NSLog(@"[ChessAssistantPro] Maia=%p Engine=%p", maia, engine);
     }
 }

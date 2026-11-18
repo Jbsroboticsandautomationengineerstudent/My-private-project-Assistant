@@ -1762,32 +1762,26 @@ static HEBoard HEApply(const HEBoard *in, HEMove m) {
     return b;
 }
 
-// Infer the opponent's actual move when the next search follows a move we
-// selected. Comparing resulting boards avoids guessing from square changes in
-// castling, en passant and promotion positions.
-NSString *HEInferOpponentMove(const char *priorFen, const char *selectedMove,
-                              const char *currentFen) {
-    HEBoard prior, current;
-    if (!HEParseFEN(priorFen, &prior) || !HEParseFEN(currentFen, &current)) return nil;
-    HEMove ours = HEParseMove(selectedMove);
-    if (ours.from < 0 || ours.to < 0 || prior.sq[ours.from] == '.' ||
-        HEIsWhitePiece(prior.sq[ours.from]) != prior.whiteToMove ||
-        current.whiteToMove != prior.whiteToMove) return nil;
-    HEBoard afterOurs = HEApply(&prior, ours);
+// Accept a transition only when exactly one move reproduces the next board.
+// This also handles castling, en passant and promotions without guessing from
+// a changed-square count.
+static NSString *HEInferMoveBetweenBoards(const HEBoard *before,
+                                          const HEBoard *after) {
+    if (before->whiteToMove == after->whiteToMove) return nil;
     NSString *match = nil;
     for (int from = 0; from < 64; ++from) {
-        char piece = afterOurs.sq[from];
-        if (piece == '.' || HEIsWhitePiece(piece) != afterOurs.whiteToMove) continue;
+        char piece = before->sq[from];
+        if (piece == '.' || HEIsWhitePiece(piece) != before->whiteToMove) continue;
         for (int to = 0; to < 64; ++to) {
             if (from == to) continue;
             BOOL promotion = tolower((unsigned char)piece) == 'p' &&
-                HERank(to) == (afterOurs.whiteToMove ? 7 : 0);
+                HERank(to) == (before->whiteToMove ? 7 : 0);
             const char *promotions = promotion ? "qrbn" : "-";
             for (const char *promo = promotions; *promo; ++promo) {
                 HEMove candidate = {from, to, (char)(promotion ? *promo : 0)};
-                HEBoard result = HEApply(&afterOurs, candidate);
-                if (result.whiteToMove != current.whiteToMove ||
-                    memcmp(result.sq, current.sq, sizeof(result.sq)) != 0) continue;
+                HEBoard result = HEApply(before, candidate);
+                if (result.whiteToMove != after->whiteToMove ||
+                    memcmp(result.sq, after->sq, sizeof(result.sq)) != 0) continue;
                 NSString *uci = [NSString stringWithFormat:@"%c%c%c%c%@",
                     'a' + HEFile(from), '1' + HERank(from),
                     'a' + HEFile(to), '1' + HERank(to),
@@ -1798,6 +1792,26 @@ NSString *HEInferOpponentMove(const char *priorFen, const char *selectedMove,
         }
     }
     return match;
+}
+
+static NSString *HEInferOnePlyMove(const char *priorFen, const char *currentFen) {
+    HEBoard prior, current;
+    if (!HEParseFEN(priorFen, &prior) || !HEParseFEN(currentFen, &current)) return nil;
+    return HEInferMoveBetweenBoards(&prior, &current);
+}
+
+// When only our own turns were observed, first apply the move recommended at
+// the previous search, then infer the opponent's reply from the new position.
+NSString *HEInferOpponentMove(const char *priorFen, const char *selectedMove,
+                              const char *currentFen) {
+    HEBoard prior, current;
+    if (!HEParseFEN(priorFen, &prior) || !HEParseFEN(currentFen, &current)) return nil;
+    HEMove ours = HEParseMove(selectedMove);
+    if (ours.from < 0 || ours.to < 0 || prior.sq[ours.from] == '.' ||
+        HEIsWhitePiece(prior.sq[ours.from]) != prior.whiteToMove ||
+        current.whiteToMove != prior.whiteToMove) return nil;
+    HEBoard afterOurs = HEApply(&prior, ours);
+    return HEInferMoveBetweenBoards(&afterOurs, &current);
 }
 
 // ===========================================================================
@@ -2008,6 +2022,34 @@ void HEResetLines(void) {
     HELineDepth = 0;
     memset(HEPreviousLines, 0, sizeof(HEPreviousLines));
     HEPreviousLineCount = 0;
+}
+
+// The search command is returned last. The caller sends the setoption commands
+// before isready/position and sends go only after position fen.
+NSArray<NSString *> *HEConfigureCommands(int elo) {
+    NSMutableArray<NSString *> *commands = [NSMutableArray array];
+    if (!HEHumanBand(elo)) {
+        [commands addObject:@"setoption name MultiPV value 1"];
+        [commands addObject:@"setoption name Skill Level value 20"];
+        if (elo < 3190) {
+            [commands addObject:@"setoption name UCI_LimitStrength value true"];
+            [commands addObject:[NSString stringWithFormat:@"setoption name UCI_Elo value %d", elo]];
+        } else {
+            [commands addObject:@"setoption name UCI_LimitStrength value false"];
+        }
+        [commands addObject:@"go movetime 200"];
+        return commands;
+    }
+    if (!HEP.init) HENewGame(YES, elo);
+    HEHP = HEParamsFor(elo);
+    [commands addObject:@"setoption name UCI_LimitStrength value false"];
+    [commands addObject:@"setoption name Threads value 1"];
+    [commands addObject:[NSString stringWithFormat:@"setoption name Skill Level value %d", HEHP.skill]];
+    [commands addObject:[NSString stringWithFormat:@"setoption name MultiPV value %d", HEHP.multipv]];
+    [commands addObject:[NSString stringWithFormat:@"go depth %d movetime %d",
+                         HEHP.depth + (int)arc4random_uniform(3),
+                         110 + (int)arc4random_uniform(140)]];
+    return commands;
 }
 
 // Parses one "info ... multipv K ... score cp X ... pv MOVE ..." line.
@@ -2333,6 +2375,19 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
             HENewGame(strstr(fen, " b ") == nullptr, requestedElo);
             humanLastFen.clear(); humanLastMove.clear();
             NSLog(@"[ChessAssistantPro] Human band new game, ply=%d", ply);
+        } else if (ply == humanLastPly + 1 && !humanLastFen.empty()) {
+            HEBoard priorBoard;
+            BOOL havePrior = HEParseFEN(humanLastFen.c_str(), &priorBoard);
+            NSString *played = havePrior ?
+                HEInferOnePlyMove(humanLastFen.c_str(), fen) : nil;
+            BOOL opponentMoved = havePrior && priorBoard.whiteToMove != HEP.isWhite;
+            if (opponentMoved) {
+                HENoteOpponentMove(played.UTF8String);
+                NSLog(@"[ChessAssistantPro] Human band opponent move %@",
+                      played ?: @"unavailable from one-ply FEN transition");
+            } else if (played) {
+                HELastOwnTo = HEParseMove(played.UTF8String).to;
+            }
         } else if (ply == humanLastPly + 2 && !humanLastFen.empty() &&
                    !humanLastMove.empty()) {
             NSString *opponent = HEInferOpponentMove(humanLastFen.c_str(),
@@ -2361,21 +2416,17 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
             cachedThreads = 2;
         }
         if (lowElo) {
-            HEParams params = HEParamsFor(requestedElo);
-            if (cachedThreads != 1) {
-                if (!CAPWrite(input[1], "setoption name Threads value 1\n")) goto done;
-                cachedThreads = 1;
+            for (NSString *command in HEConfigureCommands(requestedElo)) {
+                if ([command hasPrefix:@"go "]) {
+                    humanGo = command;
+                } else if ([command isEqualToString:@"setoption name Threads value 1"]) {
+                    if (cachedThreads != 1) {
+                        if (!CAPWrite(input[1], "setoption name Threads value 1\n")) goto done;
+                        cachedThreads = 1;
+                    }
+                } else if (!CAPWrite(input[1], std::string(command.UTF8String) + "\n")) goto done;
             }
-            if (!CAPWrite(input[1], "setoption name MultiPV value " +
-                                    std::to_string(params.multipv) + "\n") ||
-                !CAPWrite(input[1], "setoption name Skill Level value " +
-                                    std::to_string(params.skill) + "\n") ||
-                !CAPWrite(input[1], "setoption name UCI_LimitStrength value false\n") ||
-                !CAPWrite(input[1], "setoption name UCI_Elo value 1320\n")) goto done;
-            int depth = params.depth + (int)arc4random_uniform(3);
-            int moveTime = 110 + (int)arc4random_uniform(140);
-            humanGo = [NSString stringWithFormat:@"go depth %d movetime %d",
-                       depth, moveTime];
+            if (!humanGo) goto done;
             HEResetLines();
             NSLog(@"[ChessAssistantPro] Stockfish human band ELO=%d ply=%d %@",
                   requestedElo, ply, humanGo);

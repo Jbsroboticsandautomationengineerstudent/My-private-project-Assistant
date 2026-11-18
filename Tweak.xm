@@ -945,6 +945,296 @@ static void CAPSwiftBoardLayout(UIView *board, SEL selector) {
     });
 }
 
+// ---- Bot-only Auto-Play for the Swift board (synthetic touches on the pieces overlay) ----
+@interface CAPFakeTouch : UITouch
+@property (nonatomic, weak) UIView *capView;
+@property (nonatomic, assign) CGPoint capPoint, capPrev;
+@property (nonatomic, assign) UITouchPhase capPhase;
+@property (nonatomic, assign) NSTimeInterval capTime;
+@end
+static CGPoint CAPConvertPoint(UIView *src, CGPoint p, UIView *dst) {
+    if (!src || dst == src) return p;
+    return [src convertPoint:p toView:dst];
+}
+@implementation CAPFakeTouch
+- (CGPoint)locationInView:(UIView *)v { return CAPConvertPoint(self.capView, self.capPoint, v); }
+- (CGPoint)previousLocationInView:(UIView *)v { return CAPConvertPoint(self.capView, self.capPrev, v); }
+- (CGPoint)preciseLocationInView:(UIView *)v { return [self locationInView:v]; }
+- (CGPoint)precisePreviousLocationInView:(UIView *)v { return [self previousLocationInView:v]; }
+- (UITouchPhase)phase { return self.capPhase; }
+- (NSUInteger)tapCount { return 1; }
+- (UIView *)view { return self.capView; }
+- (UIWindow *)window { return self.capView.window; }
+- (NSTimeInterval)timestamp { return self.capTime; }
+- (UITouchType)type { return UITouchTypeDirect; }
+- (CGFloat)majorRadius { return 20; }
+- (CGFloat)force { return 0; }
+- (CGFloat)maximumPossibleForce { return 1; }
+- (NSArray *)gestureRecognizers { return @[]; }
+@end
+
+@interface CAPFakeEvent : UIEvent
+@property (nonatomic, strong) NSSet *capTouches;
+@property (nonatomic, assign) NSTimeInterval capTime;
+@end
+@implementation CAPFakeEvent
+- (NSSet *)allTouches { return self.capTouches; }
+- (NSSet *)touchesForView:(UIView *)v { return self.capTouches; }
+- (NSSet *)touchesForWindow:(UIWindow *)w { return self.capTouches; }
+- (UIEventType)type { return UIEventTypeTouches; }
+- (NSTimeInterval)timestamp { return self.capTime; }
+@end
+
+static UIView *CAPFindOverlay(UIView *view, Class overlayClass) {
+    if (view.hidden || view.alpha < 0.05 || !view.window) return nil;
+    if ([view isKindOfClass:overlayClass] && view.bounds.size.width > 160 &&
+        CGRectIntersectsRect([view convertRect:view.bounds toView:view.window], view.window.bounds))
+        return view;
+    for (UIView *child in view.subviews) {
+        UIView *found = CAPFindOverlay(child, overlayClass);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static void CAPCollectPieces(UIView *view, Class pieceClass, NSMutableArray *out) {
+    for (UIView *child in view.subviews) {
+        if ([child isKindOfClass:pieceClass] && !child.hidden && child.alpha > 0.05) [out addObject:child];
+        CAPCollectPieces(child, pieceClass, out);
+    }
+}
+
+static BOOL CAPClassChainHasBot(UIViewController *vc, int depth) {
+    if (!vc || depth > 12) return NO;
+    if ([NSStringFromClass(vc.class) containsString:@"PlayBot"]) return YES;
+    if ([vc isKindOfClass:UINavigationController.class]) {
+        if (CAPClassChainHasBot(((UINavigationController *)vc).topViewController, depth + 1)) return YES;
+    }
+    if ([vc isKindOfClass:UITabBarController.class]) {
+        if (CAPClassChainHasBot(((UITabBarController *)vc).selectedViewController, depth + 1)) return YES;
+    }
+    if (CAPClassChainHasBot(vc.presentedViewController, depth + 1)) return YES;
+    for (UIViewController *child in vc.childViewControllers)
+        if (CAPClassChainHasBot(child, depth + 1)) return YES;
+    return NO;
+}
+
+// YES only when the visible game screen belongs to the PlayBot module (computer opponent).
+static BOOL CAPIsBotGameScreen(UIView *overlay) {
+    for (UIResponder *r = overlay; r; r = r.nextResponder)
+        if ([NSStringFromClass(r.class) containsString:@"PlayBot"]) return YES;
+    return CAPClassChainHasBot(overlay.window.rootViewController, 0);
+}
+
+static CGPoint CAPSquareCenter(CGFloat size, int file, int rank, BOOL flipped) {
+    CGFloat sq = size / 8.0;
+    CGFloat x = (flipped ? 7 - file : file) + 0.5;
+    CGFloat y = (flipped ? rank : 7 - rank) + 0.5;
+    return CGPointMake(x * sq, y * sq);
+}
+
+static uint64_t CAPFenMask(NSString *fen) {
+    uint64_t mask = 0; int rank = 7, file = 0;
+    NSString *board = [fen componentsSeparatedByString:@" "].firstObject;
+    for (NSUInteger i = 0; i < board.length; i++) {
+        unichar c = [board characterAtIndex:i];
+        if (c == '/') { rank--; file = 0; }
+        else if (c >= '1' && c <= '8') file += c - '0';
+        else { if (rank >= 0 && file < 8) mask |= (1ULL << (rank * 8 + file)); file++; }
+    }
+    return mask;
+}
+
+static uint64_t CAPPieceMask(NSArray *pieces, UIView *overlay, BOOL flipped) {
+    uint64_t mask = 0; CGFloat sq = overlay.bounds.size.width / 8.0;
+    for (UIView *p in pieces) {
+        if (!p.superview) continue;
+        CGPoint c = [p.superview convertPoint:p.center toView:overlay];
+        int f = (int)floor(c.x / sq), rt = (int)floor(c.y / sq);
+        if (f < 0 || f > 7 || rt < 0 || rt > 7) continue;
+        int file = flipped ? 7 - f : f, rank = flipped ? rt : 7 - rt;
+        mask |= (1ULL << (rank * 8 + file));
+    }
+    return mask;
+}
+
+static BOOL CAPPieceAt(NSArray *pieces, UIView *overlay, int file, int rank, BOOL flipped) {
+    CGPoint target = CAPSquareCenter(overlay.bounds.size.width, file, rank, flipped);
+    CGFloat sq = overlay.bounds.size.width / 8.0;
+    for (UIView *p in pieces) {
+        if (!p.superview) continue;
+        CGPoint c = [p.superview convertPoint:p.center toView:overlay];
+        if (fabs(c.x - target.x) < sq * 0.5 && fabs(c.y - target.y) < sq * 0.5) return YES;
+    }
+    return NO;
+}
+
+static void CAPSendTouch(UIView *overlay, CAPFakeTouch *touch, CAPFakeEvent *event,
+                         UITouchPhase phase, CGPoint point) {
+    touch.capPrev = touch.capPoint;
+    if (phase == UITouchPhaseBegan) touch.capPrev = point;
+    touch.capPoint = point;
+    touch.capPhase = phase;
+    touch.capTime = NSProcessInfo.processInfo.systemUptime;
+    event.capTime = touch.capTime;
+    SEL sel = phase == UITouchPhaseBegan ? @selector(touchesBegan:withEvent:) :
+              phase == UITouchPhaseMoved ? @selector(touchesMoved:withEvent:) :
+                                           @selector(touchesEnded:withEvent:);
+    ((void (*)(id, SEL, id, id))objc_msgSend)(overlay, sel, event.capTouches, event);
+}
+
+// Synthetic drag (or tap-tap) from one point to another on the pieces overlay.
+static void CAPSyntheticMove(UIView *overlay, CGPoint from, CGPoint to, BOOL tapMode) {
+    CAPFakeTouch *touch = [[CAPFakeTouch alloc] init];
+    CAPFakeEvent *event = [[CAPFakeEvent alloc] init];
+    touch.capView = overlay;
+    event.capTouches = [NSSet setWithObject:touch];
+    __block int step = 0;
+    int total = tapMode ? 4 : 6;
+    __block void (^run)(void) = nil;
+    run = ^{
+        @try {
+            if (tapMode) {
+                if (step == 0) CAPSendTouch(overlay, touch, event, UITouchPhaseBegan, from);
+                else if (step == 1) CAPSendTouch(overlay, touch, event, UITouchPhaseEnded, from);
+                else if (step == 2) CAPSendTouch(overlay, touch, event, UITouchPhaseBegan, to);
+                else CAPSendTouch(overlay, touch, event, UITouchPhaseEnded, to);
+            } else if (step == 0) {
+                CAPSendTouch(overlay, touch, event, UITouchPhaseBegan, from);
+            } else if (step <= 4) {
+                CGFloat t = step / 4.0;
+                CAPSendTouch(overlay, touch, event, UITouchPhaseMoved,
+                             CGPointMake(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t));
+            } else {
+                CAPSendTouch(overlay, touch, event, UITouchPhaseEnded, to);
+            }
+        } @catch (NSException *e) {
+            NSLog(@"[CAP-AP] touch exception %@", e);
+        }
+        step++;
+        if (step < total) {
+            int64_t gap = (tapMode && step == 2) ? 150 : 16;
+            void (^next)(void) = run;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, gap * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), next);
+        } else {
+            run = nil;
+        }
+    };
+    run();
+}
+
+// On-screen Auto-Play status (no log access on a sideloaded phone).
+static void CAPToast(NSString *text) {
+    NSLog(@"[CAP-AP] %@", text);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *host = nil;
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (![scene isKindOfClass:UIWindowScene.class] ||
+                scene.activationState != UISceneActivationStateForegroundActive) continue;
+            for (UIWindow *w in ((UIWindowScene *)scene).windows) if (w.isKeyWindow) host = w;
+            if (!host) host = ((UIWindowScene *)scene).windows.firstObject;
+        }
+        if (!host) return;
+        UILabel *label = (UILabel *)[host viewWithTag:0xCA9];
+        if (!label) {
+            label = [[UILabel alloc] init];
+            label.tag = 0xCA9;
+            label.numberOfLines = 3;
+            label.font = [UIFont boldSystemFontOfSize:12];
+            label.textColor = UIColor.whiteColor;
+            label.backgroundColor = [UIColor colorWithWhite:0 alpha:0.75];
+            label.layer.cornerRadius = 6;
+            label.clipsToBounds = YES;
+            label.textAlignment = NSTextAlignmentCenter;
+            label.userInteractionEnabled = NO;
+            [host addSubview:label];
+        }
+        label.text = [@"AP: " stringByAppendingString:text];
+        CGFloat top = host.safeAreaInsets.top + 44;
+        label.frame = CGRectMake(8, top, host.bounds.size.width - 16, 44);
+        [host bringSubviewToFront:label];
+        label.alpha = 1;
+        static NSInteger generation = 0;
+        NSInteger mine = ++generation;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            if (mine == generation) [label removeFromSuperview];
+        });
+    });
+}
+
+static NSString *CAPDeepVCName(UIViewController *vc, int depth) {
+    if (!vc || depth > 12) return @"?";
+    UIViewController *next = vc.presentedViewController;
+    if (!next && [vc isKindOfClass:UINavigationController.class]) next = ((UINavigationController *)vc).topViewController;
+    if (!next && [vc isKindOfClass:UITabBarController.class]) next = ((UITabBarController *)vc).selectedViewController;
+    if (!next) next = vc.childViewControllers.lastObject;
+    return next ? CAPDeepVCName(next, depth + 1) : NSStringFromClass(vc.class);
+}
+
+static BOOL CAPAutoPlaySwiftBot(NSString *uci, NSString *fen) {
+    Class overlayClass = NSClassFromString(@"_TtC15SwiftChessBoard28PiecesOverlayWithTouchEvents");
+    Class pieceClass = NSClassFromString(@"_TtC15SwiftChessBoard9PieceView");
+    if (!overlayClass) { CAPToast(@"board class missing"); return NO; }
+    UIView *overlay = nil;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class] ||
+            scene.activationState != UISceneActivationStateForegroundActive) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            overlay = CAPFindOverlay(window, overlayClass);
+            if (overlay) break;
+        }
+        if (overlay) break;
+    }
+    if (!overlay) { CAPToast(@"no board overlay found"); return NO; }
+    if (!CAPIsBotGameScreen(overlay)) { CAPToast([NSString stringWithFormat:@"not bot screen: %@", CAPDeepVCName(overlay.window.rootViewController, 0)]); return NO; }
+
+    int sf = [uci characterAtIndex:0] - 'a', sr = [uci characterAtIndex:1] - '1';
+    int df = [uci characterAtIndex:2] - 'a', dr = [uci characterAtIndex:3] - '1';
+    BOOL whiteToMove = [fen containsString:@" w "];
+    NSMutableArray *pieces = [NSMutableArray array];
+    if (pieceClass) CAPCollectPieces(overlay.superview ?: overlay, pieceClass, pieces);
+
+    BOOL flipped = !whiteToMove; // fallback: user is the side to move
+    BOOL decided = NO;
+    if (pieces.count) {
+        uint64_t fenMask = CAPFenMask(fen);
+        BOOL m0 = CAPPieceMask(pieces, overlay, NO) == fenMask;
+        BOOL m1 = CAPPieceMask(pieces, overlay, YES) == fenMask;
+        if (m0 != m1) { flipped = m1; decided = YES; }
+    }
+    if (decided && whiteToMove == flipped) {
+        CAPToast(@"not your turn on this board");
+        return NO;
+    }
+    CGFloat size = overlay.bounds.size.width;
+    CGPoint from = CAPSquareCenter(size, sf, sr, flipped);
+    CGPoint to = CAPSquareCenter(size, df, dr, flipped);
+    CAPToast([NSString stringWithFormat:@"tapping %@ (flip %d, pieces %lu)", uci, flipped, (unsigned long)pieces.count]);
+    // Same order as the proven web script: click source, click destination,
+    // check at 450 ms, then fall back to a drag, then a final check at 1.2 s.
+    CAPSyntheticMove(overlay, from, to, YES);
+
+    __weak UIView *weakOverlay = overlay;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 450 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        UIView *o = weakOverlay;
+        if (!o.window || !pieceClass) return;
+        NSMutableArray *now = [NSMutableArray array];
+        CAPCollectPieces(o.superview ?: o, pieceClass, now);
+        BOOL stillThere = CAPPieceAt(now, o, sf, sr, flipped);
+        CAPToast(stillThere ? @"tap ignored, trying drag" : @"tap worked");
+        if (stillThere) CAPSyntheticMove(o, from, to, NO);
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        UIView *o = weakOverlay;
+        if (!o.window || !pieceClass) return;
+        NSMutableArray *now = [NSMutableArray array];
+        CAPCollectPieces(o.superview ?: o, pieceClass, now);
+        CAPToast([NSString stringWithFormat:@"%@ %@", uci, CAPPieceAt(now, o, sf, sr, flipped) ? @"NOT accepted" : @"accepted"]);
+    });
+    return YES;
+}
+
 static BOOL CAPAutoPlay(NSString *uci, NSString *fen, CAPMoveSource source) {
     if (![[NSUserDefaults standardUserDefaults] boolForKey:kAutoPlayKey] ||
         !CAPSourceEnabled(source) || [lastPlayedFEN isEqualToString:fen]) {
@@ -956,8 +1246,8 @@ static BOOL CAPAutoPlay(NSString *uci, NSString *fen, CAPMoveSource source) {
     @try {
         UIView *board = CAPVisibleBoardForFEN(fen);
         if (!board) {
-            NSLog(@"[ChessAssistantPro] Auto-Play [direct] %@; no verified move API for %@",
-                  CAPVisibleSwiftBoard() ? @"Swift board detected" : @"matching board not found", uci);
+            // Swift board: only supported for computer (bot) games.
+            if (CAPAutoPlaySwiftBot(uci, fen)) { lastPlayedFEN = [fen copy]; return YES; }
             return NO;
         }
         BOOL whiteToMove = [fen containsString:@" w "];

@@ -4,8 +4,8 @@
 #import <dlfcn.h>
 #import <IOKit/IOKitLib.h>
 
-static void postEvent(IOHIDEventRef event);
-static void execute();
+static bool postEvent(IOHIDEventRef event);
+static bool execute();
 static IOHIDEventRef parent = NULL;
 static uint64_t gSenderID = 0;
 static __weak UIWindow *gTargetWindow = nil;
@@ -68,7 +68,8 @@ void simulateTouchHandReset(void) {
     CFRelease(reset);
 }
 
-void simulateTouch(int type, float x, float y) {
+bool simulateTouch(int type, float x, float y) {
+    if (!touchSimulatorAvailable()) return false;
     if (parent == NULL) {
         // Include Range + Position + Identity alongside Touch so the kernel sees
         // a complete state picture on every event, matching XXTouch's STHIDEventGenerator.
@@ -84,7 +85,7 @@ void simulateTouch(int type, float x, float y) {
             0,
             0.0, 0.0, 0.0, 0.0, 0.0,
             0, (type != TOUCH_UP), 0);
-        if (!parent) return;
+        if (!parent) return false;
         IOHIDEventSetIntegerValue(parent, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
     }
 
@@ -103,7 +104,7 @@ void simulateTouch(int type, float x, float y) {
         childMask,
         x, y, 0.0f, 0.0f, 0.0f,
         isTouch, isTouch, 0);
-    if (!child) { CFRelease(parent); parent = NULL; return; }
+    if (!child) { CFRelease(parent); parent = NULL; return false; }
     // 5.0mm matches real hardware contact area; 0.04 is sub-threshold and
     // can cause the OS to classify the event as noise.
     IOHIDEventSetFloatValue(child, kIOHIDEventFieldDigitizerMajorRadius, 5.0f);
@@ -111,7 +112,7 @@ void simulateTouch(int type, float x, float y) {
     IOHIDEventAppendEvent(parent, child);
     CFRelease(child);
 
-    execute();
+    return execute();
 }
 
 static UIWindow *getKeyWindow(void) {
@@ -130,7 +131,7 @@ static UIWindow *getKeyWindow(void) {
     return nil;
 }
 
-static void postEvent(IOHIDEventRef event) {
+static bool postEvent(IOHIDEventRef event) {
     UIWindow *keyWindow = gTargetWindow ?: getKeyWindow();
 
 #ifdef DEBUG
@@ -148,35 +149,39 @@ static void postEvent(IOHIDEventRef event) {
     });
 #endif
 
+    if (!event || !keyWindow ||
+        ![keyWindow respondsToSelector:@selector(_contextId)] ||
+        ![[UIApplication sharedApplication] respondsToSelector:@selector(_enqueueHIDEvent:)])
+        return false;
     IOHIDEventSetSenderID(event, gSenderID);
     // UIKit enqueue path: routes the touch into the target app's responder chain
     // via the window's contextId. Skip when no scene is active yet.
-    if (event != NULL && keyWindow != nil &&
-        [keyWindow respondsToSelector:@selector(_contextId)] &&
-        [[UIApplication sharedApplication] respondsToSelector:@selector(_enqueueHIDEvent:)]) {
-        uint32_t contextID = keyWindow._contextId;
-        void *handle = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
-        if (handle) {
-            typedef void (*BKSHIDEventSetDigitizerInfoType)(IOHIDEventRef, uint32_t, uint8_t, uint8_t, CFStringRef, CFTimeInterval, float);
-            BKSHIDEventSetDigitizerInfoType digitizer = (BKSHIDEventSetDigitizerInfoType)dlsym(handle, "BKSHIDEventSetDigitizerInfo");
-            if (digitizer) {
-                digitizer(event, contextID, false, false, NULL, 0, 0);
-            }
-            [[UIApplication sharedApplication] _enqueueHIDEvent:event];
-        }
-    } else if (keyWindow == nil) {
-        NSLog(@"TouchSimulator: no key window available, skipping UIKit enqueue path");
+    uint32_t contextID = keyWindow._contextId;
+    if (!contextID) return false;
+    void *handle = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
+    if (!handle) return false;
+    typedef void (*BKSHIDEventSetDigitizerInfoType)(IOHIDEventRef, uint32_t, uint8_t, uint8_t, CFStringRef, CFTimeInterval, float);
+    BKSHIDEventSetDigitizerInfoType digitizer = (BKSHIDEventSetDigitizerInfoType)dlsym(handle, "BKSHIDEventSetDigitizerInfo");
+    if (!digitizer) return false;
+    @try {
+        digitizer(event, contextID, false, false, NULL, 0, 0);
+        [[UIApplication sharedApplication] _enqueueHIDEvent:event];
+    } @catch (NSException *exception) {
+        NSLog(@"[ChessAssistantPro] Auto-Play [input] HID enqueue exception: %@", exception);
+        return false;
     }
 
     // This tweak is loaded in Chess itself. The UIKit enqueue above delivers
     // the event to its responder chain. A second system dispatch would risk
     // duplicate touches (and duplicate moves) on jailbreaks that permit it.
+    return true;
 }
 
-static void execute() {
-    postEvent(parent);
+static bool execute() {
+    bool sent = postEvent(parent);
     CFRelease(parent);
     parent = NULL;
+    return sent;
 }
 
 __attribute__((constructor))

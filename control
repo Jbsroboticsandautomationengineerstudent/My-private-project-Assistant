@@ -1,6 +1,6 @@
 Package: com.jerich.chessassistantpro
 Name: Chess Assistant Pro
-Version: 0.5.0
+Version: 0.6.0
 Architecture: iphoneos-arm64
 Description: Maia ONNX, three engine choices, and Swift-board touch Auto-Play
 Maintainer: Jerich

@@ -24,7 +24,7 @@ enum {
     TOUCH_MOVE
 };
 
-void simulateTouch(int type, float x, float y);
+bool simulateTouch(int type, float x, float y);
 void simulateTouchHandReset(void);
 bool touchSimulatorAvailable(void);
 void touchSimulatorSetTargetWindow(UIWindow *window);

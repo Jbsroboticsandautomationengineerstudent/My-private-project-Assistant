@@ -7,11 +7,15 @@
 #import <dlfcn.h>
 #import <dispatch/dispatch.h>
 #import <QuartzCore/QuartzCore.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
+#import <mach-o/dyld.h>
 #include <onnxruntime_c_api.h>
 #include <stdint.h>
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <spawn.h>
@@ -19,6 +23,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <math.h>
+#include <stdarg.h>
+#include <stdlib.h>
 #include <atomic>
 #include <string>
 
@@ -32,6 +38,48 @@ static NSString *const kGodEngineKey = @"godEngineChoice";
 static NSString *const kAutoEngineKey = @"ChessAssistantPro_AutoPlayEngine";
 static const char *kStockfish19Path = "/var/jb/usr/bin/stockfish19";
 static const char *kTriumviratusPath = "/var/jb/usr/bin/triumviratus";
+static NSString *capLastOutgoingMove = nil;
+
+static NSString *CAPDumpPath(void) {
+    NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES);
+    return paths.firstObject ?
+        [paths.firstObject stringByAppendingPathComponent:@"cap_swift_dump.txt"] : nil;
+}
+
+static void CAPDiscLog(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    NSLog(@"[CAP-DISC] %@", message);
+    NSString *path = CAPDumpPath();
+    if (!path) return;
+    static dispatch_queue_t writeQueue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        writeQueue = dispatch_queue_create("com.jerich.chessassistantpro.discovery", DISPATCH_QUEUE_SERIAL);
+    });
+    NSString *line = [NSString stringWithFormat:@"[CAP-DISC] %@\n", message];
+    dispatch_async(writeQueue, ^{
+        [[NSFileManager defaultManager] createDirectoryAtPath:[path stringByDeletingLastPathComponent]
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        const char *file = path.fileSystemRepresentation;
+        int fd = open(file, O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (fd < 0) return;
+        NSData *bytes = [line dataUsingEncoding:NSUTF8StringEncoding];
+        const uint8_t *cursor = (const uint8_t *)bytes.bytes;
+        NSUInteger remaining = bytes.length;
+        while (remaining) {
+            ssize_t written = write(fd, cursor, remaining);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) break;
+            cursor += written;
+            remaining -= (NSUInteger)written;
+        }
+        close(fd);
+    });
+}
 
 static const OrtApi *CAPOrt(void) {
     static const OrtApi *api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
@@ -326,6 +374,389 @@ static UIView *CAPVisibleBoardForFEN(NSString *fen) {
     return nil;
 }
 
+static BOOL CAPMoveWord(NSString *name) {
+    return [name rangeOfString:@"move" options:NSCaseInsensitiveSearch].location != NSNotFound &&
+           [name rangeOfString:@"remove" options:NSCaseInsensitiveSearch].location == NSNotFound;
+}
+
+static void CAPDumpClass(Class cls) {
+    if (!cls) return;
+    CAPDiscLog(@"CLASS %@ image=%s", NSStringFromClass(cls), class_getImageName(cls) ?: "?");
+    unsigned count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    for (unsigned i = 0; i < count; ++i)
+        CAPDiscLog(@"  METHOD %s encoding=%s imp=%p",
+                   sel_getName(method_getName(methods[i])),
+                   method_getTypeEncoding(methods[i]) ?: "?",
+                   method_getImplementation(methods[i]));
+    free(methods);
+    Ivar *ivars = class_copyIvarList(cls, &count);
+    for (unsigned i = 0; i < count; ++i)
+        CAPDiscLog(@"  IVAR %s encoding=%s offset=%td",
+                   ivar_getName(ivars[i]), ivar_getTypeEncoding(ivars[i]) ?: "?",
+                   ivar_getOffset(ivars[i]));
+    free(ivars);
+    objc_property_t *properties = class_copyPropertyList(cls, &count);
+    for (unsigned i = 0; i < count; ++i)
+        CAPDiscLog(@"  PROPERTY %s attributes=%s", property_getName(properties[i]),
+                   property_getAttributes(properties[i]) ?: "?");
+    free(properties);
+}
+
+static void CAPDumpSwiftSymbols(const struct mach_header_64 *header) {
+    if (!header || header->magic != MH_MAGIC_64) {
+        CAPDiscLog(@"SYMBOLS no Mach-O header");
+        return;
+    }
+    const struct symtab_command *symtab = nullptr;
+    const struct segment_command_64 *linkedit = nullptr, *textSegment = nullptr;
+    const uint8_t *cursor = (const uint8_t *)header + sizeof(*header);
+    for (uint32_t i = 0; i < header->ncmds; ++i) {
+        const struct load_command *command = (const struct load_command *)cursor;
+        if (command->cmdsize < sizeof(*command)) break;
+        if (command->cmd == LC_SYMTAB) symtab = (const struct symtab_command *)cursor;
+        if (command->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *segment = (const struct segment_command_64 *)cursor;
+            if (strcmp(segment->segname, "__LINKEDIT") == 0) linkedit = segment;
+            if (strcmp(segment->segname, "__TEXT") == 0) textSegment = segment;
+        }
+        cursor += command->cmdsize;
+    }
+    if (!symtab || !linkedit || !textSegment ||
+        symtab->symoff < linkedit->fileoff || symtab->stroff < linkedit->fileoff ||
+        (uint64_t)symtab->symoff + (uint64_t)symtab->nsyms * sizeof(struct nlist_64) >
+            linkedit->fileoff + linkedit->filesize ||
+        (uint64_t)symtab->stroff + symtab->strsize > linkedit->fileoff + linkedit->filesize) {
+        CAPDiscLog(@"SYMBOLS LC_SYMTAB unavailable or outside __LINKEDIT");
+        return;
+    }
+    intptr_t slide = (intptr_t)header - (intptr_t)textSegment->vmaddr;
+    uintptr_t base = (uintptr_t)(slide + (intptr_t)linkedit->vmaddr - (intptr_t)linkedit->fileoff);
+    const struct nlist_64 *symbols = (const struct nlist_64 *)(base + symtab->symoff);
+    const char *strings = (const char *)(base + symtab->stroff);
+    unsigned matches = 0;
+    for (uint32_t i = 0; i < symtab->nsyms; ++i) {
+        uint32_t index = symbols[i].n_un.n_strx;
+        if (index >= symtab->strsize) continue;
+        const char *name = strings + index;
+        size_t length = strnlen(name, symtab->strsize - index);
+        if (length >= symtab->strsize - index) continue;
+        std::string symbol(name, length), lower = symbol;
+        for (char &c : lower) c = (char)tolower((unsigned char)c);
+        if (symbol.find("SwiftChessBoard") == std::string::npos) continue;
+        if (lower.find("move") == std::string::npos && lower.find("drop") == std::string::npos &&
+            lower.find("select") == std::string::npos && lower.find("tap") == std::string::npos &&
+            lower.find("piece") == std::string::npos && lower.find("delegate") == std::string::npos &&
+            lower.find("completion") == std::string::npos) continue;
+        uintptr_t address = symbols[i].n_value ? (uintptr_t)(slide + symbols[i].n_value) : 0;
+        CAPDiscLog(@"SYMBOL %s address=%p type=0x%x", name, (void *)address, symbols[i].n_type);
+        ++matches;
+    }
+    CAPDiscLog(@"SYMBOLS scanned=%u matched=%u", symtab->nsyms, matches);
+}
+
+static NSString *CAPMoveArg(id value) {
+    if (!value) return @"nil";
+    if ([value isKindOfClass:NSString.class] || [value isKindOfClass:NSNumber.class])
+        return [NSString stringWithFormat:@"%@", value];
+    NSString *move = nil;
+    if ([value respondsToSelector:@selector(lanMove)]) {
+        @try { move = ((id (*)(id, SEL))objc_msgSend)(value, @selector(lanMove)); }
+        @catch (NSException *exception) {}
+    }
+    return [NSString stringWithFormat:@"<%@ %p%@>", NSStringFromClass([value class]), value,
+            [move isKindOfClass:NSString.class] ? [@" lan=" stringByAppendingString:move] : @""];
+}
+
+static NSMutableDictionary<NSString *, NSValue *> *CAPMoveOriginals(void) {
+    static NSMutableDictionary<NSString *, NSValue *> *originals;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ originals = [NSMutableDictionary dictionary]; });
+    return originals;
+}
+
+static IMP CAPMoveOriginal(SEL selector) {
+    @synchronized (CAPMoveOriginals()) {
+        return (IMP)[CAPMoveOriginals()[NSStringFromSelector(selector)] pointerValue];
+    }
+}
+
+static void CAPObserveMove0(id self, SEL selector) {
+    CAPDiscLog(@"CALL %@ %@", NSStringFromClass([self class]), NSStringFromSelector(selector));
+    void (*original)(id, SEL) = (void (*)(id, SEL))CAPMoveOriginal(selector);
+    if (original) original(self, selector);
+}
+static void CAPObserveMove1(id self, SEL selector, id arg) {
+    CAPDiscLog(@"CALL %@ %@ arg=%@", NSStringFromClass([self class]),
+               NSStringFromSelector(selector), CAPMoveArg(arg));
+    void (*original)(id, SEL, id) = (void (*)(id, SEL, id))CAPMoveOriginal(selector);
+    if (original) original(self, selector, arg);
+}
+static void CAPObserveMove1Bool(id self, SEL selector, id arg, BOOL flag) {
+    CAPDiscLog(@"CALL %@ %@ arg=%@ flag=%d", NSStringFromClass([self class]),
+               NSStringFromSelector(selector), CAPMoveArg(arg), flag);
+    void (*original)(id, SEL, id, BOOL) =
+        (void (*)(id, SEL, id, BOOL))CAPMoveOriginal(selector);
+    if (original) original(self, selector, arg, flag);
+}
+static void CAPObserveMove2(id self, SEL selector, id first, id second) {
+    CAPDiscLog(@"CALL %@ %@ first=%@ second=%@", NSStringFromClass([self class]),
+               NSStringFromSelector(selector), CAPMoveArg(first), CAPMoveArg(second));
+    void (*original)(id, SEL, id, id) =
+        (void (*)(id, SEL, id, id))CAPMoveOriginal(selector);
+    if (original) original(self, selector, first, second);
+}
+
+static void CAPInstallMoveObservers(Class cls) {
+    if (!cls) return;
+    unsigned count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    for (unsigned i = 0; i < count; ++i) {
+        Method method = methods[i];
+        SEL selector = method_getName(method);
+        NSString *name = NSStringFromSelector(selector);
+        if (!CAPMoveWord(name)) continue;
+        const char *types = method_getTypeEncoding(method);
+        NSMethodSignature *signature = types ? [NSMethodSignature signatureWithObjCTypes:types] : nil;
+        if (!signature || signature.methodReturnType[0] != 'v') continue;
+        NSUInteger arguments = signature.numberOfArguments;
+        IMP replacement = nullptr;
+        if (arguments == 2) replacement = (IMP)CAPObserveMove0;
+        else if (arguments == 3 && [signature getArgumentTypeAtIndex:2][0] == '@')
+            replacement = (IMP)CAPObserveMove1;
+        else if (arguments == 4 && [signature getArgumentTypeAtIndex:2][0] == '@') {
+            char last = [signature getArgumentTypeAtIndex:3][0];
+            if (last == '@') replacement = (IMP)CAPObserveMove2;
+            else if (last == 'B' || last == 'c') replacement = (IMP)CAPObserveMove1Bool;
+        }
+        if (!replacement) {
+            CAPDiscLog(@"OBSERVER skipped %@ %@ encoding=%s (ABI not verified)",
+                       NSStringFromClass(cls), name, types ?: "?");
+            continue;
+        }
+        @synchronized (CAPMoveOriginals()) {
+            if (CAPMoveOriginals()[name]) {
+                CAPDiscLog(@"OBSERVER skipped duplicate selector %@ on %@", name, NSStringFromClass(cls));
+                continue;
+            }
+            IMP previous = method_getImplementation(method);
+            CAPMoveOriginals()[name] = [NSValue valueWithPointer:previous];
+            IMP original = nullptr;
+            MSHookMessageEx(cls, selector, replacement, &original);
+            if (original) CAPMoveOriginals()[name] = [NSValue valueWithPointer:original];
+            CAPDiscLog(@"OBSERVER registered %@ %@ encoding=%s original=%p",
+                       NSStringFromClass(cls), name, types, original ?: previous);
+        }
+    }
+    free(methods);
+}
+
+static void CAPDumpGesture(UIGestureRecognizer *gesture) {
+    CAPDiscLog(@"    GESTURE %@ %p state=%ld enabled=%d",
+               NSStringFromClass([gesture class]), gesture,
+               (long)gesture.state, gesture.enabled);
+    @try {
+        id rawTargets = [gesture valueForKey:@"_targets"];
+        id<NSFastEnumeration> targets =
+            ([rawTargets isKindOfClass:NSArray.class] || [rawTargets isKindOfClass:NSSet.class]) ?
+                rawTargets : nil;
+        if (!targets) {
+            CAPDiscLog(@"      _targets unavailable: %@", CAPMoveArg(rawTargets));
+            return;
+        }
+        for (id entry in targets) {
+            Ivar targetIvar = class_getInstanceVariable([entry class], "_target");
+            Ivar actionIvar = class_getInstanceVariable([entry class], "_action");
+            const char *targetType = targetIvar ? ivar_getTypeEncoding(targetIvar) : nullptr;
+            const char *actionType = actionIvar ? ivar_getTypeEncoding(actionIvar) : nullptr;
+            id target = targetType && targetType[0] == '@' ?
+                object_getIvar(entry, targetIvar) : nil;
+            SEL action = nullptr;
+            if (actionType && actionType[0] == ':')
+                memcpy(&action, (const uint8_t *)(__bridge const void *)entry +
+                       ivar_getOffset(actionIvar), sizeof(action));
+            CAPDiscLog(@"      TARGET %@ %p action=%s", NSStringFromClass([target class]),
+                       target, action ? sel_getName(action) : "?");
+        }
+    } @catch (NSException *exception) {
+        CAPDiscLog(@"      _targets KVC failed: %@", exception.name);
+    }
+}
+
+static void CAPDumpSubviewTree(UIView *view, NSUInteger depth, NSUInteger *count) {
+    if (!view || depth > 4 || *count >= 2000) return;
+    ++*count;
+    CAPDiscLog(@"VIEW depth=%lu %@ %p frame=%@ hidden=%d alpha=%.2f",
+               (unsigned long)depth, NSStringFromClass([view class]), view,
+               NSStringFromCGRect(view.frame), view.hidden, view.alpha);
+    for (UIGestureRecognizer *gesture in view.gestureRecognizers)
+        CAPDumpGesture(gesture);
+    for (UIView *child in view.subviews)
+        CAPDumpSubviewTree(child, depth + 1, count);
+}
+
+static void CAPDumpResponderChain(UIView *board) {
+    UIResponder *responder = board;
+    for (NSUInteger depth = 0; responder && depth < 24; ++depth) {
+        Class cls = [responder class];
+        CAPDiscLog(@"RESPONDER depth=%lu %@ %p", (unsigned long)depth,
+                   NSStringFromClass(cls), responder);
+        unsigned count = 0;
+        Method *methods = class_copyMethodList(cls, &count);
+        for (unsigned i = 0; i < count; ++i) {
+            NSString *name = NSStringFromSelector(method_getName(methods[i]));
+            if (CAPMoveWord(name) ||
+                [name rangeOfString:@"game" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                [name rangeOfString:@"board" options:NSCaseInsensitiveSearch].location != NSNotFound)
+                CAPDiscLog(@"  RESPONDER METHOD %@ encoding=%s", name,
+                           method_getTypeEncoding(methods[i]) ?: "?");
+        }
+        free(methods);
+        const char *image = class_getImageName(cls);
+        if (image && strstr(image, "/Chess.app/")) CAPInstallMoveObservers(cls);
+        if ([responder isKindOfClass:UIViewController.class]) break;
+        responder = responder.nextResponder;
+    }
+}
+
+static void CAPDumpObjectIvars(UIView *board) {
+    unsigned count = 0;
+    Ivar *ivars = class_copyIvarList([board class], &count);
+    for (unsigned i = 0; i < count; ++i) {
+        const char *encoding = ivar_getTypeEncoding(ivars[i]);
+        if (!encoding || encoding[0] != '@') continue;
+        @try {
+            id value = object_getIvar(board, ivars[i]);
+            CAPDiscLog(@"OBJECT IVAR %s -> %@ %p", ivar_getName(ivars[i]),
+                       NSStringFromClass([value class]), value);
+        } @catch (NSException *exception) {
+            CAPDiscLog(@"OBJECT IVAR %s read failed: %@", ivar_getName(ivars[i]),
+                       exception.name);
+        }
+    }
+    free(ivars);
+}
+
+static NSString *CAPBoardGameKey(UIView *board) {
+    for (UIResponder *item = board; item; item = item.nextResponder) {
+        SEL gameID = @selector(gameID);
+        if ([item respondsToSelector:gameID]) {
+            NSMethodSignature *signature = [item methodSignatureForSelector:gameID];
+            const char *type = signature ? signature.methodReturnType : nullptr;
+            @try {
+                if (type && (type[0] == 'Q' || type[0] == 'q')) {
+                    long long identifier = ((long long (*)(id, SEL))objc_msgSend)(item, gameID);
+                    if (identifier) return [NSString stringWithFormat:@"game:%lld", identifier];
+                } else if (type && type[0] == '@') {
+                    id identifier = ((id (*)(id, SEL))objc_msgSend)(item, gameID);
+                    if ([identifier isKindOfClass:NSString.class] ||
+                        [identifier isKindOfClass:NSNumber.class])
+                        return [NSString stringWithFormat:@"game:%@", identifier];
+                }
+            } @catch (NSException *exception) {}
+        }
+        if ([item respondsToSelector:@selector(game)]) {
+            NSMethodSignature *signature = [item methodSignatureForSelector:@selector(game)];
+            if (signature && signature.methodReturnType[0] == '@') {
+                @try {
+                    id game = ((id (*)(id, SEL))objc_msgSend)(item, @selector(game));
+                    if (game) return [NSString stringWithFormat:@"game-object:%p", game];
+                } @catch (NSException *exception) {}
+            }
+        }
+    }
+    return [NSString stringWithFormat:@"board:%p", board];
+}
+
+static void CAPDumpSwiftBoard(UIView *board, BOOL forced) {
+    if (!board || ![NSThread isMainThread]) return;
+    Class cls = [board class];
+    Dl_info info = {};
+    BOOL located = dladdr((__bridge const void *)cls, &info) != 0;
+    const char *image = located && info.dli_fname ? info.dli_fname : class_getImageName(cls);
+    const struct mach_header_64 *header =
+        located ? (const struct mach_header_64 *)info.dli_fbase : nullptr;
+    if (!header && image) {
+        for (uint32_t i = 0; i < _dyld_image_count(); ++i) {
+            const char *candidate = _dyld_get_image_name(i);
+            if (candidate && strcmp(candidate, image) == 0) {
+                header = (const struct mach_header_64 *)_dyld_get_image_header(i);
+                break;
+            }
+        }
+    }
+    CAPDiscLog(@"===== SWIFT BOARD DUMP %@ key=%@ board=%p image=%s file=%@ =====",
+               forced ? @"forced" : @"automatic", CAPBoardGameKey(board), board,
+               image ?: "?", CAPDumpPath());
+    for (Class current = cls; current; current = class_getSuperclass(current)) {
+        CAPDumpClass(current);
+        if (current == NSObject.class) break;
+    }
+    if (image) {
+        unsigned classCount = 0;
+        const char **names = objc_copyClassNamesForImage(image, &classCount);
+        CAPDiscLog(@"MODULE image=%s classes=%u", image, classCount);
+        for (unsigned i = 0; i < classCount; ++i) {
+            if (strncmp(names[i], "_TtC15SwiftChessBoard", 21) != 0) continue;
+            Class member = objc_getClass(names[i]);
+            CAPDumpClass(member);
+            CAPInstallMoveObservers(member);
+        }
+        free(names);
+    }
+    CAPDumpSwiftSymbols(header);
+    NSUInteger viewCount = 0;
+    CAPDumpSubviewTree(board, 0, &viewCount);
+    CAPDiscLog(@"VIEWS logged=%lu", (unsigned long)viewCount);
+    CAPDumpResponderChain(board);
+    CAPDumpObjectIvars(board);
+    @synchronized ([NSURLSessionWebSocketTask class]) {
+        CAPDiscLog(@"LAST OUTGOING MOVE %@", capLastOutgoingMove ?: @"none");
+    }
+    CAPDiscLog(@"===== END SWIFT BOARD DUMP =====");
+}
+
+static void CAPMaybeDumpSwiftBoard(UIView *board) {
+    if (!board || ![NSThread isMainThread]) return;
+    static NSMapTable<UIView *, NSString *> *keys;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ keys = [NSMapTable weakToStrongObjectsMapTable]; });
+    NSString *key = CAPBoardGameKey(board);
+    if ([[keys objectForKey:board] isEqualToString:key]) return;
+    [keys setObject:key forKey:board];
+    @try { CAPDumpSwiftBoard(board, NO); }
+    @catch (NSException *exception) {
+        CAPDiscLog(@"DUMP failed: %@ %@", exception.name, exception.reason);
+    }
+}
+
+typedef void (*CAPWebSocketSendIMP)(NSURLSessionWebSocketTask *, SEL,
+                                    NSURLSessionWebSocketMessage *,
+                                    void (^)(NSError *));
+static CAPWebSocketSendIMP originalWebSocketSend = nullptr;
+static void CAPWebSocketSend(NSURLSessionWebSocketTask *task, SEL selector,
+                             NSURLSessionWebSocketMessage *message,
+                             void (^completion)(NSError *)) {
+    if (message.type == NSURLSessionWebSocketMessageTypeString) {
+        NSString *payload = message.string;
+        static NSRegularExpression *movePattern;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            movePattern = [NSRegularExpression regularExpressionWithPattern:
+                @"\\b(?:[a-h][1-8][a-h][1-8][qrbn]?|move)\\b"
+                options:NSRegularExpressionCaseInsensitive error:nil];
+        });
+        if (payload && [movePattern firstMatchInString:payload options:0
+                                                range:NSMakeRange(0, payload.length)]) {
+            @synchronized ([NSURLSessionWebSocketTask class]) {
+                capLastOutgoingMove = [payload copy];
+            }
+            CAPDiscLog(@"WEBSOCKET OUT task=%p message=%@", task, payload);
+        }
+    }
+    originalWebSocketSend(task, selector, message, completion);
+}
+
 // Detect the native Swift board so an unsupported move path fails explicitly.
 static UIView *CAPFindSwiftBoard(UIView *view) {
     if (view.hidden || view.alpha < 0.05 || !view.window) return nil;
@@ -357,7 +788,21 @@ static UIView *CAPVisibleSwiftBoard(void) {
             selected = found;
         }
     }
+    CAPMaybeDumpSwiftBoard(selected);
     return selected;
+}
+
+typedef void (*CAPLayoutIMP)(UIView *, SEL);
+static CAPLayoutIMP originalSwiftBoardLayout = nullptr;
+static BOOL capBoardProbeQueued = NO; // UIKit layout runs on the main thread.
+static void CAPSwiftBoardLayout(UIView *board, SEL selector) {
+    originalSwiftBoardLayout(board, selector);
+    if (!board.window || capBoardProbeQueued) return;
+    capBoardProbeQueued = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        capBoardProbeQueued = NO;
+        CAPVisibleSwiftBoard();
+    });
 }
 
 static BOOL CAPAutoPlay(NSString *uci, NSString *fen, CAPMoveSource source) {
@@ -902,16 +1347,42 @@ static void CAPInsertGodEngine(id panel) {
     objc_setAssociatedObject(panel, &kGodEngineRowKey, row, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+static char kDumpGestureKey;
+static void CAPInstallDumpGesture(id panel) {
+    if (![panel isKindOfClass:UIView.class] ||
+        objc_getAssociatedObject(panel, &kDumpGestureKey)) return;
+    UILongPressGestureRecognizer *gesture = [[UILongPressGestureRecognizer alloc]
+        initWithTarget:panel action:@selector(cap_dumpLongPress:)];
+    gesture.minimumPressDuration = 0.8;
+    gesture.cancelsTouchesInView = NO;
+    [(UIView *)panel addGestureRecognizer:gesture];
+    objc_setAssociatedObject(panel, &kDumpGestureKey, gesture, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 %hook CHSettingsPanel
 - (void)build {
     %orig;
     CAPInsertGodEngine(self);
     CAPInsertAutoPlay(self);
+    CAPInstallDumpGesture(self);
 }
 - (void)populate {
     %orig;
     CAPInsertGodEngine(self);
     CAPInsertAutoPlay(self);
+    CAPInstallDumpGesture(self);
+}
+%new
+- (void)cap_dumpLongPress:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateBegan) return;
+    UIView *board = CAPVisibleSwiftBoard();
+    if (board) {
+        @try { CAPDumpSwiftBoard(board, YES); }
+        @catch (NSException *exception) {
+            CAPDiscLog(@"DUMP forced failed: %@ %@", exception.name, exception.reason);
+        }
+    }
+    else CAPDiscLog(@"LONG PRESS no visible Swift board");
 }
 - (void)swMaia:(UISwitch *)sender {
     %orig;
@@ -960,13 +1431,7 @@ static void CAPInsertGodEngine(id panel) {
     lastPlayedFEN = nil;
     if (sender.on) {
         CAPSyncEngineChoiceUI(self);
-        // The bottom sheet covers the board and would consume synthetic taps.
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if ([(id)self respondsToSelector:@selector(closeTap)])
-                ((void (*)(id, SEL))objc_msgSend)(self, @selector(closeTap));
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
-                           dispatch_get_main_queue(), ^{ CAPScheduleCachedMove(); });
-        });
+        CAPScheduleCachedMove();
     }
 }
 %new
@@ -1031,6 +1496,22 @@ static void CAPSetFillColor(CAShapeLayer *layer, SEL selector, CGColorRef color)
         if (maia) MSHookFunction(maia, (void *)CAPMaiaGo, (void **)&originalMaiaGo);
         void *engine = dlsym(RTLD_DEFAULT, "EngineGo");
         if (engine) MSHookFunction(engine, (void *)CAPEngineGo, (void **)&originalEngineGo);
+        Class swiftBoard = NSClassFromString(@"_TtC15SwiftChessBoard10ChessBoard");
+        if (swiftBoard) {
+            Method layout = class_getInstanceMethod(swiftBoard, @selector(layoutSubviews));
+            originalSwiftBoardLayout = layout ? (CAPLayoutIMP)method_getImplementation(layout) : nullptr;
+            if (originalSwiftBoardLayout)
+                MSHookMessageEx(swiftBoard, @selector(layoutSubviews),
+                                (IMP)CAPSwiftBoardLayout, (IMP *)&originalSwiftBoardLayout);
+        }
+        Class webSocketTask = objc_getClass("NSURLSessionWebSocketTask");
+        Method send = webSocketTask ?
+            class_getInstanceMethod(webSocketTask, @selector(sendMessage:completionHandler:)) : nullptr;
+        if (send) {
+            originalWebSocketSend = (CAPWebSocketSendIMP)method_getImplementation(send);
+            MSHookMessageEx(webSocketTask, @selector(sendMessage:completionHandler:),
+                            (IMP)CAPWebSocketSend, (IMP *)&originalWebSocketSend);
+        }
         Class shape = objc_getClass("CAShapeLayer");
         if (shape) {
             MSHookMessageEx(shape, @selector(setStrokeColor:), (IMP)CAPSetStrokeColor,
@@ -1038,6 +1519,7 @@ static void CAPSetFillColor(CAShapeLayer *layer, SEL selector, CGColorRef color)
             MSHookMessageEx(shape, @selector(setFillColor:), (IMP)CAPSetFillColor,
                             (IMP *)&originalFillColor);
         }
+        CAPDiscLog(@"diagnostics installed SwiftBoard=%p WebSocket=%p", swiftBoard, webSocketTask);
         NSLog(@"[ChessAssistantPro] Maia=%p Engine=%p", maia, engine);
     }
 }

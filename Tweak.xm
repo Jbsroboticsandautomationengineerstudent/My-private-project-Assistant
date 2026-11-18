@@ -719,6 +719,50 @@ static void CAPDumpSwiftBoard(UIView *board, BOOL forced) {
     CAPDiscLog(@"===== END SWIFT BOARD DUMP =====");
 }
 
+
+// Share the discovery dump (the sideloaded app has no Files-app access).
+static UIWindow *CAPDiscKeyWindow(void) {
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class]) continue;
+        for (UIWindow *w in ((UIWindowScene *)scene).windows) if (w.isKeyWindow) return w;
+    }
+    return nil;
+}
+
+@interface CAPShareHelper : NSObject
++ (void)tapped;
+@end
+@implementation CAPShareHelper
++ (void)tapped {
+    NSString *path = CAPDumpPath();
+    if (!path || ![[NSFileManager defaultManager] fileExistsAtPath:path]) return;
+    UIViewController *top = CAPDiscKeyWindow().rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    if (!top) return;
+    UIActivityViewController *vc = [[UIActivityViewController alloc]
+        initWithActivityItems:@[[NSURL fileURLWithPath:path]] applicationActivities:nil];
+    vc.popoverPresentationController.sourceView = top.view;
+    vc.popoverPresentationController.sourceRect =
+        CGRectMake(CGRectGetMidX(top.view.bounds), 80, 1, 1);
+    [top presentViewController:vc animated:YES completion:nil];
+}
+@end
+
+static void CAPAddShareButton(UIWindow *window) {
+    static BOOL added = NO;
+    if (added || !window) return;
+    added = YES;
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    [button setTitle:@"Share dump" forState:UIControlStateNormal];
+    [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    button.backgroundColor = [UIColor colorWithWhite:0 alpha:0.7];
+    button.layer.cornerRadius = 8;
+    button.frame = CGRectMake(8, 60, 110, 32);
+    [button addTarget:CAPShareHelper.class action:@selector(tapped)
+     forControlEvents:UIControlEventTouchUpInside];
+    [window addSubview:button];
+}
+
 static void CAPMaybeDumpSwiftBoard(UIView *board) {
     if (!board || ![NSThread isMainThread]) return;
     static NSMapTable<UIView *, NSString *> *keys;
@@ -731,6 +775,7 @@ static void CAPMaybeDumpSwiftBoard(UIView *board) {
     @catch (NSException *exception) {
         CAPDiscLog(@"DUMP failed: %@ %@", exception.name, exception.reason);
     }
+    CAPAddShareButton(board.window);
 }
 
 typedef void (*CAPWebSocketSendIMP)(NSURLSessionWebSocketTask *, SEL,

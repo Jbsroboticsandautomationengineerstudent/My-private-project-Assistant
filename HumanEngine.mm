@@ -117,7 +117,6 @@ static inline int HERank(int s) { return s >> 3; }
 static inline int HEOnBoard(int f, int r) { return f >= 0 && f < 8 && r >= 0 && r < 8; }
 static inline int HESq(int f, int r) { return r * 8 + f; }
 static inline int HEIsWhitePiece(char c) { return c != '.' && isupper((unsigned char)c); }
-static inline int HEIsBlackPiece(char c) { return c != '.' && islower((unsigned char)c); }
 
 static int HEPieceValue(char p) {
     switch (tolower((unsigned char)p)) {

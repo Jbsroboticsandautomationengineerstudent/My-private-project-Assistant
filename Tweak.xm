@@ -460,7 +460,9 @@ static NSString *CAPMoveArg(id value) {
     if ([value isKindOfClass:NSString.class] || [value isKindOfClass:NSNumber.class])
         return [NSString stringWithFormat:@"%@", value];
     NSString *move = nil;
-    if ([value respondsToSelector:@selector(lanMove)]) {
+    NSMethodSignature *signature = [value respondsToSelector:@selector(lanMove)] ?
+        [value methodSignatureForSelector:@selector(lanMove)] : nil;
+    if (signature && signature.methodReturnType[0] == '@') {
         @try { move = ((id (*)(id, SEL))objc_msgSend)(value, @selector(lanMove)); }
         @catch (NSException *exception) {}
     }

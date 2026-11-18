@@ -540,10 +540,11 @@ static void CAPInstallMoveObservers(Class cls) {
                 continue;
             }
             IMP previous = method_getImplementation(method);
-            CAPMoveOriginals()[name] = [NSValue valueWithPointer:previous];
+            CAPMoveOriginals()[name] = [NSValue valueWithPointer:(const void *)previous];
             IMP original = nullptr;
             MSHookMessageEx(cls, selector, replacement, &original);
-            if (original) CAPMoveOriginals()[name] = [NSValue valueWithPointer:original];
+            if (original) CAPMoveOriginals()[name] =
+                [NSValue valueWithPointer:(const void *)original];
             CAPDiscLog(@"OBSERVER registered %@ %@ encoding=%s original=%p",
                        NSStringFromClass(cls), name, types, original ?: previous);
         }

@@ -1459,7 +1459,7 @@ static int CAPRequestedStockfishElo(void) {
 
 typedef struct {
     double t;               // 0.0 at 600, 1.0 at 1319
-    int    skill;           // Stockfish Skill Level   0 → 3
+    int    skill;           // displayed human preset 0 → 3 (UCI search stays at 20)
     int    depth;           // search depth            5 → 10
     int    multipv;         // candidate lines         10 → 6
     double T;               // softmax temperature     145 → 45
@@ -2044,7 +2044,8 @@ NSArray<NSString *> *HEConfigureCommands(int elo) {
     HEHP = HEParamsFor(elo);
     [commands addObject:@"setoption name UCI_LimitStrength value false"];
     [commands addObject:@"setoption name Threads value 1"];
-    [commands addObject:[NSString stringWithFormat:@"setoption name Skill Level value %d", HEHP.skill]];
+    // Keep every MultiPV score comparable. Weakening happens in HEChooseMove.
+    [commands addObject:@"setoption name Skill Level value 20"];
     [commands addObject:[NSString stringWithFormat:@"setoption name MultiPV value %d", HEHP.multipv]];
     [commands addObject:[NSString stringWithFormat:@"go depth %d movetime %d",
                          HEHP.depth + (int)arc4random_uniform(3),
@@ -2056,6 +2057,8 @@ NSArray<NSString *> *HEConfigureCommands(int elo) {
 void HEParseInfo(const char *line) {
     if (!line) return;
     if (!strstr(line, " multipv ") || !strstr(line, " pv ")) return;
+    // Bounds from an unfinished aspiration search are not comparable scores.
+    if (strstr(line, " lowerbound") || strstr(line, " upperbound")) return;
 
     const char *depthField = strstr(line, " depth ");
     if (!depthField) return;
@@ -2172,6 +2175,14 @@ NSString *HEChooseMove(const char *fen, int ply, int elo) {
         if (source[i].valid) L[n++] = source[i];
     if (n == 0) return nil;
 
+    // A timed search can leave the MultiPV slots out of score order.
+    for (int i = 1; i < n; i++) {
+        HELine key = L[i];
+        int j = i - 1;
+        while (j >= 0 && L[j].cp < key.cp) { L[j + 1] = L[j]; j--; }
+        L[j + 1] = key;
+    }
+
     HEBoard b;
     int haveBoard = HEParseFEN(fen, &b) ? 1 : 0;
     int white     = haveBoard ? b.whiteToMove : HEP.isWhite;
@@ -2210,14 +2221,21 @@ NSString *HEChooseMove(const char *fen, int ply, int elo) {
     }
 
     if (n >= 4 && HEFrand() < rate) {
-        int k = n - 1 - (int)arc4random_uniform(2);
-        if (k < 1) k = n - 1;
-        HEFeatures bf = {};
-        if (haveBoard) bf = HEExtract(&b, HEParseMove(L[k].move));
-        // a human blunder is one they cannot see; obvious ones are rarer
-        if (!bf.visibleMistake || HEFrand() < 0.40 - 0.25 * HEHP.t) {
-            HEP.blunderBudget -= 1.0;
-            return HECommitMove(L, k);
+        int candidates[HE_MAX_PV], count = 0;
+        for (int i = 1; i < n; i++) {
+            int loss = best - L[i].cp;
+            if (loss >= 150 && loss <= 500 && L[i].mateIn >= 0)
+                candidates[count++] = i;
+        }
+        if (count > 0) {
+            int k = candidates[arc4random_uniform((uint32_t)count)];
+            HEFeatures bf = {};
+            if (haveBoard) bf = HEExtract(&b, HEParseMove(L[k].move));
+            // Obvious one-move errors are less likely than hidden mistakes.
+            if (!bf.visibleMistake || HEFrand() < 0.40 - 0.25 * HEHP.t) {
+                HEP.blunderBudget -= 1.0;
+                return HECommitMove(L, k);
+            }
         }
     }
 
@@ -2245,7 +2263,7 @@ NSString *HEChooseMove(const char *fen, int ply, int elo) {
         w[i] = exp(-perceived / HEHP.T) * HEHumanBias(&f, ply);
 
         if (loss > 700 && f.visibleMistake) w[i] *= 0.10;
-        if (L[i].mateIn < 0)                w[i] *= 0.05;   // don't walk into mate
+        if (L[i].mateIn < 0 && L[0].mateIn >= 0) w[i] = 0.0;
 
         sum += w[i];
     }
@@ -2277,7 +2295,7 @@ NSDictionary *HEDescribeElo(int elo) {
     HEParams p = HEParamsFor(elo);
     return @{
         @"mode"     : [NSString stringWithFormat:
-                        @"Human sim · skill %d · depth %d · MultiPV %d · ~%.1f blunders",
+                        @"Human sim · preset %d · depth %d · MultiPV %d · ~%.1f blunders",
                         p.skill, p.depth, p.multipv, p.blunderBudget],
         @"skill"    : @(p.skill),
         @"depth"    : @(p.depth),
@@ -2758,10 +2776,10 @@ static void CAPUpdateStockfishSkillUI(id panel, UISlider *slider) {
             @"Stockfish 19 ELO limit %d, approximate effective skill %.1f of 20",
             elo, CAPStockfishSkillForElo(elo)];
     } else {
-        label.text = [NSString stringWithFormat:@"~%d · Skill %.0f/20 + variety",
+        label.text = [NSString stringWithFormat:@"~%d · Human preset %.0f/3",
                       elo, CAPStockfishSkillForElo(elo)];
         label.accessibilityLabel = [NSString stringWithFormat:
-            @"Stockfish 19 uncalibrated low strength %d, skill %.0f of 20 with varied legal moves",
+            @"Stockfish 19 uncalibrated human preset %d, setting %.0f of 3; engine searches at full skill and selects among legal moves",
             elo, CAPStockfishSkillForElo(elo)];
     }
 }

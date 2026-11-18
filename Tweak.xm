@@ -545,30 +545,27 @@ static void CAPTouchTap(CGPoint point, void (^completion)(BOOL)) {
     });
 }
 
+static void CAPTouchDragStep(CGPoint from, CGPoint to, NSInteger step,
+                             void (^completion)(BOOL)) {
+    CGPoint point = CGPointMake(from.x + (to.x - from.x) * step / 4.0,
+                                from.y + (to.y - from.y) * step / 4.0);
+    BOOL sent = simulateTouch(step == 4 ? TOUCH_UP : TOUCH_MOVE, point.x, point.y);
+    if (!sent) simulateTouchHandReset();
+    if (!sent || step == 4) {
+        if (completion) completion(sent);
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 40 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{ CAPTouchDragStep(from, to, step + 1, completion); });
+}
+
 static void CAPTouchDrag(CGPoint from, CGPoint to, void (^completion)(BOOL)) {
     if (!simulateTouch(TOUCH_DOWN, from.x, from.y)) {
         if (completion) completion(NO);
         return;
     }
-    __block NSInteger step = 0;
-    __block BOOL sent = YES;
-    __block void (^advance)(void) = nil;
-    advance = ^{
-        ++step;
-        CGPoint point = CGPointMake(from.x + (to.x - from.x) * step / 4.0,
-                                    from.y + (to.y - from.y) * step / 4.0);
-        sent &= simulateTouch(step == 4 ? TOUCH_UP : TOUCH_MOVE, point.x, point.y);
-        if (step < 4 && sent) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 40 * NSEC_PER_MSEC),
-                           dispatch_get_main_queue(), advance);
-        } else {
-            if (!sent) simulateTouchHandReset();
-            if (completion) completion(sent);
-            advance = nil;
-        }
-    };
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 40 * NSEC_PER_MSEC),
-                   dispatch_get_main_queue(), advance);
+                   dispatch_get_main_queue(), ^{ CAPTouchDragStep(from, to, 1, completion); });
 }
 
 static BOOL CAPPositionUnchanged(UIView *board, NSString *expected, BOOL *known) {

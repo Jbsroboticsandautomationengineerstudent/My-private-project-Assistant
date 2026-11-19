@@ -1461,6 +1461,10 @@ static int CAPRequestedStockfishElo(void) {
 
 // Low-ELO move selection and FEN feature analysis.
 // Embedded from Humaneengine.mm (new).txt; move policy and all equation groups.
+// Some supplied equation identities are callable diagnostics rather than live
+// move pickers. Theos treats unused static diagnostics as build errors.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
 #define HE_BAND_LO            600
 #define HE_BAND_HI            1321         // exclusive: include 1320
 #define HE_MAX_PV             40
@@ -2974,6 +2978,7 @@ NSDictionary *HEDescribeElo(int elo) {
 
 
 #endif
+#pragma clang diagnostic pop
 
 // Preserve the existing FEN-transition observer for opponent recapture bias.
 // Accept a transition only when exactly one move reproduces the next board.

@@ -10,6 +10,7 @@
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
 #import <mach-o/dyld.h>
+#import <mach/vm_prot.h>
 #include <onnxruntime_c_api.h>
 #include <stdint.h>
 #include <string.h>
@@ -52,6 +53,11 @@ static NSString *const kGodEngineKey = @"godEngineChoice";
 static NSString *const kAutoEngineKey = @"ChessAssistantPro_AutoPlayEngine";
 static const char *kStockfish19Path = "/var/jb/usr/bin/stockfish19";
 static const char *kTriumviratusPath = "/var/jb/usr/bin/triumviratus";
+static const int kEloPresets[] = {
+    400, 600, 800, 900, 1000, 1200, 1320,
+    1400, 1600, 1800, 2000, 2400, 2800, 3200
+};
+static const int kEloPresetCount = sizeof(kEloPresets) / sizeof(kEloPresets[0]);
 static NSString *capLastOutgoingMove = nil;
 
 static NSString *CAPDumpPath(void) {
@@ -1452,11 +1458,20 @@ static BOOL CAPUciMove(const std::string &move) {
            move[4] == 'b' || move[4] == 'n';
 }
 
+static int CAPEloPresetIndexFor(int value) {
+    int best = 0;
+    for (int i = 1; i < kEloPresetCount; ++i)
+        if (abs(kEloPresets[i] - value) < abs(kEloPresets[best] - value)) best = i;
+    return best;
+}
+
 static int CAPRequestedStockfishElo(void) {
     id saved = [[NSUserDefaults standardUserDefaults] objectForKey:kStrengthEloKey];
-    // The original panel defaults to its maximum when there is no saved value.
-    return saved && [saved respondsToSelector:@selector(integerValue)] ?
-        (int)MAX(600, MIN(10000, [saved integerValue])) : 3200;
+    // Normalize old saved values to the same stops shown by the original panel.
+    NSInteger raw = saved && [saved respondsToSelector:@selector(integerValue)] ?
+        [saved integerValue] : 3200;
+    int value = (int)MAX(400, MIN(3200, raw));
+    return kEloPresets[CAPEloPresetIndexFor(value)];
 }
 
 // Low-ELO move selection and FEN feature analysis.
@@ -1465,9 +1480,10 @@ static int CAPRequestedStockfishElo(void) {
 // move pickers. Theos treats unused static diagnostics as build errors.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function"
-#define HE_BAND_LO            600
+#define HE_BAND_LO            400
 #define HE_BAND_HI            1320         // exclusive
-#define HE_MAX_PV             40
+#define HE_MAX_PV             43
+#define HE_MAX_TRACKED_DEPTH  64
 #define HE_MATE_CP            30000
 #define HE_CMD_LEN            96
 
@@ -1479,10 +1495,12 @@ static const double HEClassLo[HE_NCLASS] = { 0.0, 2.0,             5.0, 10.0, 20
 
 
 
-// Class mix per move at 600 and at 1319 (linear in between).
+// Weaker human-band class targets. Preserve the 600 and 1319 anchors; 400 is
+// a continuous extrapolation of the same formula, not a separate move policy.
+// These are weights before position-specific availability and human biases.
 //                                             top      good   inacc mistake blunder
-static const double HEMix600 [HE_NCLASS] = { 0.22, 0.24, 0.22, 0.16, 0.16 };
-static const double HEMix1319[HE_NCLASS] = { 0.36, 0.27, 0.17, 0.11, 0.09 };
+static const double HEMix600 [HE_NCLASS] = { 0.08, 0.12, 0.20, 0.25, 0.35 };
+static const double HEMix1319[HE_NCLASS] = { 0.22, 0.23, 0.23, 0.18, 0.14 };
 
 
 // Win% for a centipawn score (Lichess curve, close to Game Review)
@@ -1494,14 +1512,14 @@ static double HEWinPct(int cp) {
 
 
 // ===========================================================================
-// MARK: - Band parameters (continuous 600 → 1319)
+// MARK: - Band parameters (400 → 1319, anchored at 600)
 // ===========================================================================
 
 
 typedef struct {
-     double t;                     // 0.0 at 600, 1.0 at 1319
-     int    depth;                 // search depth                        6 → 9
-     int    multipv;               // candidate lines                    40 → 30
+     double t;                     // -200/719 at 400, 0 at 600, 1 at 1319
+     int    depth;                 // search depth                         5 → 9
+     int    multipv;               // candidate lines                     43 → 30
      double mix[HE_NCLASS];        // per-move class probabilities
      double spotObvious;           // takes a free piece               0.60 → 0.85
      double spotTactic;            // finds a non-capture win/mate 0.15 → 0.60
@@ -1516,12 +1534,15 @@ typedef struct {
 static inline int HEHumanBand(int elo) {
     return elo >= HE_BAND_LO && elo < HE_BAND_HI;
 }
+static inline bool HEPdfBand(int elo) {
+    return elo == 1320 || elo == 1400 || elo == 1600 || elo == 1800;
+}
 
 
 static HEParams HEParamsFor(int elo) {
     HEParams p;
-    double t = (elo - (double)HE_BAND_LO) / 719.0;
-    if (t < 0.0) t = 0.0;
+    double t = (elo - 600.0) / 719.0;
+    if (t < -200.0 / 719.0) t = -200.0 / 719.0;
     if (t > 1.0) t = 1.0;
     p.t = t;
 
@@ -1984,12 +2005,18 @@ typedef struct {
 
 static HELine HELines[HE_MAX_PV];
 static int        HELineCount = 0;
+// Keep each depth's complete MultiPV snapshot. The engine may stop halfway
+// through the next depth; the latest line for each index then spans depths.
+static HELine HELinesAtDepth[HE_MAX_TRACKED_DEPTH][HE_MAX_PV];
+static int HEDepthCounts[HE_MAX_TRACKED_DEPTH];
 
 
 void HEResetLines(void) {
     std::lock_guard<std::recursive_mutex> lock(HEMutex);
     memset(HELines, 0, sizeof(HELines));
     HELineCount = 0;
+    memset(HELinesAtDepth, 0, sizeof(HELinesAtDepth));
+    memset(HEDepthCounts, 0, sizeof(HEDepthCounts));
 }
 // Fills `out` with UCI commands (last one is "go"). Options are only resent
 // when the ELO changes or a new game starts.
@@ -2085,6 +2112,11 @@ void HEParseInfo(const char *line) {
 
 
     if (idx > HELineCount) HELineCount = idx;
+    if (depth < HE_MAX_TRACKED_DEPTH) {
+        HELine *snapshot = &HELinesAtDepth[depth][idx - 1];
+        if (!snapshot->valid) ++HEDepthCounts[depth];
+        *snapshot = *l;
+    }
 }
 
 
@@ -2294,6 +2326,18 @@ static Law choice(const Vec &d,double s,double c){
     for(size_t i=0;i<d.size();++i)out.p[i]=std::exp(out.w[i]*safeLog(x));
     out.p=normalize(out.p);
     return out;
+}
+// Section 8.3: the PDF's independent five-move example is a regression check
+// for the root and probability ordering. It is not a low-Elo calibration.
+static bool referenceSolverCheck(){
+    const Law law=choice({0.0,.04,.12,.28,.55},.098,.483);
+    const double expected[]={.5264203468554158,.2930243324562274,
+        .1447172973036302,.0341823572108512,.0016556661738753};
+    if(law.p.size()!=5||law.iterations>20||
+       std::fabs(law.g(law.p0)-1.0)>1.e-12)return false;
+    for(size_t i=0;i<5;++i)
+        if(std::fabs(law.p[i]-expected[i])>1.e-10)return false;
+    return true;
 }
 // 04,11: historical intrinsic performance rating and inversion (not actual Elo).
 static double expectedError(const Vec&p,const Vec&d){return dot(p,d);}
@@ -2626,22 +2670,33 @@ struct Observation {
            qualityVariance=0,centered=0,reganIPR=0,
            moveKL=0,thetaFisher=0,effFisher=0,
            evidence=0,localEvidence=0,score=0,
-           predictedTimeSec=0,timeLogLikelihood=0;
+           predictedTimeSec=0,timeLogLikelihood=0,standardizedResidual=0;
+    int topFirstVisibleDepth=-1;
     bool hasTime=false,possibleModelCrossing=false;
 };
 struct Tracker {
     long long moves=0;double sumExpectedLoss=0,sumLoss=0,sumCentered=0,sumVariance=0,
-          logEvidence=0,localEvidence=0,residualM=0,residualPrev=0,
-          residualCross=0,residualSquares=0,sumTimingLog=0;
+          logEvidence=0,localEvidence=0,sumTimingLog=0;
+    // Sections 1.4, 1.5 and B.2 use unit-variance residuals, never raw
+    // win-probability differences. Zero-variance positions are excluded.
+    std::array<double,4> lagNumerator{};
+    std::array<double,4> recentResidual{};
+    int recentResidualCount=0;
+    long long residualCount=0;
+    std::array<long long,HE_MAX_TRACKED_DEPTH> depthCount{};
+    std::array<long long,HE_MAX_TRACKED_DEPTH> depthTopCount{};
+    std::array<double,HE_MAX_TRACKED_DEPTH> depthLoss{};
     long long timingSamples=0;
     Observation latest;
     void record(const Law&law,const Vec&alt,const Vec&quality,int chosen,
-                double observedTimeSec,double expectedTimeSec,double motor=.12){
+                double observedTimeSec,double expectedTimeSec,int firstTopDepth,
+                double motor=.12){
         if(chosen<0||size_t(chosen)>=law.p.size())return;
         latest=Observation{};latest.entropy=entropy(law.p);
         latest.expectedLoss=expectedError(law.p,law.d);latest.actualLoss=law.d[chosen];
         latest.expectedQuality=mean(law.p,quality);latest.qualityVariance=variance(law.p,quality);
         latest.centered=quality[chosen]-latest.expectedQuality;
+        latest.topFirstVisibleDepth=firstTopDepth;
         latest.reganIPR=intrinsicRating(latest.expectedLoss);
         latest.moveKL=kl(alt,law.p);latest.thetaFisher=latest.qualityVariance;
         Vec st=scoreTilt(quality,law.p),sr=scaleScore(law);
@@ -2655,10 +2710,21 @@ struct Tracker {
         ++moves;sumExpectedLoss+=latest.expectedLoss;sumLoss+=latest.actualLoss;
         sumCentered+=latest.centered;sumVariance+=latest.qualityVariance;
         latest.score=standardizedScore(sumCentered,sumVariance);
-        // No spurious mean reversion imposed: measured residual autocorrelation.
-        if(moves>1)residualCross+=residualPrev*latest.centered;
-        residualPrev=latest.centered;residualSquares+=sq(latest.centered);
-        residualM+=latest.centered;
+        if(firstTopDepth>=1&&firstTopDepth<HE_MAX_TRACKED_DEPTH){
+            ++depthCount[firstTopDepth];
+            if(chosen==0)++depthTopCount[firstTopDepth];
+            depthLoss[firstTopDepth]+=law.d[chosen];
+        }
+        if(latest.qualityVariance>1.e-15){
+            const double e=latest.centered/std::sqrt(latest.qualityVariance);
+            latest.standardizedResidual=e;
+            for(int k=1;k<=recentResidualCount;++k)
+                lagNumerator[k-1]+=e*recentResidual[k-1];
+            for(int k=3;k>0;--k)recentResidual[k]=recentResidual[k-1];
+            recentResidual[0]=e;
+            recentResidualCount=std::min(4,recentResidualCount+1);
+            ++residualCount;
+        }
         if(observedTimeSec>motor){
             double m=std::log(std::max(expectedTimeSec-motor,.01))-.5*sq(.55);
             latest.timeLogLikelihood=logNormalLogDensity(observedTimeSec,motor,m,.55);
@@ -2669,7 +2735,15 @@ struct Tracker {
     }
     double observedIPR()const{return moves?intrinsicRating(sumLoss/moves):NAN;}
     double expectedIPR()const{return moves?intrinsicRating(sumExpectedLoss/moves):NAN;}
-    double lagOne()const{return moves>1&&residualSquares>tiny?residualCross/residualSquares:0;}
+    double lag(int k)const{return k>=1&&k<=4&&residualCount>k?
+        lagNumerator[k-1]/residualCount:0;}
+    double lagOne()const{return lag(1);}
+    double portmanteau()const{
+        double q=0;
+        for(int k=1;k<=4&&residualCount>k;++k)
+            q+=sq(lagNumerator[k-1])/(residualCount-k);
+        return q;
+    }
 };
 } // namespace HEMath
 
@@ -2688,6 +2762,57 @@ static void HEStatsReset(void){HEStats=HEMath::Tracker{};HEPendingTime=HEClockTi
 
 static HELine HEL[HE_MAX_PV];
 static char     HEChosen[8];
+static char     HEPdfChosen[8];
+
+// PDF Sections 1.3-1.5 and 1.8: observable checks of the four intermediate
+// presets. These are diagnostics, not extra move biases or Elo calibration.
+struct HEPdfDiagnostics {
+    int elo=-1,lastPly=-1,lastFirstVisibleDepth=-1;
+    long long moves=0,residuals=0,saturated=0;
+    double expectedLoss=0,observedLoss=0,centered=0,variance=0;
+    double lagOneNumerator=0,previousResidual=0,lastResidual=0;
+    double lastTarget=0,lastAttainable=0;
+    std::array<long long,HE_MAX_TRACKED_DEPTH> depthCount{};
+    std::array<long long,HE_MAX_TRACKED_DEPTH> depthTopCount{};
+    std::array<double,HE_MAX_TRACKED_DEPTH> depthLoss{};
+    void begin(int requestedElo,int ply) {
+        if(elo!=requestedElo || (lastPly>=0 && ply>=0 && ply<lastPly))
+            *this=HEPdfDiagnostics{};
+        elo=requestedElo;
+        lastPly=ply;
+    }
+    void record(const HEMath::Law&law,int selected,int firstVisibleDepth,
+                double target,double attainable) {
+        const double topProbability=law.p[0];
+        const double topChosen=selected==0 ? 1.0 : 0.0;
+        const double moveVariance=topProbability*(1.0-topProbability);
+        ++moves;
+        expectedLoss+=HEMath::expectedError(law.p,law.d);
+        observedLoss+=law.d[selected];
+        centered+=topChosen-topProbability;
+        variance+=moveVariance;
+        lastFirstVisibleDepth=firstVisibleDepth;
+        lastTarget=target;
+        lastAttainable=attainable;
+        if(attainable+1.e-9<target)++saturated;
+        if(moveVariance>1.e-15) {
+            lastResidual=(topChosen-topProbability)/std::sqrt(moveVariance);
+            if(residuals>0)lagOneNumerator+=lastResidual*previousResidual;
+            previousResidual=lastResidual;
+            ++residuals;
+        }
+        if(firstVisibleDepth>=1 && firstVisibleDepth<HE_MAX_TRACKED_DEPTH) {
+            ++depthCount[firstVisibleDepth];
+            depthTopCount[firstVisibleDepth]+=selected==0;
+            depthLoss[firstVisibleDepth]+=law.d[selected];
+        }
+    }
+    double expectedIPR()const {return moves?HEMath::intrinsicRating(expectedLoss/moves):NAN;}
+    double observedIPR()const {return moves?HEMath::intrinsicRating(observedLoss/moves):NAN;}
+    double lagOne()const {return residuals>1?lagOneNumerator/residuals:0.0;}
+    double scoreZ()const {return HEMath::standardizedScore(centered,variance);}
+};
+static HEPdfDiagnostics HEPdfStats;
 
 
 static int HEClassOf(double lossW) {
@@ -2712,23 +2837,31 @@ static const char *HECommit(int i, double lossW) {
 // among returned Stockfish root moves. Unreported legal moves are out of scope.
 static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     if (!HEHumanBand(elo) || HELineCount<1) return NULL;
+    static const bool solverOK=HEMath::referenceSolverCheck();
+    if(!solverOK)NSLog(@"[ChessAssistantPro] Reference move-law solver check failed");
     HEHP=HEParamsFor(elo);
     if(!HES.init)HECoreNewGame((ply%2)==0,elo);
 
-    int high=0;
-    for(int i=0;i<HELineCount;++i)if(HELines[i].valid)high=std::max(high,HELines[i].depth);
+    int widest=0;
+    for(int depth=1;depth<HE_MAX_TRACKED_DEPTH;++depth)
+        widest=std::max(widest,HEDepthCounts[depth]);
+    // At 400, keep about 82% of the widest candidate set before accepting a
+    // deeper partial search; the fraction tapers to 50% at 1319. An absolute
+    // floor of 9 -> 5 covers positions with only a few reported legal moves.
+    // If fewer lines exist, use the widest available set.
+    int needed=std::min(widest,std::max((int)lround(8.0-3.0*HEHP.t),
+        (int)lround(widest*(.75-.25*HEHP.t))));
     int chosenDepth=-1;
-    for(int depth=high;depth>=1;--depth){
-        int count=0;
-        for(int i=0;i<HELineCount;++i)if(HELines[i].valid&&HELines[i].depth==depth)++count;
-        if(count>=2){chosenDepth=depth;break;}
-    }
-    // Stockfish may return a single legal/root line. Never combine
-    // unreliable different-depth evaluations into the probability law.
+    for(int depth=HE_MAX_TRACKED_DEPTH-1;depth>=1;--depth)
+        if(HEDepthCounts[depth]>=needed&&HEDepthCounts[depth]>0){
+            chosenDepth=depth;break;
+        }
+    // Never combine evaluations from different depths in the probability law.
     int n=0;
     if(chosenDepth>=0){
-        for(int i=0;i<HELineCount;++i)
-            if(HELines[i].valid&&HELines[i].depth==chosenDepth)HEL[n++]=HELines[i];
+        for(int i=0;i<HE_MAX_PV;++i)
+            if(HELinesAtDepth[chosenDepth][i].valid)
+                HEL[n++]=HELinesAtDepth[chosenDepth][i];
     } else {
         int bestI=-1;
         for(int i=0;i<HELineCount;++i)if(HELines[i].valid&&
@@ -2737,6 +2870,20 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     }
     if(n==0)return NULL;
     std::sort(HEL,HEL+n,[](const HELine&a,const HELine&b){return a.cp>b.cp;});
+    // Section 1.8: first depth where the final-depth top move was itself the
+    // top-scored move in a snapshot with at least two reported candidates.
+    int topFirstDepth=-1;
+    if(chosenDepth>=1&&n>1){
+        for(int depth=1;depth<=chosenDepth;++depth){
+            if(HEDepthCounts[depth]<2)continue;
+            const HELine *top=nullptr;
+            for(int i=0;i<HE_MAX_PV;++i){
+                const HELine *line=&HELinesAtDepth[depth][i];
+                if(line->valid&&(!top||line->cp>top->cp))top=line;
+            }
+            if(top&&strcmp(top->move,HEL[0].move)==0){topFirstDepth=depth;break;}
+        }
+    }
 
     HEBoard board{};
     bool haveBoard=HEParseFEN(fen,&board)!=0;
@@ -2777,16 +2924,27 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     double sharp=std::min(1.5,std::max(.70,.60+.40*cx));
     for(int c=0;c<HE_NCLASS;++c)proposedMix[c]=HEHP.mix[c];
     proposedMix[HE_MISTAKE]*=sharp;proposedMix[HE_BLUNDER]*=sharp;
-    if(ply<8){proposedMix[HE_MISTAKE]*=.50;proposedMix[HE_BLUNDER]*=.35;}
+    if(ply<8){
+        // Keep the opening adjustment, but do not erase the weaker band's
+        // mistake and blunder weights before any move can be selected.
+        proposedMix[HE_MISTAKE]*=.85-.25*HEHP.t;
+        proposedMix[HE_BLUNDER]*=.75-.30*HEHP.t;
+    }
     if(HES.haveLastCp&&HES.lastCp>=HEHP.convThresh&&HEL[0].cp>=HEHP.convThresh){
-        proposedMix[HE_MISTAKE]*=.75;proposedMix[HE_BLUNDER]*=.50;
+        proposedMix[HE_MISTAKE]*=.95-.15*HEHP.t;
+        proposedMix[HE_BLUNDER]*=.90-.25*HEHP.t;
     }
     proposedMix=HEMath::normalize(proposedMix);
 
     // Actual available quality classes are constrained by Stockfish's finite
     // MultiPV list; unrepresented classes are not fabricated.
     HEMath::Vec classMass(HE_NCLASS,0),candidate(n,0);
-    for(int i=0;i<n;++i)classMass[HEClassOf(winLoss[i])]+=winning[i];
+    int available[HE_NCLASS]={0};
+    for(int i=0;i<n;++i){
+        int c=HEClassOf(winLoss[i]);
+        classMass[c]+=winning[i];
+        ++available[c];
+    }
     for(int i=0;i<n;++i){
         int c=HEClassOf(winLoss[i]);
         double factor=proposedMix[c]/std::max(classMass[c],HEMath::tiny);
@@ -2815,6 +2973,9 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     HEMath::Vec selectedLaw=HEMath::normalize(candidate);
     int k=HEPick(selectedLaw.data(),n);
     if(k<0)k=0;
+    NSLog(@"[ChessAssistantPro] Human choice ELO=%d ply=%d depth=%d candidates=%d classes=%d/%d/%d/%d/%d picked=%d loss=%.1fpp",
+          elo,ply,chosenDepth,n,available[0],available[1],available[2],
+          available[3],available[4],HEClassOf(winLoss[k]),winLoss[k]);
     if(opportunity&&k!=0){HES.misses++;HES.missStreak++;}
     else if(opportunity)HES.missStreak=0;
 
@@ -2837,8 +2998,63 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
         if(std::isfinite(diffusionSec)&&diffusionSec>0)suggested=.5*suggested+.5*diffusionSec;
         suggested=HEMath::clamp(suggested,.15,std::max(.15,HEClockSeconds*.15));
     }
-    HEStats.record(law,selectedLaw,quality,k,-1,suggested);
+    HEStats.record(law,selectedLaw,quality,k,-1,suggested,topFirstDepth);
+    if(HEStats.residualCount>=5&&HEStats.residualCount%10==0)
+        NSLog(@"[ChessAssistantPro] Uncalibrated move diagnostics n=%lld lag1=%.3f Q4=%.3f topFirstDepth=%d",
+              HEStats.residualCount,HEStats.lagOne(),HEStats.portmanteau(),topFirstDepth);
     return HECommit(k,winLoss[k]);
+}
+
+// Sections 1.1-1.5, 1.8 and 8.1-8.4 of the PDF: sample the move law and
+// measure its predicted/observed errors, residuals and depth strata.
+// The Elo-to-error target in fitLaw is historical extrapolation, not a
+// measured Stockfish 19 rating.
+// Only one completed MultiPV depth is used; unreported legal moves cannot be
+// assigned a probability from the available UCI output.
+static const char *HEPdfCoreChooseMove(int elo,int ply) {
+    if(!HEPdfBand(elo))return nullptr;
+    HEPdfStats.begin(elo,ply);
+    int widest=0;
+    for(int d=1;d<HE_MAX_TRACKED_DEPTH;++d)
+        widest=std::max(widest,HEDepthCounts[d]);
+    if(widest<2)return nullptr;
+    const int needed=std::max(2,(3*widest+3)/4);
+    int depth=-1;
+    for(int d=HE_MAX_TRACKED_DEPTH-1;d>=1;--d)
+        if(HEDepthCounts[d]>=needed){depth=d;break;}
+    if(depth<0)return nullptr;
+    int n=0;
+    for(int i=0;i<HE_MAX_PV;++i)
+        if(HELinesAtDepth[depth][i].valid)
+            HEL[n++]=HELinesAtDepth[depth][i];
+    if(n<2)return nullptr;
+    std::sort(HEL,HEL+n,[](const HELine &a,const HELine &b){return a.cp>b.cp;});
+    HEMath::Vec values(n);
+    for(int i=0;i<n;++i)
+        values[i]=std::max(-20.0,std::min(20.0,HEL[i].cp/100.0));
+    const HEMath::Vec losses=HEMath::losses(values);
+    const HEMath::Law law=HEMath::fitLaw(losses,elo,.50);
+    const int selected=HEPick(law.p.data(),n);
+    if(selected<0)return nullptr;
+    int firstVisibleDepth=-1;
+    for(int d=1;d<=depth;++d)
+        if(HEDepthCounts[d]>=2 && HELinesAtDepth[d][0].valid &&
+           strcmp(HELinesAtDepth[d][0].move,HEL[0].move)==0) {
+            firstVisibleDepth=d;
+            break;
+        }
+    const double target=HEMath::targetError(elo);
+    const double attainable=HEMath::total(losses)/n;
+    HEPdfStats.record(law,selected,firstVisibleDepth,target,attainable);
+    memcpy(HEPdfChosen,HEL[selected].move,sizeof(HEPdfChosen));
+    NSLog(@"[ChessAssistantPro] PDF move law preset=%d depth=%d candidates=%d s=%.5f c=%.3f p0=%.4f selected=%s targetAEe=%.4f attainableAEe=%.4f",
+          elo,depth,n,law.s,law.c,law.p0,HEPdfChosen,target,attainable);
+    if(HEPdfStats.moves%10==0)
+        NSLog(@"[ChessAssistantPro] PDF diagnostics preset=%d moves=%lld expectedIPR=%.1f observedIPR=%.1f topScoreZ=%.3f residualLag1=%.3f saturated=%lld firstTopDepth=%d",
+              elo,HEPdfStats.moves,HEPdfStats.expectedIPR(),HEPdfStats.observedIPR(),
+              HEPdfStats.scoreZ(),HEPdfStats.lagOne(),HEPdfStats.saturated,
+              firstVisibleDepth);
+    return HEPdfChosen;
 }
 
 // Optional caller-supplied clock, not a fabricated game clock. User controls
@@ -2879,10 +3095,13 @@ int HESuggestThinkTimeMilliseconds(){
 // meaning until fitted to a defined human rating pool and time control.
 struct HEFormulaReport {
     double expectedIPR,observedIPR,expectedLoss,observedLoss,scoreZ,lagOne;
+    double lagTwo,lagThree,lagFour,portmanteauQ4,standardizedResidual;
+    double depthTopRate,depthMeanLoss;
     double moveLogEvidence,localLogEvidence,moveKLDivergence,effectiveInformation;
     double entropy,predictedThinkSeconds,timingLogLikelihood;
     double timingKLDivergence,expectedWinProbability,modelSampleLowerBound;
-    long long moves,timingSamples;
+    long long moves,timingSamples,residualCount,depthStratumCount;
+    int topFirstVisibleDepth;
 };
 HEFormulaReport HEGetFormulaReport(){
     std::lock_guard<std::recursive_mutex> lock(HEMutex);
@@ -2892,7 +3111,21 @@ HEFormulaReport HEGetFormulaReport(){
     if(r.moves){r.expectedLoss=HEStats.sumExpectedLoss/r.moves;
                 r.observedLoss=HEStats.sumLoss/r.moves;}
     r.scoreZ=HEMath::standardizedScore(HEStats.sumCentered,HEStats.sumVariance);
-    r.lagOne=HEStats.lagOne();r.moveLogEvidence=HEStats.logEvidence;
+    r.lagOne=HEStats.lagOne();r.lagTwo=HEStats.lag(2);
+    r.lagThree=HEStats.lag(3);r.lagFour=HEStats.lag(4);
+    r.portmanteauQ4=HEStats.portmanteau();
+    r.standardizedResidual=HEStats.latest.standardizedResidual;
+    r.residualCount=HEStats.residualCount;
+    r.topFirstVisibleDepth=HEStats.latest.topFirstVisibleDepth;
+    if(r.topFirstVisibleDepth>=1&&r.topFirstVisibleDepth<HE_MAX_TRACKED_DEPTH){
+        const int d=r.topFirstVisibleDepth;
+        r.depthStratumCount=HEStats.depthCount[d];
+        if(r.depthStratumCount>0){
+            r.depthTopRate=(double)HEStats.depthTopCount[d]/r.depthStratumCount;
+            r.depthMeanLoss=HEStats.depthLoss[d]/r.depthStratumCount;
+        }
+    }
+    r.moveLogEvidence=HEStats.logEvidence;
     r.localLogEvidence=HEStats.localEvidence;
     r.moveKLDivergence=HEStats.latest.moveKL;
     r.effectiveInformation=HEStats.latest.effFisher;
@@ -2946,12 +3179,47 @@ NSString *HEChooseMove(const char *fen, int ply, int elo) {
     }
 }
 
+static NSString *HEPdfChooseMove(int elo,int ply) {
+    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    try {
+        const char *move=HEPdfCoreChooseMove(elo,ply);
+        return move ? [NSString stringWithUTF8String:move] : nil;
+    } catch (const std::exception &error) {
+        NSLog(@"[ChessAssistantPro] PDF move law failed: %s",error.what());
+        return nil;
+    } catch (...) {
+        NSLog(@"[ChessAssistantPro] PDF move law failed: unknown C++ error");
+        return nil;
+    }
+}
+
 
 NSDictionary *HEDescribeElo(int elo) {
     std::lock_guard<std::recursive_mutex> lock(HEMutex);
     if (!HEHumanBand(elo)) {
-        return @{ @"mode"     : (elo < 3190 ? @"Stockfish UCI ELO limit"
-                                              : @"Full strength · no fixed ELO"),
+        if(HEPdfBand(elo)) {
+            const bool have=HEPdfStats.elo==elo && HEPdfStats.moves>0;
+            const int depth=have?HEPdfStats.lastFirstVisibleDepth:-1;
+            const long long depthN=depth>=1&&depth<HE_MAX_TRACKED_DEPTH?
+                HEPdfStats.depthCount[depth]:0;
+            return @{ @"mode": @"PDF candidate move law · uncalibrated ELO",
+                      @"skill": @20,
+                      @"moves": @(have?HEPdfStats.moves:0),
+                      @"targetAEe": @(HEMath::targetError(elo)),
+                      @"expectedAEe": @(have?HEPdfStats.expectedLoss/HEPdfStats.moves:0),
+                      @"observedAEe": @(have?HEPdfStats.observedLoss/HEPdfStats.moves:0),
+                      @"expectedIPR": @(have?HEPdfStats.expectedIPR():0),
+                      @"observedIPR": @(have?HEPdfStats.observedIPR():0),
+                      @"topMoveScoreZ": @(have?HEPdfStats.scoreZ():0),
+                      @"topMoveResidualLag1": @(have?HEPdfStats.lagOne():0),
+                      @"saturatedPositions": @(have?HEPdfStats.saturated:0),
+                      @"firstTopVisibleDepth": @(depth),
+                      @"depthStratumCount": @(depthN),
+                      @"depthTopRate": @(depthN?(double)HEPdfStats.depthTopCount[depth]/depthN:0),
+                      @"depthMeanLoss": @(depthN?HEPdfStats.depthLoss[depth]/depthN:0) };
+        }
+        return @{ @"mode"     : elo < 3190 ? @"Stockfish UCI ELO limit"
+                                              : @"Full strength · no fixed ELO",
                      @"skill" : @20 };
     }
     HEParams p = HEParamsFor(elo);
@@ -2972,6 +3240,14 @@ NSDictionary *HEDescribeElo(int elo) {
          @"observedIPR": @(HEStats.observedIPR()),
          @"moveEvidence": @(HEStats.logEvidence),
          @"moveScoreZ" : @(HEMath::standardizedScore(HEStats.sumCentered,HEStats.sumVariance)),
+         @"standardizedResidual": @(HEStats.latest.standardizedResidual),
+         @"residualCount": @(HEStats.residualCount),
+         @"lag1": @(HEStats.lag(1)),
+         @"lag2": @(HEStats.lag(2)),
+         @"lag3": @(HEStats.lag(3)),
+         @"lag4": @(HEStats.lag(4)),
+         @"portmanteauQ4": @(HEStats.portmanteau()),
+         @"topFirstVisibleDepth": @(HEStats.latest.topFirstVisibleDepth),
          @"predictedThinkSeconds": @(HEStats.latest.predictedTimeSec)
     };
 }
@@ -3037,14 +3313,6 @@ NSString *HEInferOpponentMove(const char *priorFen, const char *selectedMove,
 static void HEInvalidateConfiguration(void) {
     std::lock_guard<std::recursive_mutex> lock(HEMutex);
     HECfgElo = -1;
-}
-
-static double CAPStockfishSkillForElo(int elo) {
-    if (elo < 1320) return 20; // Search skill, not the human move-class profile.
-    if (elo >= 3190) return 20;
-    double e = (double)(elo - 1320) / (3190 - 1320);
-    return fmax(0.0, fmin(19.0,
-        (((37.2473 * e - 40.8525) * e + 22.2943) * e - 0.311438)));
 }
 
 // FEN fullmove starts at 1. Search heuristics need half-moves played so far.
@@ -3113,10 +3381,12 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
     BOOL success = NO;
     std::string line;
     BOOL lowElo = stockfish19 && requestedElo < 1320;
-    int ply = lowElo ? CAPFenPly(fen) : -1;
+    BOOL pdfElo = stockfish19 && HEPdfBand(requestedElo);
+    int ply = (lowElo || pdfElo) ? CAPFenPly(fen) : -1;
     NSString *humanGo = nil;
     if (lowElo) {
-        BOOL newGame = humanLastPly < 0 || ply < humanLastPly ||
+        BOOL newGame = humanLastElo != requestedElo || humanLastPly < 0 ||
+            ply < humanLastPly ||
             (ply <= 1 && humanLastPly > 1);
         if (newGame) {
             HENewGame(strstr(fen, " b ") == nullptr, requestedElo);
@@ -3160,7 +3430,7 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
     if (stockfish19) {
         // The engine process is reused, so slider and engine-mode transitions
         // must restore the corresponding UCI options.
-        int uciElo = MAX(1320, MIN(3190, requestedElo));
+        int uciElo = requestedElo;
         if (!lowElo && cachedThreads != 2) {
             if (!CAPWrite(input[1], "setoption name Threads value 2\n")) goto done;
             cachedThreads = 2;
@@ -3180,46 +3450,68 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
             HEResetLines();
             NSLog(@"[ChessAssistantPro] Stockfish human band ELO=%d ply=%d %@",
                   requestedElo, ply, humanGo);
+        } else if (pdfElo) {
+            // Full-strength evaluations from one depth, sampled by the PDF
+            // law. Never reuse the low-Elo or high-Elo UCI option state.
+            HEInvalidateConfiguration();
+            if (!CAPWrite(input[1], "setoption name UCI_LimitStrength value false\n") ||
+                !CAPWrite(input[1], "setoption name Skill Level value 20\n") ||
+                !CAPWrite(input[1], "setoption name MultiPV value 16\n")) goto done;
+            HEResetLines();
+            NSLog(@"[ChessAssistantPro] PDF move law preset=%d; searching 16 lines",requestedElo);
         } else {
-            // The high-Elo path changes UCI options directly; restore all
-            // human-band options if the slider later returns to 600–1319.
+            // Preserve the original 2000–3200 UCI path. Reset the sampled
+            // modes' options if the slider later returns to either band.
             HEInvalidateConfiguration();
             if (!CAPWrite(input[1], "setoption name MultiPV value 1\n") ||
                 !CAPWrite(input[1], "setoption name Skill Level value 20\n") ||
                 !CAPWrite(input[1], std::string("setoption name UCI_LimitStrength value ") +
-                                    (requestedElo >= 3190 ? "false\n" : "true\n")) ||
+                                    (requestedElo >= 3190 ? "false\n" : "true\n"))) goto done;
+            if (requestedElo < 3190 &&
                 !CAPWrite(input[1], "setoption name UCI_Elo value " +
                                     std::to_string(uciElo) + "\n")) goto done;
-            NSLog(@"[ChessAssistantPro] Stockfish strength slider=%d UCI_Elo=%d skill=%.1f/20 MultiPV=1",
-                  requestedElo, uciElo, CAPStockfishSkillForElo(requestedElo));
+            NSLog(@"[ChessAssistantPro] Stockfish preset=%d UCI_Elo=%@ MultiPV=1",
+                  requestedElo, requestedElo >= 3190 ? @"full strength" : @(uciElo));
         }
     }
     if (!CAPWrite(input[1], "isready\n") || !CAPWaitForLine(output[0], "readyok", deadline)) goto done;
     if (!CAPWrite(input[1], std::string("position fen ") + fen + "\n")) goto done;
     if (!CAPWrite(input[1], lowElo ? std::string(humanGo.UTF8String) + "\n" :
-                          (stockfish19 ? "go movetime 200\n" : "go depth 16\n"))) goto done;
+                          (pdfElo ? "go depth 12 movetime 1200\n" :
+                           (stockfish19 ? "go movetime 200\n" : "go depth 16\n")))) goto done;
     deadline = CFAbsoluteTimeGetCurrent() + (stockfish19 ? 3.0 : 15.0);
     while (CAPReadLine(output[0], line, deadline)) {
         if (line.find("CRITICAL ERROR") != std::string::npos) break;
         if (line.compare(0, 9, "bestmove ") != 0) {
-            if (lowElo) HEParseInfo(line.c_str());
+            if (lowElo || pdfElo) HEParseInfo(line.c_str());
             continue;
         }
         size_t end = line.find(' ', 9);
         bestMove = line.substr(9, end == std::string::npos ? end : end - 9);
         success = CAPUciMove(bestMove);
-        if (success && lowElo) {
+        if (success && (lowElo || pdfElo)) {
             if (humanLastFen == fen && humanLastElo == requestedElo &&
                 CAPUciMove(humanLastMove)) {
                 bestMove = humanLastMove;
             } else {
-                NSString *chosen = HEChooseMove(fen, MAX(ply, 0), requestedElo);
-                if (chosen && CAPUciMove(chosen.UTF8String)) bestMove = chosen.UTF8String;
+                NSString *chosen = lowElo ?
+                    HEChooseMove(fen, MAX(ply, 0), requestedElo) :
+                    HEPdfChooseMove(requestedElo,ply);
+                if (chosen && CAPUciMove(chosen.UTF8String)) {
+                    bestMove = chosen.UTF8String;
+                } else {
+                    NSLog(@"[ChessAssistantPro] %@ choice unavailable ELO=%d ply=%d lines=%d; using engine bestmove",
+                          lowElo ? @"Human" : @"PDF",requestedElo,ply,HELineCount);
+                }
                 humanLastFen = fen;
                 humanLastMove = bestMove;
                 humanLastPly = ply;
                 humanLastElo = requestedElo;
             }
+        } else if (success && stockfish19) {
+            // Returning from a high-Elo search must not reuse an old sampled
+            // position when the slider changes back to a candidate-law mode.
+            humanLastElo=-1;
         }
         break;
     }
@@ -3491,25 +3783,92 @@ static void CAPInsertGodEngine(id panel) {
     objc_setAssociatedObject(panel, &kGodEngineRowKey, row, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
-static void CAPUpdateStockfishSkillUI(id panel, UISlider *slider) {
-    int elo = CAPRequestedStockfishElo();
-    // Keep the number shown during a drag and the engine's next UCI request in sync.
-    if ([slider isKindOfClass:UISlider.class] && slider.value >= 600 &&
-        slider.value <= 10000 && slider.maximumValue >= 3190) {
-        elo = (int)lroundf(slider.value);
-        [[NSUserDefaults standardUserDefaults] setInteger:elo forKey:kStrengthEloKey];
+static UISlider *CAPFindEloSlider(UIView *view) {
+    if ([view isKindOfClass:UISlider.class]) {
+        UISlider *slider = (UISlider *)view;
+        if (fabsf(slider.minimumValue) < 0.01f &&
+            fabsf(slider.maximumValue - (float)(kEloPresetCount - 1)) < 0.01f)
+            return slider;
     }
+    for (UIView *child in view.subviews) {
+        UISlider *found = CAPFindEloSlider(child);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static UILabel *CAPPanelEloLabel(id panel, const char *name) {
+    Ivar ivar = class_getInstanceVariable([panel class], name);
+    id value = ivar ? object_getIvar(panel, ivar) : nil;
+    return [value isKindOfClass:UILabel.class] ? (UILabel *)value : nil;
+}
+
+static void CAPSetEloPanelLabels(id panel, int elo) {
+    UILabel *value = CAPPanelEloLabel(panel, "_eloValue");
+    UILabel *tier = CAPPanelEloLabel(panel, "_eloTier");
+    value.text = [NSString stringWithFormat:@"%d", elo];
+    tier.text = elo < 1320 ? @"Human-like" :
+        (HEPdfBand(elo) ? @"PDF move law" :
+         (elo >= 3190 ? @"Maximum" : @"Stockfish 19"));
+}
+
+static BOOL CAPImageContainsRange(const struct mach_header_64 *header,
+                                  uint64_t address, size_t length, BOOL writable) {
+    if (!header || header->magic != MH_MAGIC_64) return NO;
+    const uint8_t *command = (const uint8_t *)(header + 1);
+    const uint8_t *end = command + header->sizeofcmds;
+    for (uint32_t index = 0; index < header->ncmds; ++index) {
+        if (command + sizeof(struct load_command) > end) return NO;
+        const struct load_command *load = (const struct load_command *)command;
+        if (load->cmdsize < sizeof(struct load_command) || command + load->cmdsize > end)
+            return NO;
+        if (load->cmd == LC_SEGMENT_64 && load->cmdsize >= sizeof(struct segment_command_64)) {
+            const struct segment_command_64 *segment = (const struct segment_command_64 *)load;
+            if (address >= segment->vmaddr && address + length <= segment->vmaddr + segment->vmsize &&
+                (!writable || (segment->initprot & VM_PROT_WRITE))) return YES;
+        }
+        command += load->cmdsize;
+    }
+    return NO;
+}
+
+static void CAPSyncOriginalEloGlobal(int elo) {
+    // Chess.dylib 4.10.22 keeps its active Elo in writable __DATA. Verify the
+    // original 14-entry table before touching this version-specific address.
+    for (uint32_t i = 0; i < _dyld_image_count(); ++i) {
+        const char *image = _dyld_get_image_name(i);
+        if (!image || !strstr(image, "/Chess.dylib")) continue;
+        const struct mach_header_64 *header =
+            (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!CAPImageContainsRange(header, 0x6f968, 14 * sizeof(int64_t), NO) ||
+            !CAPImageContainsRange(header, 0x26c0ed8, sizeof(int64_t), YES)) return;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        const int64_t *original = (const int64_t *)(slide + 0x6f968);
+        if (original[0] != 400 || original[6] != 1600 || original[13] != 3500) {
+            NSLog(@"[ChessAssistantPro] Original Elo table changed; skipping global sync");
+            return;
+        }
+        int64_t *current = (int64_t *)(slide + 0x26c0ed8);
+        __atomic_store_n(current, (int64_t)elo, __ATOMIC_RELAXED);
+        return;
+    }
+}
+
+static void CAPUpdateStockfishSkillUI(id panel, int elo) {
     UILabel *label = objc_getAssociatedObject(panel, &kStockfishSkillLabelKey);
     if (!label) return;
     if (elo >= 3190) {
         label.text = @"Max · Skill 20/20";
         label.accessibilityLabel = @"Stockfish 19 full strength, skill level 20 of 20, no fixed Elo rating";
-    } else if (elo >= 1320) {
-        label.text = [NSString stringWithFormat:@"%d · Skill ~%.1f/20",
-                      elo, CAPStockfishSkillForElo(elo)];
+    } else if (HEPdfBand(elo)) {
+        label.text = [NSString stringWithFormat:@"%d · PDF move law",elo];
         label.accessibilityLabel = [NSString stringWithFormat:
-            @"Stockfish 19 ELO limit %d, approximate effective skill %.1f of 20",
-            elo, CAPStockfishSkillForElo(elo)];
+            @"Stockfish 19 candidate move law at preset %d; rating not calibrated, search skill 20 of 20",elo];
+    } else if (elo >= 1320) {
+        label.text = [NSString stringWithFormat:@"%d · UCI Elo", elo];
+        label.accessibilityLabel = [NSString stringWithFormat:
+            @"Stockfish 19 UCI ELO limit %d, search skill level 20 of 20",
+            elo];
     } else {
         NSDictionary *profile = HEDescribeElo(elo);
         label.text = [NSString stringWithFormat:@"%d · Human mix · Depth %@",
@@ -3518,6 +3877,19 @@ static void CAPUpdateStockfishSkillUI(id panel, UISlider *slider) {
             @"Stockfish 19 uncalibrated human move profile %d, depth %@, up to %@ scored moves; engine search skill 20 of 20",
             elo, profile[@"depth"] ?: @"?", profile[@"multipv"] ?: @"?"];
     }
+}
+
+static void CAPConfigureEloSlider(id panel) {
+    if (![panel isKindOfClass:UIView.class]) return;
+    UISlider *slider = CAPFindEloSlider((UIView *)panel);
+    if (!slider) return;
+    slider.minimumValue = 0;
+    slider.maximumValue = (float)(kEloPresetCount - 1);
+    int elo = CAPRequestedStockfishElo();
+    [slider setValue:(float)CAPEloPresetIndexFor(elo) animated:NO];
+    CAPSyncOriginalEloGlobal(elo);
+    CAPSetEloPanelLabels(panel, elo);
+    CAPUpdateStockfishSkillUI(panel, elo);
 }
 
 static void CAPInsertStockfishSkill(id panel) {
@@ -3544,7 +3916,7 @@ static void CAPInsertStockfishSkill(id panel) {
         objc_setAssociatedObject(panel, &kStockfishSkillLabelKey, label,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    CAPUpdateStockfishSkillUI(panel, nil);
+    CAPUpdateStockfishSkillUI(panel, CAPRequestedStockfishElo());
 }
 
 static char kDumpGestureKey;
@@ -3562,6 +3934,7 @@ static void CAPInstallDumpGesture(id panel) {
 %hook CHSettingsPanel
 - (void)build {
     %orig;
+    CAPConfigureEloSlider(self);
     CAPInsertGodEngine(self);
     CAPInsertStockfishSkill(self);
     CAPInsertAutoPlay(self);
@@ -3569,6 +3942,7 @@ static void CAPInstallDumpGesture(id panel) {
 }
 - (void)populate {
     %orig;
+    CAPConfigureEloSlider(self);
     CAPInsertGodEngine(self);
     CAPInsertStockfishSkill(self);
     CAPInsertAutoPlay(self);
@@ -3576,11 +3950,39 @@ static void CAPInstallDumpGesture(id panel) {
 }
 - (void)eloSlide:(UISlider *)sender {
     %orig;
-    CAPUpdateStockfishSkillUI(self, sender);
+    int index = MAX(0, MIN(kEloPresetCount - 1, (int)lroundf(sender.value)));
+    [sender setValue:(float)index animated:NO];
+    int elo = kEloPresets[index];
+    CAPSetEloPanelLabels(self, elo);
+    CAPUpdateStockfishSkillUI(self, elo);
 }
 - (void)eloDone:(UISlider *)sender {
-    %orig;
-    CAPUpdateStockfishSkillUI(self, sender);
+    int index = MAX(0, MIN(kEloPresetCount - 1, (int)lroundf(sender.value)));
+    [sender setValue:(float)index animated:NO];
+    int elo = kEloPresets[index];
+    [[NSUserDefaults standardUserDefaults] setInteger:elo forKey:kStrengthEloKey];
+    CAPSyncOriginalEloGlobal(elo);
+    CAPSetEloPanelLabels(self, elo);
+    CAPUpdateStockfishSkillUI(self, elo);
+    engineGeneration.fetch_add(1);
+    ++autoPlayGeneration;
+    lastScheduledFEN = nil;
+    lastPlayedFEN = nil;
+    cachedGodMove = cachedGodFEN = nil;
+    cachedGodChoice = -1;
+    UIView *board = CAPVisibleSwiftBoard();
+    if (board) { [board setNeedsLayout]; [board layoutIfNeeded]; }
+    NSLog(@"[ChessAssistantPro] ELO preset %d selected (slider stop %d)", elo, index);
+}
+- (void)creditsTap {
+    UIViewController *presenter = ((UIView *)self).window.rootViewController;
+    while (presenter.presentedViewController) presenter = presenter.presentedViewController;
+    if (!presenter) return;
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:nil
+        message:@"Made by JerichBrylle :)" preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+        style:UIAlertActionStyleDefault handler:nil]];
+    [presenter presentViewController:alert animated:YES completion:nil];
 }
 %new
 - (void)cap_dumpLongPress:(UILongPressGestureRecognizer *)gesture {

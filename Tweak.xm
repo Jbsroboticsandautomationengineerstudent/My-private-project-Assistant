@@ -1466,7 +1466,7 @@ static int CAPRequestedStockfishElo(void) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function"
 #define HE_BAND_LO            600
-#define HE_BAND_HI            1321         // exclusive: include 1320
+#define HE_BAND_HI            1320         // exclusive
 #define HE_MAX_PV             40
 #define HE_MATE_CP            30000
 #define HE_CMD_LEN            96
@@ -1479,10 +1479,10 @@ static const double HEClassLo[HE_NCLASS] = { 0.0, 2.0,             5.0, 10.0, 20
 
 
 
-// Class mix per move at 600 and at 1320 (linear in between).
+// Class mix per move at 600 and at 1319 (linear in between).
 //                                             top      good   inacc mistake blunder
 static const double HEMix600 [HE_NCLASS] = { 0.22, 0.24, 0.22, 0.16, 0.16 };
-static const double HEMix1320[HE_NCLASS] = { 0.36, 0.27, 0.17, 0.11, 0.09 };
+static const double HEMix1319[HE_NCLASS] = { 0.36, 0.27, 0.17, 0.11, 0.09 };
 
 
 // Win% for a centipawn score (Lichess curve, close to Game Review)
@@ -1494,12 +1494,12 @@ static double HEWinPct(int cp) {
 
 
 // ===========================================================================
-// MARK: - Band parameters (continuous 600 → 1320)
+// MARK: - Band parameters (continuous 600 → 1319)
 // ===========================================================================
 
 
 typedef struct {
-     double t;                     // 0.0 at 600, 1.0 at 1320
+     double t;                     // 0.0 at 600, 1.0 at 1319
      int    depth;                 // search depth                        6 → 9
      int    multipv;               // candidate lines                    40 → 30
      double mix[HE_NCLASS];        // per-move class probabilities
@@ -1520,7 +1520,7 @@ static inline int HEHumanBand(int elo) {
 
 static HEParams HEParamsFor(int elo) {
     HEParams p;
-    double t = (elo - (double)HE_BAND_LO) / 720.0;
+    double t = (elo - (double)HE_BAND_LO) / 719.0;
     if (t < 0.0) t = 0.0;
     if (t > 1.0) t = 1.0;
     p.t = t;
@@ -1529,7 +1529,7 @@ static HEParams HEParamsFor(int elo) {
     p.depth          = (int)lround(6.0 + 3.0 * t);
     p.multipv        = (int)lround(40.0 - 10.0 * t);
     for (int c = 0; c < HE_NCLASS; c++)
-          p.mix[c]   = HEMix600[c] + (HEMix1320[c] - HEMix600[c]) * t;
+          p.mix[c]   = HEMix600[c] + (HEMix1319[c] - HEMix600[c]) * t;
     p.spotObvious = 0.60 + 0.25 * t;
     p.spotTactic     = 0.15 + 0.45 * t;
     p.spotMate1      = 0.85 + 0.15 * t;
@@ -3040,7 +3040,7 @@ static void HEInvalidateConfiguration(void) {
 }
 
 static double CAPStockfishSkillForElo(int elo) {
-    if (elo <= 1320) return 20; // Search skill, not the human move-class profile.
+    if (elo < 1320) return 20; // Search skill, not the human move-class profile.
     if (elo >= 3190) return 20;
     double e = (double)(elo - 1320) / (3190 - 1320);
     return fmax(0.0, fmin(19.0,
@@ -3112,7 +3112,7 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
     }
     BOOL success = NO;
     std::string line;
-    BOOL lowElo = stockfish19 && requestedElo <= 1320;
+    BOOL lowElo = stockfish19 && requestedElo < 1320;
     int ply = lowElo ? CAPFenPly(fen) : -1;
     NSString *humanGo = nil;
     if (lowElo) {
@@ -3182,7 +3182,7 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
                   requestedElo, ply, humanGo);
         } else {
             // The high-Elo path changes UCI options directly; restore all
-            // human-band options if the slider later returns to 600–1320.
+            // human-band options if the slider later returns to 600–1319.
             HEInvalidateConfiguration();
             if (!CAPWrite(input[1], "setoption name MultiPV value 1\n") ||
                 !CAPWrite(input[1], "setoption name Skill Level value 20\n") ||
@@ -3504,7 +3504,7 @@ static void CAPUpdateStockfishSkillUI(id panel, UISlider *slider) {
     if (elo >= 3190) {
         label.text = @"Max · Skill 20/20";
         label.accessibilityLabel = @"Stockfish 19 full strength, skill level 20 of 20, no fixed Elo rating";
-    } else if (elo >= 1321) {
+    } else if (elo >= 1320) {
         label.text = [NSString stringWithFormat:@"%d · Skill ~%.1f/20",
                       elo, CAPStockfishSkillForElo(elo)];
         label.accessibilityLabel = [NSString stringWithFormat:

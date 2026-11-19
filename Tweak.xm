@@ -23,11 +23,23 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <atomic>
 #include <sstream>
 #include <string>
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <functional>
+#include <limits>
+#include <mutex>
+#include <numeric>
+#include <random>
+#include <utility>
+#include <stdexcept>
+#include <vector>
 
 extern char **environ;
 
@@ -1448,72 +1460,104 @@ static int CAPRequestedStockfishElo(void) {
 }
 
 // Low-ELO move selection and FEN feature analysis.
-#define HE_BAND_LO        600
-#define HE_BAND_HI        1320      // exclusive
-#define HE_MAX_PV         12
-#define HE_MATE_CP        30000
+// Embedded from Humaneengine.mm (new).txt; move policy and all equation groups.
+#define HE_BAND_LO            600
+#define HE_BAND_HI            1321         // exclusive: include 1320
+#define HE_MAX_PV             40
+#define HE_MATE_CP            30000
+#define HE_CMD_LEN            96
+
+
+// Move classes by WIN% lost vs Stockfish's best line (same idea as Game Review)
+//    Best/Excellent < 2%      Good 2–5%      Inaccuracy 5–10%       Mistake 10–20%     Blunder 20%+
+enum { HE_TOP = 0, HE_GOOD, HE_INACC, HE_MISTAKE, HE_BLUNDER, HE_NCLASS };
+static const double HEClassLo[HE_NCLASS] = { 0.0, 2.0,             5.0, 10.0, 20.0 };
+
+
+
+// Class mix per move at 600 and at 1320 (linear in between).
+//                                             top      good   inacc mistake blunder
+static const double HEMix600 [HE_NCLASS] = { 0.22, 0.24, 0.22, 0.16, 0.16 };
+static const double HEMix1320[HE_NCLASS] = { 0.36, 0.27, 0.17, 0.11, 0.09 };
+
+
+// Win% for a centipawn score (Lichess curve, close to Game Review)
+static double HEWinPct(int cp) {
+     if (cp >    2000) cp =   2000;
+     if (cp < -2000) cp = -2000;
+     return 50.0 + 50.0 * (2.0 / (1.0 + exp(-0.00368208 * cp)) - 1.0);
+}
+
 
 // ===========================================================================
-// MARK: - Band parameters (continuous across 600 → 1319)
+// MARK: - Band parameters (continuous 600 → 1320)
 // ===========================================================================
+
 
 typedef struct {
-    double t;               // 0.0 at 600, 1.0 at 1319
-    int    skill;           // displayed human preset 0 → 3 (UCI search stays at 20)
-    int    depth;           // search depth            5 → 10
-    int    multipv;         // candidate lines         10 → 6
-    double T;               // softmax temperature     145 → 45
-    double seeThrough;      // tactical vision         0 → 1
-    double blunderBudget;   // real blunders per game  4.5 → 1.0
-    double mistakeBudget;   // mistakes per game       9 → 3
-    int    convThresh;      // cp above which it always plays best  600 → 350
-    double quietW;          // weight on quiet moves   0.50 → 0.95
+     double t;                     // 0.0 at 600, 1.0 at 1320
+     int    depth;                 // search depth                        6 → 9
+     int    multipv;               // candidate lines                    40 → 30
+     double mix[HE_NCLASS];        // per-move class probabilities
+     double spotObvious;           // takes a free piece               0.60 → 0.85
+     double spotTactic;            // finds a non-capture win/mate 0.15 → 0.60
+    double spotMate1;          // finds mate in 1              0.85 → 1.00
+    double visW;               // likes "hangs a piece" blunders 1.5 → 0.5
+    int       convThresh;      // winning → fewer errors        500 → 300
+    double quietW;             // weight on quiet moves        0.55 → 0.95
     double greedBase, aggroBase, fearBase;
 } HEParams;
 
-static inline BOOL HEHumanBand(int elo) {
+
+static inline int HEHumanBand(int elo) {
     return elo >= HE_BAND_LO && elo < HE_BAND_HI;
 }
 
+
 static HEParams HEParamsFor(int elo) {
     HEParams p;
-    double t = (elo - (double)HE_BAND_LO) / 719.0;
+    double t = (elo - (double)HE_BAND_LO) / 720.0;
     if (t < 0.0) t = 0.0;
     if (t > 1.0) t = 1.0;
     p.t = t;
 
-    p.skill         = (int)lround(3.0 * t);
-    p.depth         = (int)lround(5.0 + 5.0 * t);
-    p.multipv       = (int)lround(10.0 - 4.0 * t);
-    p.T             = 145.0 - 100.0 * t;
-    p.seeThrough    = t;
-    p.blunderBudget = 4.5 - 3.5 * t;
-    p.mistakeBudget = 9.0 - 6.0 * t;
-    p.convThresh    = (int)lround(600.0 - 250.0 * t);
-    p.quietW        = 0.50 + 0.45 * t;
-    p.greedBase     = 1.50 - 0.40 * t;
-    p.aggroBase     = 1.45 - 0.35 * t;
-    p.fearBase      = 0.40 + 0.40 * t;
+
+    p.depth          = (int)lround(6.0 + 3.0 * t);
+    p.multipv        = (int)lround(40.0 - 10.0 * t);
+    for (int c = 0; c < HE_NCLASS; c++)
+          p.mix[c]   = HEMix600[c] + (HEMix1320[c] - HEMix600[c]) * t;
+    p.spotObvious = 0.60 + 0.25 * t;
+    p.spotTactic     = 0.15 + 0.45 * t;
+    p.spotMate1      = 0.85 + 0.15 * t;
+    p.visW           = 1.50 - 1.00 * t;
+    p.convThresh     = (int)lround(500.0 - 200.0 * t);
+    p.quietW         = 0.55 + 0.40 * t;
+    p.greedBase      = 1.50 - 0.40 * t;
+    p.aggroBase      = 1.45 - 0.35 * t;
+    p.fearBase       = 0.45 + 0.40 * t;
     return p;
 }
+
 
 // ===========================================================================
 // MARK: - RNG
 // ===========================================================================
 
+
 static inline double HEFrand(void) {
     return (double)arc4random_uniform(1000000u) / 1000000.0;
 }
 
+
 // ===========================================================================
 // MARK: - Board (index 0 = a1 … 63 = h8)
 // ===========================================================================
-
 typedef struct {
-    char sq[64];        // '.' = empty, uppercase = white, lowercase = black
-    int  whiteToMove;
-    int  epSquare;      // -1 if none
+    char sq[64];             // '.' = empty, uppercase = white, lowercase = black
+    int    whiteToMove;
+    int    epSquare;         // -1 if none
 } HEBoard;
+
 
 static inline int HEFile(int s) { return s & 7; }
 static inline int HERank(int s) { return s >> 3; }
@@ -1521,17 +1565,19 @@ static inline int HEOnBoard(int f, int r) { return f >= 0 && f < 8 && r >= 0 && 
 static inline int HESq(int f, int r) { return r * 8 + f; }
 static inline int HEIsWhitePiece(char c) { return c != '.' && isupper((unsigned char)c); }
 
+
 static int HEPieceValue(char p) {
     switch (tolower((unsigned char)p)) {
-        case 'p': return 100;
-        case 'n': return 320;
-        case 'b': return 330;
-        case 'r': return 500;
-        case 'q': return 900;
-        case 'k': return 10000;
-        default:  return 0;
+          case 'p': return 100;
+          case 'n': return 320;
+          case 'b': return 330;
+          case 'r': return 500;
+          case 'q': return 900;
+          case 'k': return 10000;
+          default:     return 0;
     }
 }
+
 
 static int HEParseSquare(const char *s) {
     if (!s || !s[0] || !s[1]) return -1;
@@ -1541,132 +1587,71 @@ static int HEParseSquare(const char *s) {
     return HESq(f, r);
 }
 
-// Parses the board, side to move and en-passant square. Castling rights and
-// clocks are not needed by any heuristic here.
-static BOOL HEParseFEN(const char *fen, HEBoard *out) {
-    if (!fen || !out) return NO;
+
+static int HEParseFEN(const char *fen, HEBoard *out) {
+    if (!fen || !out) return 0;
     memset(out->sq, '.', sizeof(out->sq));
     out->whiteToMove = 1;
-    out->epSquare    = -1;
+    out->epSquare         = -1;
+
 
     int rank = 7, file = 0;
     const char *p = fen;
 
+
     for (; *p && *p != ' '; p++) {
-        if (*p == '/') {
-            if (file != 8 || rank == 0) return NO;
-            rank--; file = 0;
-            continue;
-        }
-        if (*p >= '1' && *p <= '8') {
-            file += *p - '0';
-            if (file > 8) return NO;
-            continue;
-        }
-        if (file > 7 || !strchr("PNBRQKpnbrqk", *p)) return NO;
-        out->sq[HESq(file, rank)] = *p;
+          if (*p == '/') { rank--; file = 0; if (rank < 0) return 0; continue; }
+          if (isdigit((unsigned char)*p)) { file += *p - '0'; continue; }
+          if (file < 0 || file > 7 || rank < 0) return 0;
+          out->sq[HESq(file, rank)] = *p;
         file++;
     }
-    if (rank != 0 || file != 8) return NO;
+
 
     while (*p == ' ') p++;
-    if (*p != 'w' && *p != 'b') return NO;
-    out->whiteToMove = (*p == 'w');
-    p++;
+    if (*p) { out->whiteToMove = (*p == 'w'); p++; }
 
-    while (*p == ' ') p++;              // skip side-to-move field remainder
-    while (*p && *p != ' ') p++;        // castling rights
+
+    while (*p == ' ') p++;
+    while (*p && *p != ' ') p++;           // castling rights
     while (*p == ' ') p++;
     if (*p && *p != '-') out->epSquare = HEParseSquare(p);
 
-    return YES;
+
+    return 1;
 }
+
 
 // ---------------------------------------------------------------------------
 // Attack detection
 // ---------------------------------------------------------------------------
 
+
 static const int HEKnightD[8][2] = {{1,2},{2,1},{2,-1},{1,-2},{-1,-2},{-2,-1},{-2,1},{-1,2}};
-static const int HEKingD[8][2]   = {{0,1},{1,1},{1,0},{1,-1},{0,-1},{-1,-1},{-1,0},{-1,1}};
+static const int HEKingD[8][2]      = {{0,1},{1,1},{1,0},{1,-1},{0,-1},{-1,-1},{-1,0},{-1,1}};
 static const int HEBishopD[4][2] = {{1,1},{1,-1},{-1,-1},{-1,1}};
-static const int HERookD[4][2]   = {{0,1},{1,0},{0,-1},{-1,0}};
+static const int HERookD[4][2]      = {{0,1},{1,0},{0,-1},{-1,0}};
 
-static int HEAttackedBy(const HEBoard *b, int sq, int byWhite) {
-    int f = HEFile(sq), r = HERank(sq);
 
-    // pawns
-    if (byWhite) {
-        if (HEOnBoard(f - 1, r - 1) && b->sq[HESq(f - 1, r - 1)] == 'P') return 1;
-        if (HEOnBoard(f + 1, r - 1) && b->sq[HESq(f + 1, r - 1)] == 'P') return 1;
-    } else {
-        if (HEOnBoard(f - 1, r + 1) && b->sq[HESq(f - 1, r + 1)] == 'p') return 1;
-        if (HEOnBoard(f + 1, r + 1) && b->sq[HESq(f + 1, r + 1)] == 'p') return 1;
-    }
-
-    // knights
-    for (int i = 0; i < 8; i++) {
-        int nf = f + HEKnightD[i][0], nr = r + HEKnightD[i][1];
-        if (!HEOnBoard(nf, nr)) continue;
-        char c = b->sq[HESq(nf, nr)];
-        if (c == (byWhite ? 'N' : 'n')) return 1;
-    }
-
-    // king
-    for (int i = 0; i < 8; i++) {
-        int nf = f + HEKingD[i][0], nr = r + HEKingD[i][1];
-        if (!HEOnBoard(nf, nr)) continue;
-        char c = b->sq[HESq(nf, nr)];
-        if (c == (byWhite ? 'K' : 'k')) return 1;
-    }
-
-    // bishops / queens
-    for (int i = 0; i < 4; i++) {
-        int nf = f, nr = r;
-        for (;;) {
-            nf += HEBishopD[i][0]; nr += HEBishopD[i][1];
-            if (!HEOnBoard(nf, nr)) break;
-            char c = b->sq[HESq(nf, nr)];
-            if (c == '.') continue;
-            if (byWhite ? (c == 'B' || c == 'Q') : (c == 'b' || c == 'q')) return 1;
-            break;
-        }
-    }
-
-    // rooks / queens
-    for (int i = 0; i < 4; i++) {
-        int nf = f, nr = r;
-        for (;;) {
-            nf += HERookD[i][0]; nr += HERookD[i][1];
-            if (!HEOnBoard(nf, nr)) break;
-            char c = b->sq[HESq(nf, nr)];
-            if (c == '.') continue;
-            if (byWhite ? (c == 'R' || c == 'Q') : (c == 'r' || c == 'q')) return 1;
-            break;
-        }
-    }
-
-    return 0;
-}
-
-// Cheapest enemy piece attacking sq (HE_MATE_CP if none).
+// Cheapest piece of side `byWhite` attacking sq (0 if none).
 static int HECheapestAttacker(const HEBoard *b, int sq, int byWhite) {
-    int best = HE_MATE_CP;
+    int best = 0;
     int f = HEFile(sq), r = HERank(sq);
+#define HE_TAKE(v) do { if (best == 0 || (v) < best) best = (v); } while (0)
 
-    if (byWhite) {
-        if (HEOnBoard(f - 1, r - 1) && b->sq[HESq(f - 1, r - 1)] == 'P') best = 100;
-        if (HEOnBoard(f + 1, r - 1) && b->sq[HESq(f + 1, r - 1)] == 'P') best = 100;
-    } else {
-        if (HEOnBoard(f - 1, r + 1) && b->sq[HESq(f - 1, r + 1)] == 'p') best = 100;
-        if (HEOnBoard(f + 1, r + 1) && b->sq[HESq(f + 1, r + 1)] == 'p') best = 100;
-    }
-    if (best == 100) return 100;
 
+    int pr = byWhite ? r - 1 : r + 1;
+    char P = byWhite ? 'P' : 'p';
+    if (HEOnBoard(f - 1, pr) && b->sq[HESq(f - 1, pr)] == P) return 100;
+    if (HEOnBoard(f + 1, pr) && b->sq[HESq(f + 1, pr)] == P) return 100;
+
+
+    char N = byWhite ? 'N' : 'n';
     for (int i = 0; i < 8; i++) {
         int nf = f + HEKnightD[i][0], nr = r + HEKnightD[i][1];
-        if (!HEOnBoard(nf, nr)) continue;
-        if (b->sq[HESq(nf, nr)] == (byWhite ? 'N' : 'n')) { if (320 < best) best = 320; }
+        if (HEOnBoard(nf, nr) && b->sq[HESq(nf, nr)] == N) { HE_TAKE(320); break; }
     }
+
 
     for (int i = 0; i < 4; i++) {
         int nf = f, nr = r;
@@ -1675,11 +1660,12 @@ static int HECheapestAttacker(const HEBoard *b, int sq, int byWhite) {
             if (!HEOnBoard(nf, nr)) break;
             char c = b->sq[HESq(nf, nr)];
             if (c == '.') continue;
-            if (byWhite ? (c == 'B') : (c == 'b')) { if (330 < best) best = 330; }
-            else if (byWhite ? (c == 'Q') : (c == 'q')) { if (900 < best) best = 900; }
+            if (c == (byWhite ? 'B' : 'b')) HE_TAKE(330);
+            else if (c == (byWhite ? 'Q' : 'q')) HE_TAKE(900);
             break;
         }
     }
+
 
     for (int i = 0; i < 4; i++) {
         int nf = f, nr = r;
@@ -1688,20 +1674,27 @@ static int HECheapestAttacker(const HEBoard *b, int sq, int byWhite) {
             if (!HEOnBoard(nf, nr)) break;
             char c = b->sq[HESq(nf, nr)];
             if (c == '.') continue;
-            if (byWhite ? (c == 'R') : (c == 'r')) { if (500 < best) best = 500; }
-            else if (byWhite ? (c == 'Q') : (c == 'q')) { if (900 < best) best = 900; }
+            if (c == (byWhite ? 'R' : 'r')) HE_TAKE(500);
+            else if (c == (byWhite ? 'Q' : 'q')) HE_TAKE(900);
             break;
         }
     }
 
+
+    char K = byWhite ? 'K' : 'k';
     for (int i = 0; i < 8; i++) {
         int nf = f + HEKingD[i][0], nr = r + HEKingD[i][1];
-        if (!HEOnBoard(nf, nr)) continue;
-        if (b->sq[HESq(nf, nr)] == (byWhite ? 'K' : 'k')) { if (10000 < best) best = 10000; }
+        if (HEOnBoard(nf, nr) && b->sq[HESq(nf, nr)] == K) { HE_TAKE(10000); break; }
     }
-
+#undef HE_TAKE
     return best;
 }
+
+
+static inline int HEAttackedBy(const HEBoard *b, int sq, int byWhite) {
+    return HECheapestAttacker(b, sq, byWhite) != 0;
+}
+
 
 static int HEFindKing(const HEBoard *b, int white) {
     char k = white ? 'K' : 'k';
@@ -1709,59 +1702,1280 @@ static int HEFindKing(const HEBoard *b, int white) {
     return -1;
 }
 
+
 // ---------------------------------------------------------------------------
-// Move application (enough fidelity for the heuristics)
+// Move application
 // ---------------------------------------------------------------------------
 
+
 typedef struct { int from, to; char promo; } HEMove;
+
 
 static HEMove HEParseMove(const char *uci) {
     HEMove m = { -1, -1, 0 };
     if (!uci || strlen(uci) < 4) return m;
-    m.from  = HEParseSquare(uci);
-    m.to    = HEParseSquare(uci + 2);
+    m.from     = HEParseSquare(uci);
+    m.to       = HEParseSquare(uci + 2);
     m.promo = (strlen(uci) >= 5) ? (char)tolower((unsigned char)uci[4]) : 0;
     return m;
 }
+
 
 static HEBoard HEApply(const HEBoard *in, HEMove m) {
     HEBoard b = *in;
     if (m.from < 0 || m.to < 0) return b;
 
+
     char piece = b.sq[m.from];
     char lower = (char)tolower((unsigned char)piece);
-    int  white = HEIsWhitePiece(piece);
+    int     white = HEIsWhitePiece(piece);
 
-    // en passant capture
+
     if (lower == 'p' && m.to == in->epSquare && b.sq[m.to] == '.') {
-        int capSq = white ? m.to - 8 : m.to + 8;
-        if (capSq >= 0 && capSq < 64) b.sq[capSq] = '.';
+           int capSq = white ? m.to - 8 : m.to + 8;
+           if (capSq >= 0 && capSq < 64) b.sq[capSq] = '.';
     }
 
-    // castling: move the rook too
+
     if (lower == 'k' && abs(HEFile(m.to) - HEFile(m.from)) == 2) {
-        int r = HERank(m.from);
-        if (HEFile(m.to) == 6) {                       // king side
-            b.sq[HESq(5, r)] = b.sq[HESq(7, r)];
-            b.sq[HESq(7, r)] = '.';
-        } else if (HEFile(m.to) == 2) {                // queen side
-            b.sq[HESq(3, r)] = b.sq[HESq(0, r)];
-            b.sq[HESq(0, r)] = '.';
+        int r=HERank(m.from);
+        if (HEFile(m.to)==6) {
+            b.sq[HESq(5,r)] = b.sq[HESq(7,r)];
+            b.sq[HESq(7,r)] = '.';
+        } else if (HEFile(m.to)==2) {
+            b.sq[HESq(3,r)] = b.sq[HESq(0,r)];
+            b.sq[HESq(0,r)] = '.';
         }
     }
-
-    b.sq[m.to]   = m.promo ? (white ? (char)toupper((unsigned char)m.promo) : m.promo) : piece;
+    b.sq[m.to] = m.promo ? (white ? (char)toupper((unsigned char)m.promo) : m.promo) : piece;
     b.sq[m.from] = '.';
 
-    // new en-passant square
     b.epSquare = -1;
     if (lower == 'p' && abs(HERank(m.to) - HERank(m.from)) == 2)
-        b.epSquare = white ? m.from + 8 : m.from - 8;
+           b.epSquare = white ? m.from + 8 : m.from - 8;
+
 
     b.whiteToMove = !in->whiteToMove;
     return b;
 }
 
+
+// ===========================================================================
+// MARK: - Move features
+// ===========================================================================
+
+
+typedef struct {
+    int isCapture, capturedValue, isRecapture, capturesHigher, givesCheck;
+    int attacksQueen, isBackward, isQuiet, isSamePieceAgain, isPawnPush;
+    int hangsPiece, isDeveloping, isCastle, isEarlyQueenSortie, isRookPawn;
+    int isPromotion, visibleMistake;
+} HEFeatures;
+
+
+static int HELastOwnTo = -1;      // destination of our previous move
+static int HEOppLastTo = -1;      // destination of the opponent's last move
+
+
+static HEFeatures HEExtract(const HEBoard *b, HEMove m) {
+    HEFeatures f;
+    memset(&f, 0, sizeof(f));
+    if (m.from < 0 || m.to < 0) return f;
+
+
+    char piece     = b->sq[m.from];
+    char lower     = (char)tolower((unsigned char)piece);
+    int    white   = HEIsWhitePiece(piece);
+    char target = b->sq[m.to];
+
+
+    f.isCapture         = (target != '.') || (lower == 'p' && m.to == b->epSquare);
+    f.capturedValue     = (target != '.') ? HEPieceValue(target) : (f.isCapture ? 100 : 0);
+    f.isRecapture       = f.isCapture && (m.to == HEOppLastTo);
+    f.capturesHigher = f.isCapture && f.capturedValue > HEPieceValue(piece);
+    f.isPromotion       = (m.promo != 0);
+    f.isPawnPush        = (lower == 'p') && !f.isCapture;
+    f.isRookPawn        = (lower == 'p') && (HEFile(m.from) == 0 || HEFile(m.from) == 7);
+    f.isCastle          = (lower == 'k') && abs(HEFile(m.to) - HEFile(m.from)) == 2;
+    f.isSamePieceAgain = (m.from == HELastOwnTo);
+
+
+    int dr = HERank(m.to) - HERank(m.from);
+    f.isBackward = white ? (dr < 0) : (dr > 0);
+
+
+    int homeRank = white ? 0 : 7;
+    f.isDeveloping          = (lower == 'n' || lower == 'b') && (HERank(m.from) == homeRank);
+    f.isEarlyQueenSortie = (lower == 'q') && (HERank(m.from) == homeRank);
+
+
+    HEBoard after = HEApply(b, m);
+
+
+    int oppKing     = HEFindKing(&after, !white);
+    f.givesCheck = (oppKing >= 0) && HEAttackedBy(&after, oppKing, white);
+
+
+    char oq = white ? 'q' : 'Q';
+    for (int i = 0; i < 64; i++) {
+          if (after.sq[i] != oq) continue;
+          if (HEAttackedBy(&after, i, white)) f.attacksQueen = 1;
+          break;
+    }
+
+
+    f.isQuiet = !f.isCapture && !f.givesCheck && !f.isPromotion && !f.attacksQueen;
+    // SEE-lite on the destination square
+    int movedValue = HEPieceValue(after.sq[m.to]);
+    int cheapest      = HECheapestAttacker(&after, m.to, !white);
+    int defended      = HEAttackedBy(&after, m.to, white);
+    if (cheapest && (cheapest < movedValue || !defended)) {
+        if (f.capturedValue - movedValue < -80) f.hangsPiece = 1;
+    }
+
+
+    // "Visible" = refutation is one move deep: the moved piece hangs, or any
+    // other piece is attacked by something cheaper OR is attacked and undefended.
+    f.visibleMistake = f.hangsPiece;
+    if (!f.visibleMistake) {
+        for (int i = 0; i < 64; i++) {
+            char c = after.sq[i];
+            if (c == '.' || HEIsWhitePiece(c) != white || i == m.to) continue;
+            char l = (char)tolower((unsigned char)c);
+            if (l == 'p' || l == 'k') continue;
+            int ca = HECheapestAttacker(&after, i, !white);
+            if (!ca) continue;
+            if (ca < HEPieceValue(c) || !HEAttackedBy(&after, i, white)) {
+                   f.visibleMistake = 1;
+                   break;
+            }
+        }
+    }
+    return f;
+}
+
+
+// ---------------------------------------------------------------------------
+// Position descriptors
+// ---------------------------------------------------------------------------
+
+
+typedef enum { HEOpening = 0, HEMiddlegame = 1, HEEndgame = 2 } HEPhase;
+
+
+static int HEPieceCount(const HEBoard *b) {
+    int n = 0;
+    for (int i = 0; i < 64; i++) if (b->sq[i] != '.') n++;
+    return n;
+}
+
+
+static int HENonPawnMaterial(const HEBoard *b) {
+    int v = 0;
+    for (int i = 0; i < 64; i++) {
+        char l = (char)tolower((unsigned char)b->sq[i]);
+        if (l == '.' || l == 'p' || l == 'k') continue;
+          v += HEPieceValue(l);
+    }
+    return v;
+}
+
+
+static HEPhase HEPhaseOf(const HEBoard *b, int ply) {
+    int npm = HENonPawnMaterial(b);
+    if (npm <= 2200) return HEEndgame;
+    if (ply < 16 && npm >= 5600) return HEOpening;
+    return HEMiddlegame;
+}
+
+
+// How sharp the position is: our attacks, their threats, pressure on their king.
+static double HEComplexity(const HEBoard *b, int white) {
+    int ours = 0, theirs = 0, nearKing = 0;
+    for (int i = 0; i < 64; i++) {
+          char c = b->sq[i];
+          if (c == '.') continue;
+          if (HEIsWhitePiece(c) != white) {
+               if (HEAttackedBy(b, i, white)) ours++;
+          } else if (tolower((unsigned char)c) != 'k') {
+               if (HEAttackedBy(b, i, !white)) theirs++;
+          }
+    }
+    int ok = HEFindKing(b, !white);
+    if (ok >= 0) {
+          int f = HEFile(ok), r = HERank(ok);
+          for (int i = 0; i < 8; i++) {
+               int nf = f + HEKingD[i][0], nr = r + HEKingD[i][1];
+               if (HEOnBoard(nf, nr) && HEAttackedBy(b, HESq(nf, nr), white)) nearKing++;
+          }
+    }
+    return ours / 6.0 + theirs / 4.0 + nearKing / 4.0;
+}
+
+
+// ===========================================================================
+// MARK: - Per-game state
+// ===========================================================================
+
+
+typedef struct {
+    double greed, aggro, fear;
+    int       count[HE_NCLASS];     // moves played per class
+    int       misses;               // opponent blunders not punished
+    int       missStreak;           // misses in a row (it notices eventually)
+    int       ownMoves;
+    int       lastCp, haveLastCp;   // our eval after our previous move
+    int       isWhite, init;
+} HEState;
+
+
+static std::recursive_mutex HEMutex;  // protects ALL engine global state, including info lines.
+static HEState        HES;
+static HEParams HEHP;
+static double HEClockSeconds = -1.0; // set with HEClockRemainingSeconds(), optional
+static int            HECfgElo = -1;      // last ELO whose options were sent
+
+
+static void HEStatsReset(void);
+static void HECoreNewGame(int playingWhite, int elo) {
+    memset(&HES, 0, sizeof(HES));
+    HEStatsReset();
+    HEHP = HEParamsFor(elo);
+
+
+    HES.isWhite = playingWhite ? 1 : 0;
+    HES.greed         = HEHP.greedBase + HEFrand() * 0.50;
+    HES.aggro         = HEHP.aggroBase + HEFrand() * 0.45;
+    HES.fear          = HEHP.fearBase     + HEFrand() * 0.30;
+    if (playingWhite) HES.aggro *= 1.20; else HES.fear *= 1.15;
+
+
+    HEClockSeconds = -1;
+    HELastOwnTo = -1;
+    HEOppLastTo = -1;
+    HECfgElo          = -1;               // resend engine options
+    HES.init          = 1;
+}
+
+
+void HENoteOpponentMove(const char *uci) {
+    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    HEOppLastTo = HEParseMove(uci).to;
+}
+
+
+// ===========================================================================
+// MARK: - UCI plumbing
+// ===========================================================================
+
+
+typedef struct {
+    int     cp;              // side-to-move POV, centipawns
+    int     mateIn;          // 0 none, >0 we mate, <0 we get mated
+    int     depth;
+    int     valid;
+    char move[8];
+} HELine;
+
+
+static HELine HELines[HE_MAX_PV];
+static int        HELineCount = 0;
+
+
+void HEResetLines(void) {
+    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    memset(HELines, 0, sizeof(HELines));
+    HELineCount = 0;
+}
+// Fills `out` with UCI commands (last one is "go"). Options are only resent
+// when the ELO changes or a new game starts.
+static int HECoreConfigure(int elo, char out[][HE_CMD_LEN], int max) {
+    int n = 0;
+#define HE_ADD(...) do { if (n < max) snprintf(out[n++], HE_CMD_LEN, __VA_ARGS__); } while (0)
+
+
+    HEResetLines();
+    int fresh = (elo != HECfgElo);
+    HECfgElo = elo;
+
+
+    if (!HEHumanBand(elo)) {
+        if (fresh) {
+            HE_ADD("setoption name MultiPV value 1");
+            HE_ADD("setoption name Skill Level value 20");
+            if (elo < 3190) {
+                   HE_ADD("setoption name UCI_LimitStrength value true");
+                   HE_ADD("setoption name UCI_Elo value %d", elo);
+            } else {
+                   HE_ADD("setoption name UCI_LimitStrength value false");
+            }
+        }
+        HE_ADD("go movetime 200");
+        return n;
+    }
+
+
+    if (!HES.init) HECoreNewGame(1, elo);
+    HEHP = HEParamsFor(elo);
+
+
+    if (fresh) {
+        HE_ADD("setoption name UCI_LimitStrength value false");
+        HE_ADD("setoption name Threads value 1");
+        HE_ADD("setoption name Skill Level value 20");       // honest scores
+        HE_ADD("setoption name MultiPV value %d", HEHP.multipv);
+    }
+    HE_ADD("go depth %d movetime 1500", HEHP.depth + (int)arc4random_uniform(2));
+#undef HE_ADD
+    return n;
+}
+
+
+// Parses "info depth D ... multipv K score cp X ... pv MOVE ..."
+void HEParseInfo(const char *line) {
+    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    if (!line) return;
+    if (!strstr(line, " multipv ") || !strstr(line, " pv ")) return;
+    if (strstr(line, " lowerbound") || strstr(line, " upperbound")) return;
+    int idx = 0, cp = 0, mate = 0, depth = 0, haveScore = 0;
+    char mv[8] = {0};
+
+
+    const char *p = strstr(line, " multipv ");
+    idx = atoi(p + 9);
+    if (idx < 1 || idx > HE_MAX_PV) return;
+
+
+    p = strstr(line, " depth ");
+    if (p) depth = atoi(p + 7);
+
+
+    p = strstr(line, " score cp ");
+    if (p) { cp = atoi(p + 10); haveScore = 1; }
+
+
+    p = strstr(line, " score mate ");
+    if (p) {
+        mate = atoi(p + 12);
+        cp = (mate > 0) ? (HE_MATE_CP - mate) : (-HE_MATE_CP - mate);
+        haveScore = 1;
+    }
+    if (!haveScore) return;
+
+
+    p = strstr(line, " pv ") + 4;
+    int n = 0;
+    while (*p && *p != ' ' && n < 7) mv[n++] = *p++;
+    mv[n] = 0;
+    if (n < 4 || n > 5) return;
+    HEMove parsed=HEParseMove(mv);
+    if(parsed.from<0||parsed.to<0||depth<1) return;
+    if(n==5 && mv[4]!='q' && mv[4]!='r' && mv[4]!='b' && mv[4]!='n') return;
+
+    HELine *l = &HELines[idx - 1];
+    l->cp        = cp;
+    l->mateIn = mate;
+    l->depth     = depth;
+    l->valid     = 1;
+    memcpy(l->move, mv, sizeof(l->move));
+
+
+    if (idx > HELineCount) HELineCount = idx;
+}
+
+
+// ===========================================================================
+// MARK: - Human bias
+// ===========================================================================
+
+
+static double HEHumanBias(const HEFeatures *f, int ply) {
+    double t = HEHP.t, inv = 1.0 - t, w = 1.0;
+
+
+    if (f->isCapture)          w *= HES.greed;
+    if (f->isRecapture)        w *= 1.0 + 0.90 * inv;
+    if (f->capturesHigher)      w *= 1.0 + 0.60 * inv;
+    if (f->givesCheck)          w *= HES.aggro;
+    if (f->attacksQueen)        w *= 1.0 + 0.30 * inv;
+    if (f->isPromotion)         w *= 1.6;
+
+
+    if (f->isBackward)          w *= HES.fear;
+    if (f->isQuiet)             w *= HEHP.quietW;
+    if (f->isSamePieceAgain) w *= 1.0 + 0.35 * inv;
+    if (f->isPawnPush)          w *= 1.0 + 0.20 * inv;
+    if (f->hangsPiece)          w *= 0.25 + 0.60 * t;
+
+
+    if (ply < 16) {
+        if (f->isDeveloping)          w *= 1.15 + 0.35 * t;
+        if (f->isCastle)              w *= 0.65 + 0.45 * t;
+        if (f->isEarlyQueenSortie) w *= 1.0 + 0.55 * inv;
+        if (f->isRookPawn)            w *= 0.45 + 0.45 * t;
+    }
+
+
+    if (w < 0.01) w = 0.01;
+    return w;
+}
+
+
+// Weighted random index over w[0..n), -1 if all zero.
+static int HEPick(const double *w, int n) {
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) sum += w[i];
+    if (sum <= 0.0) return -1;
+    double r = HEFrand() * sum, acc = 0.0;
+    int last = -1;
+    for (int i = 0; i < n; i++) {
+        if (w[i] <= 0.0) continue;
+        last = i;
+        acc += w[i];
+        if (r < acc) return i;
+    }
+    return last;
+}
+
+
+// ============================================================================
+// PDF MATHEMATICS, equations 01-75 (Chess Decision Mathematics, Nov 2026)
+// EQUATION COVERAGE MAP (same source-group numbering as uploaded PDF)
+// 01 Value-scaled move loss: phi/losses
+// 02 Move probability relation: choice
+// 03 Probability normalization: Law::g and choice
+// 04 Expected error and rating index: expectedError/intrinsicRating/Tracker
+// 05 Score moments: mean/variance
+// 06 Mean-reverting running total: revert
+// 07 Stationary variance identities: stationaryVariance/incrementVariance
+// 08 Adjacent-increment dependence: lagOneCovariance/lagOneCorrelation/Tracker
+// 09 Log-time distribution: timeLogMean/logNormalLogDensity
+// 10 Sensitivity limits: sensitivityLimits
+// 11 Rating-error inversion: targetError
+// 12 Depth-constrained choice rule: depthPolicy
+// 13 First-passage decision process: Diffusion/simulateFirstExit
+// 14 First-exit time density: exitDensity
+// 15 Expected decision duration: expectedExit
+// 16 Position-dependent drift and boundary: diffusion
+// 17 Exponential choice family: tilt/logPartition
+// 18 Cumulant moments: mean/variance
+// 19 Relative-entropy expansions: kl/logPartition
+// 20 Local log-likelihood expansion: localLogLR
+// 21 Standardized performance score: standardizedScore
+// 22 Rating-to-score conversion: eloToScoreGain
+// 23 Joint move-time distributions: jointLog
+// 24 Conditional information chain rule: jointKL
+// 25 Additive divergence identity: jointKL
+// 26 Per-observation log ratio: logOneStepRatio
+// 27 Log-normal information distance: logNormalKL
+// 28 Sequential ratio product: appendLogEvidence
+// 29 Uniform crossing bound: crossed
+// 30 Expected log-growth: kl/Tracker
+// 31 Approximate threshold time: thresholdObservations
+// 32 Admissible rating path: ratingStepAllowed/maxLogPath
+// 33 Path-conditional likelihood: pathConditionalLog
+// 34 Composite-normalized ratio: compositeLogEvidence
+// 35 Decomposition by rating variation: compositeDecomposition
+// 36 Two-sided information bounds: minimumSamples
+// 37 Binary relative entropy: binaryKL
+// 38 Minimum observation bound: minimumSamples
+// 39 Effective model divergence: minFamilyKL
+// 40 Rating-adjusted sequential ratio: compositeLogEvidence
+// 41 Rating-aware choice perturbation: tilt/ratingScore
+// 42 Choice and rating scores: scoreTilt/ratingScore
+// 43 Parameter derivatives: scaleScore/ratingScore
+// 44 Closed-form rating score: scaleScore
+// 45 Fisher information matrix: fisher
+// 46 Local effective information: Fisher::effective
+// 47 Information collapse condition: informationCollapse
+// 48 Orthogonal perturbation component: orthogonal/effectivePerturbation
+// 49 Boundary-constrained information: constrainedInformation
+// 50 Joint-channel information gain: informationWithTiming
+// 51 One-step model mismatch: chiSquared/mismatchCovarianceBound
+// 52 Expected log-ratio drift: expectedLogDrift
+// 53 Fractional-power crossing bound: fractionalCrossing
+// 54 Tilted moment identity: tiltedMoment
+// 55 Calibration inflation exponent: inflationExponent
+// 56 Critical model distance: criticalMismatch
+// 57 History-averaged conditional law: historyAverage
+// 58 Conditional-information decomposition: conditionalMutualInformation
+// 59 History-conditional likelihood expectation: historyConditionalRatioMean
+// 60 History-aware ratio product: historySequentialLog
+// 61 Regime-to-regime divergence: clockRegimeKL
+// 62 Change in choice information: clockRegimeKL/kl
+// 63 Sensitivity information score: scaleScore/sensitivityFisher
+// 64 Inverse-Gaussian divergence: inverseGaussianKL
+// 65 Transition-state subdensity: transitionStateDensity
+// 66 Post-transition exit-time law: postTransitionExit
+// 67 Piecewise boundary-crossing time: changedBoundaryTime
+// 68 Clock-conditioned observation law: clockConditionedJoint
+// 69 Complete conditional factorization: jointLog/clockConditionedJoint
+// 70 Generalized path statistic: compositeLogEvidence/generalizedThreshold
+// 71 Model-class sample bound: effectiveSampleLower
+// 72 Second-order sample bound: secondOrderSampleBound
+// 73 Normalization derivatives: Law::g/gp/gpp
+// 74 Newton iteration: choice (safeguarded Newton)
+// 75 Quadratic convergence guarantee: Law::newtonQuadraticBound
+// NOTE: analytic bounds, hypothesis tests and alternative timing laws are
+// callable mathematical diagnostics; they are NOT additional move pickers.
+// H0 coefficients and empirical human rating data were not supplied.
+// Sequential Testing of Choice and Response-Time Models: same derivations.
+// All 75 numbered equation groups are represented by executable operations,
+// bounds or diagnostic identities. Only genuine choice and timing distributions
+// influence the live policy: the other equations measure/validate it. They NEVER manufacture
+// human calibration, clock readings, population data, or a verified H0 model.
+// All density arguments use seconds, evaluations use PAWNS, probabilities [0,1].
+// ============================================================================
+namespace HEMath {
+using Vec = std::vector<double>;
+constexpr double pi = 3.141592653589793238462643383279502884;
+constexpr double tiny = 1.0e-300;
+static double clamp(double x, double lo, double hi) { return std::max(lo, std::min(hi, x)); }
+static double safeLog(double x) { return std::log(std::max(x, tiny)); }
+static double sq(double x) { return x*x; }
+static double total(const Vec& a) { return std::accumulate(a.begin(),a.end(),0.0); }
+static Vec normalize(Vec a) {
+    double sum=0; for (double &x:a) {x=std::isfinite(x)?std::max(0.0,x):0.0;sum+=x;}
+    if(a.empty())return a;
+    if(sum<=0){std::fill(a.begin(),a.end(),1.0/a.size());return a;}
+    for(double &x:a)x/=sum;return a;
+}
+static double dot(const Vec &a,const Vec &b) {
+    if(a.size()!=b.size())throw std::invalid_argument("HEMath dot: vector size mismatch");
+    double v=0;for(size_t i=0;i<a.size();++i)v+=a[i]*b[i];return v;
+}
+static double entropy(const Vec &p) {double h=0;for(double v:p)if(v>0)h-=v*std::log(v);return h;}
+// 01: scaled score loss and sign-safe transform.
+static double phi(double v){return std::copysign(std::log1p(std::fabs(v)),v);}
+static Vec losses(const Vec& v) {Vec d(v.size());if(v.empty())return d;
+    double top=*std::max_element(v.begin(),v.end());
+    for(size_t i=0;i<v.size();++i)d[i]=std::max(0.0,phi(top)-phi(v[i]));return d;
+}
+// 02,03,73-75: implicit Regan-Haworth normalization with analytic g', g'';
+// safeguarded Newton + bisection; equality, extremes, and overflow covered.
+struct Law {Vec p,w,d;double p0=1,s=0,c=0;int iterations=0;
+    double g(double x)const{double z=0;for(double wi:w)z+=std::exp(wi*safeLog(x));return z;}
+    double gp(double x)const{double z=0;for(double wi:w)z+=wi*std::exp((wi-1)*safeLog(x));return z;}
+    double gpp(double x)const{double z=0;for(double wi:w)z+=wi*(wi-1)*std::exp((wi-2)*safeLog(x));return z;}
+    double newtonQuadraticBound(double rootError,double high)const{
+        // Eq 75: M=max_{p in [p*,high]} g''(p), not merely g''(high).
+        // For 1<w<2 the curvature DECREASES; for w>2 it increases.
+        if(!(high>=p0&&high<=1.0&&p0>0))return NAN;
+        double M=0.0;
+        for(double wi:w)if(wi>1.0){
+            const double at=(wi<2.0)?p0:high;
+            M+=wi*(wi-1.0)*std::exp((wi-2.0)*safeLog(at));
+        }
+        return M/std::max(2*gp(p0),tiny)*sq(rootError);
+    }
+};
+static Law choice(const Vec &d,double s,double c){
+    if(!(s>0&&c>0)||!std::isfinite(s)||!std::isfinite(c))throw std::invalid_argument("HEMath choice: positive finite s,c required");
+    Law out;out.d=d;out.s=s;out.c=c;out.w.resize(d.size());out.p.resize(d.size());
+    if(d.empty())return out;
+    for(size_t i=0;i<d.size();++i){
+        if(d[i]<0||!std::isfinite(d[i]))throw std::invalid_argument("HEMath choice: invalid loss");
+        double exponent=std::pow(d[i]/s,c);
+        out.w[i]=std::exp(std::min(exponent,40.0)); // numerical cap; not statistical calibration
+    }
+    double low=0.0,high=1.0,x=1.0/out.w.size();
+    for(int it=0;it<160;++it){
+        double gx=out.g(x)-1.0;out.iterations=it+1;
+        if(std::fabs(gx)<1e-13||high-low<1e-15)break;
+        if(gx>0)high=x;else low=x;
+        double dfx=out.gp(x);double y=(dfx>tiny)?x-gx/dfx:std::numeric_limits<double>::quiet_NaN();
+        x=(std::isfinite(y)&&y>low&&y<high)?y:0.5*(low+high);
+    }
+    out.p0=x;
+    for(size_t i=0;i<d.size();++i)out.p[i]=std::exp(out.w[i]*safeLog(x));
+    out.p=normalize(out.p);
+    return out;
+}
+// 04,11: historical intrinsic performance rating and inversion (not actual Elo).
+static double expectedError(const Vec&p,const Vec&d){return dot(p,d);}
+static double intrinsicRating(double ae){return 3571.0-15413.0*ae;}
+static double targetError(int rating){return std::max(0.0,(3571.0-rating)/15413.0);}
+// 05,18: conditional moments and Fisher variance in outcome quality.
+static double mean(const Vec&p,const Vec&u){return dot(p,u);}
+static double variance(const Vec&p,const Vec&u){double m=mean(p,u),v=0;
+    for(size_t i=0;i<p.size();++i)v+=p[i]*sq(u[i]-m);return std::max(0.0,v);}
+// 06-08: stationary mean-reverting model / lag-1 regularity diagnostic.
+static double revert(double M,double e,double k){return (1-k)*M+e;}
+static double stationaryVariance(double k){return 1.0/(k*(2-k));}
+static double incrementVariance(double k){return 2.0/(2.0-k);}
+static double lagOneCovariance(double k){return -k/(2.0-k);}
+static double lagOneCorrelation(double k){return -0.5*k;}
+// 09: log-normal decision-time law, conditional on entropy + remaining clock.
+static double timeLogMean(double b0,double b1,double b2,double H,double clockSec){
+    return b0+b1*H+b2*std::log(std::max(clockSec,0.001));}
+static double normalLogDensity(double y,double m,double sd){
+    if(!(sd>0))return -INFINITY;return -.5*sq((y-m)/sd)-std::log(sd)-.5*std::log(2*pi);}
+static double logNormalLogDensity(double elapsed,double motor,double m,double sd){
+    if(elapsed<=motor)return -INFINITY;
+    double t=elapsed-motor;return normalLogDensity(std::log(t),m,sd)-std::log(t);
+}
+// 10: limits are tested by choice(d,s,c), s->0 and s->infinity.
+// 12: deterministic depth-limited point-mass policy for comparison, not generation.
+static Vec depthPolicy(const Vec&v){Vec q(v.size(),0);if(!v.empty())q[std::max_element(v.begin(),v.end())-v.begin()]=1;return q;}
+// 10: compute both limits explicitly using the exact same normalization solver.
+static std::pair<Vec,Vec> sensitivityLimits(const Vec&d,double consistency){
+    return {choice(d,1.e-8,consistency).p,choice(d,1.e8,consistency).p};
+}
+// 13-16: drift diffusion, first-exit density/mean, entropy/clock-dependent drift.
+struct Diffusion {double mu=0,B=1,sigma=1,motor=0;};
+static double expectedExit(const Diffusion &a){if(a.B<=0||a.sigma<=0)return NAN;
+    if(std::fabs(a.mu)<1e-8)return sq(a.B/a.sigma);
+    return a.B/a.mu*std::tanh(a.mu*a.B/sq(a.sigma));}
+static double exitDensity(double t,const Diffusion&a,int terms=160){
+    if(!(t>0&&a.B>0&&a.sigma>0))return 0;
+    double z=0,kappa=sq(pi*a.sigma)/(8*sq(a.B));
+    for(int k=0;k<terms;++k){double term=(2*k+1)*std::exp(-sq(2*k+1)*kappa*t);
+        z+=(k&1)?-term:term;if(k>10&&term<1e-14)break;}
+    double h=a.mu*a.B/sq(a.sigma), pref;
+    // log(cosh) avoids overflow.
+    double logcosh=std::fabs(h)+std::log1p(std::exp(-2*std::fabs(h)))-std::log(2.0);
+    pref=std::exp(logcosh-sq(a.mu)*t/(2*sq(a.sigma)));
+    return std::max(0.0,pref*kappa*4/pi*z);
+}
+static Diffusion diffusion(double entropyX,double clock,double secondGap,double sensitivity,
+                            double b0,double b1,double b2,double m0,double m1){
+    Diffusion a; a.B=std::max(.05,b0+b1*entropyX+b2*std::log(std::max(clock,.001)));
+    a.mu=m0+m1*secondGap/std::max(sensitivity,1e-10);return a;}
+// 13: direct first passage of a drifted Wiener process; optional simulation
+// for testing the theoretical density against Monte Carlo, not move generation.
+static double simulateFirstExit(const Diffusion&a,std::mt19937_64 &rng,double dt=.002){
+    if(!(dt>0&&a.B>0&&a.sigma>0))return NAN;
+    std::normal_distribution<double> normal(0,1);
+    double x=0;
+    for(int k=1;k<=5000000;++k){
+        x+=a.mu*dt+a.sigma*std::sqrt(dt)*normal(rng);
+        if(std::fabs(x)>=a.B)return k*dt;
+    }
+    return NAN; // right-censored simulation, caller must account for censoring
+}
+// 17-20: exponential tilt, cumulants, KL and local score expansion.
+static Vec tilt(const Vec&p,const Vec&q,double theta){
+    if(p.size()!=q.size())throw std::invalid_argument("HEMath tilt: vector size mismatch");
+    Vec logs(p.size()),r(p.size());double mx=-INFINITY;
+    for(size_t i=0;i<p.size();++i){logs[i]=safeLog(p[i])+theta*q[i];mx=std::max(mx,logs[i]);}
+    for(size_t i=0;i<p.size();++i)r[i]=std::exp(logs[i]-mx);return normalize(r);
+}
+static double logPartition(const Vec&p,const Vec&q,double theta){
+    double mx=-INFINITY;for(size_t i=0;i<p.size();++i)mx=std::max(mx,safeLog(p[i])+theta*q[i]);
+    double sum=0;for(size_t i=0;i<p.size();++i)sum+=std::exp(safeLog(p[i])+theta*q[i]-mx);
+    return mx+std::log(std::max(sum,tiny));
+}
+static double kl(const Vec&a,const Vec&b){if(a.size()!=b.size())throw std::invalid_argument("HEMath KL size mismatch");
+    double d=0;for(size_t i=0;i<a.size();++i)if(a[i]>0)d+=a[i]*(std::log(a[i])-safeLog(b[i]));return std::max(0.0,d);}
+static double localLogLR(double theta,double qMinusMu,double v){return theta*qMinusMu-.5*sq(theta)*v;}
+// 21: standardized score statistic; 22: Elo-to-expected-score gain.
+static double standardizedScore(double sumCentered,double sumV){return sumV>0?sumCentered/std::sqrt(sumV):0;}
+static double eloToScoreGain(double deltaR){return .5*std::tanh(std::log(10.0)*deltaR/800.0);}
+// 23-27: joint choice/time likelihood, information chain and Gaussian time KL.
+static double jointLog(double moveProbability,double logTimePdf){return safeLog(moveProbability)+logTimePdf;}
+static double jointKL(const Vec&piX,const Vec&p0X,const Vec&conditionalKL){return kl(piX,p0X)+dot(piX,conditionalKL);}
+static double logOneStepRatio(double q,double p,double f1Log,double f0Log){
+    return safeLog(q)-safeLog(p)+f1Log-f0Log;}
+static double logNormalKL(double m1,double m0,double sd){return sq(m1-m0)/(2*sq(sd));}
+// 28-31: log-domain sequential product and always-valid crossing threshold,
+// conditional on correctly specified p0 and a predictable alternative.
+static double appendLogEvidence(double cumulative,double step){return cumulative+step;}
+static double logThreshold(double alpha){return -std::log(alpha);}
+static bool crossed(double evidence,double alpha){return evidence>=logThreshold(alpha);}
+static double thresholdObservations(double alpha,double d){return d>0?logThreshold(alpha)/d:INFINITY;}
+// 32-35,39-40,70: composite rating model and bounded rating paths.
+static bool ratingStepAllowed(int prev,int next,int lo,int hi,int velocity){
+    return next>=lo&&next<=hi&&prev>=lo&&prev<=hi&&std::abs(next-prev)<=velocity;}
+static double maxLogPath(const std::vector<Vec>&ll,const Vec&ratings,double maxVelocity){
+    if(ll.empty())return 0;
+    size_t n=ratings.size();if(n==0)return -INFINITY;
+    Vec previous=ll.front();if(previous.size()!=n)throw std::invalid_argument("HEMath rating lattice mismatch");
+    for(size_t t=1;t<ll.size();++t){
+        if(ll[t].size()!=n)throw std::invalid_argument("HEMath rating path mismatch");
+        Vec next(n,-INFINITY);
+        for(size_t j=0;j<n;++j)for(size_t k=0;k<n;++k)
+            if(std::fabs(ratings[j]-ratings[k])<=maxVelocity)
+                next[j]=std::max(next[j],previous[k]+ll[t][j]);
+        previous.swap(next);
+    }
+    return *std::max_element(previous.begin(),previous.end());
+}
+static double compositeLogEvidence(double numerator,const std::vector<Vec>&ll,const Vec&ratings,double maxVelocity){
+    return numerator-maxLogPath(ll,ratings,maxVelocity);}
+static double compositeDecomposition(double lnNumerator,double unrestricted,double constrained){
+    return (lnNumerator-unrestricted)+(unrestricted-constrained);}
+// 33: one-game path-conditional log-likelihood. Missing clock data is not
+// silently estimated: use a move-only conditional law when timeObserved=false.
+static double pathConditionalLog(double pMove,double baselineLogTime,bool timeObserved){
+    return safeLog(pMove)+(timeObserved?baselineLogTime:0.0);
+}
+// 39: effective divergence to a finite reference family of rating profiles.
+static double minFamilyKL(const Vec&alternative,const std::vector<Vec>&ratingLaws){
+    if(ratingLaws.empty())return NAN;
+    double d=INFINITY;
+    for(const Vec&law:ratingLaws)d=std::min(d,kl(alternative,law));
+    return d;
+}
+// 36-38,71: binary KL and necessary sample sizes for alpha / power.
+static double binaryKL(double p,double q){
+    if(!(p>=0&&p<=1&&q>=0&&q<=1))throw std::invalid_argument("HEMath binaryKL: probabilities outside [0,1]");
+    if(q==0)return p==0?0:INFINITY;
+    if(q==1)return p==1?0:INFINITY;
+    p=clamp(p,0,1);q=clamp(q,tiny,1-tiny);
+    return (p>0?p*std::log(p/q):0)+(p<1?(1-p)*std::log((1-p)/(1-q)):0);
+}
+static double minimumSamples(double alpha,double beta,double kl10,double kl01){
+    if(!(alpha>0&&alpha<1&&beta>0&&beta<1))return INFINITY;
+    if(kl10<=0||kl01<=0)return INFINITY;
+    return std::max(binaryKL(1-beta,alpha)/kl10,binaryKL(alpha,1-beta)/kl01);
+}
+static double effectiveSampleLower(double alpha,double beta,double dEff,double lambda=1){
+    if(!(dEff>0&&lambda>0))return INFINITY;
+    return binaryKL(1-beta,std::pow(alpha,1/lambda))/dEff;
+}
+// 41-44,63: rating scores and scale sensitivity (analytic and finite-difference).
+static Vec scaleScore(const Law&l){
+    Vec r(l.p.size(),0);double mnum=0,mden=0;
+    for(size_t i=0;i<r.size();++i){mnum+=l.p[i]*l.w[i]*std::log(l.w[i]);mden+=l.p[i]*l.w[i];}
+    double avg=mden>0?mnum/mden:0;
+    double a=l.c/l.s*std::log(1/std::max(l.p0,tiny));
+    for(size_t i=0;i<r.size();++i)r[i]=a*(l.w[i]*std::log(l.w[i])-l.w[i]*avg);
+    return r;
+}
+static Vec ratingScore(const Law&l,double dsByRating){Vec r=scaleScore(l);for(double &v:r)v*=dsByRating;return r;}
+static Vec scoreTilt(const Vec&q,const Vec&p){Vec a(q.size());double m=mean(p,q);
+    for(size_t i=0;i<a.size();++i)a[i]=q[i]-m;return a;}
+// 45-50: Fisher matrix, orthogonal information, constrained rate corridor.
+struct Fisher {double rr=0,rt=0,tt=0;
+    double effective()const{return rr>tiny?std::max(0.0,tt-sq(rt)/rr):tt;}
+    double correlationSquared()const{return rr*tt>tiny?clamp(sq(rt)/(rr*tt),0,1):0;}
+};
+static Fisher fisher(const Vec&p,const Vec&sr,const Vec&st){
+    Fisher f;for(size_t i=0;i<p.size();++i){f.rr+=p[i]*sq(sr[i]);f.rt+=p[i]*sr[i]*st[i];f.tt+=p[i]*sq(st[i]);}return f;
+}
+static bool informationCollapse(const Fisher&f,double threshold=1e-6){return f.tt>tiny&&f.effective()<threshold*f.tt;}
+static Vec orthogonal(const Vec&h,const Vec&sr,const Vec&p){
+    double varR=0,cov=0;
+    for(size_t i=0;i<p.size();++i){varR+=p[i]*sq(sr[i]);cov+=p[i]*h[i]*sr[i];}
+    Vec out=h;double coef=varR>tiny?cov/varR:0;
+    for(size_t i=0;i<p.size();++i)out[i]-=coef*sr[i];return out;
+}
+static double effectivePerturbation(double epsilon,const Vec&p,const Vec&hPerp){
+    Vec square(hPerp.size());for(size_t i=0;i<hPerp.size();++i)square[i]=sq(hPerp[i]);
+    return .5*sq(epsilon)*dot(p,square);
+}
+static double constrainedInformation(double theta,const Fisher&f,double unconstrainedR,double maxR){
+    return .5*sq(theta)*f.effective()+.5*f.rr*sq(std::max(0.0,unconstrainedR-maxR));
+}
+static double informationWithTiming(const Fisher&f,double timingRatingInfo){
+    return f.tt-sq(f.rt)/std::max(tiny,f.rr+std::max(0.0,timingRatingInfo));}
+// 51-56: misspecification sensitivity and e-process calibration diagnostics.
+static double chiSquared(const Vec&p,const Vec&q){double v=0;
+    for(size_t i=0;i<p.size();++i)v+=sq(p[i]-q[i])/std::max(q[i],tiny);return v;}
+static double mismatchCovarianceBound(double chiAlt,double chiTrue){return std::sqrt(chiAlt*chiTrue);}
+static double expectedLogDrift(double klTrueModel,double klTrueAlt){return klTrueModel-klTrueAlt;}
+static double fractionalCrossing(double alpha,double lambda){return std::pow(alpha,lambda);}
+static double tiltedMoment(const Vec&p,const Vec&q,double theta0,double theta,double lambda){
+    return std::exp(logPartition(p,q,theta0+lambda*theta)
+        -logPartition(p,q,theta0)-lambda*logPartition(p,q,theta));
+}
+static double inflationExponent(double mismatch,double altKL){
+    return altKL>0?clamp(1-2*std::sqrt(std::max(0.0,mismatch)/altKL),0,1):0;}
+static double criticalMismatch(double altKL){return .25*altKL;}
+// 57-60: history-conditional projection and conditional-information decomposition.
+static Vec historyAverage(const std::vector<Vec>&laws,const Vec&freq){
+    if(laws.empty())return {};
+    if(laws.size()!=freq.size())throw std::invalid_argument("HEMath historyAverage: history/weight mismatch");
+    for(const Vec& law:laws)if(law.size()!=laws.front().size())
+        throw std::invalid_argument("HEMath historyAverage: law size mismatch");
+    Vec a(laws[0].size(),0);Vec freqN=normalize(freq);
+    for(size_t k=0;k<laws.size();++k)for(size_t i=0;i<a.size();++i)a[i]+=freqN[k]*laws[k][i];
+    return normalize(a);
+}
+static double conditionalMutualInformation(const std::vector<Vec>&laws,const Vec&freq){
+    Vec avg=historyAverage(laws,freq),f=normalize(freq);double mi=0;
+    for(size_t i=0;i<laws.size();++i)mi+=f[i]*kl(laws[i],avg);return mi;}
+static double historyConditionalRatioMean(const Vec&historyLaw,const Vec&alternative,const Vec&baseline){
+    if(historyLaw.size()!=alternative.size()||alternative.size()!=baseline.size())
+        throw std::invalid_argument("HEMath historyConditionalRatioMean: law size mismatch");
+    double out=0;
+    for(size_t i=0;i<historyLaw.size();++i)
+        out+=historyLaw[i]*alternative[i]/std::max(baseline[i],tiny);
+    return out;
+}
+// 60: history-conditional sequential product; ratios supplied per history
+// and state after conditioning, so the environment transition cancels.
+static double historySequentialLog(const Vec&historyLogRatios){return total(historyLogRatios);}
+// 61-64: two-regime information, sensitivity and inverse-Gaussian KL.
+static double clockRegimeKL(const Vec&p2,const Vec&p1,const Vec&timeKL){return jointKL(p2,p1,timeKL);}
+static double sensitivityFisher(const Law&l){Vec s=scaleScore(l);return variance(l.p,s);}
+// 43: derivatives with respect to rating, assuming ds/dR supplied by fit.
+static Vec exponentRatingDerivative(const Law&l,double dsByRating){
+    Vec out(l.w.size());
+    for(size_t i=0;i<out.size();++i)
+        out[i]=-l.c*dsByRating/l.s*l.w[i]*std::log(l.w[i]);
+    return out;
+}
+static Vec logProbabilityRatingDerivative(const Law&l,double dsByRating){
+    Vec out(l.p.size());
+    if(out.empty())return out;
+    const Vec dw=exponentRatingDerivative(l,dsByRating);
+    double denom=dot(l.p,l.w);
+    double dp0=-safeLog(l.p0)*dot(l.p,dw)/std::max(denom,tiny);
+    for(size_t i=0;i<out.size();++i)
+        out[i]=dw[i]*safeLog(l.p0)+l.w[i]*dp0;
+    return out;
+}
+// 51: E_true[L]=1+Cov_p0(L,p_true/p0), when L=q/p0.
+static double mismatchExpectation(const Vec&trueLaw,const Vec&alternative,const Vec&reference){
+    if(trueLaw.size()!=alternative.size()||reference.size()!=alternative.size())
+        throw std::invalid_argument("HEMath mismatchExpectation: law size mismatch");
+    double v=0;
+    for(size_t i=0;i<trueLaw.size();++i)
+        v+=trueLaw[i]*alternative[i]/std::max(reference[i],tiny);
+    return v;
+}
+// 58: E_H[KL(p_h || H0)] = I(A;H | x) + KL(p_bar || H0).
+static double historyInformationDecomposition(const std::vector<Vec>&laws,
+        const Vec&frequencies,const Vec&reference){
+    return conditionalMutualInformation(laws,frequencies)
+        +kl(historyAverage(laws,frequencies),reference);
+}
+// 62: exact regime KL and its second-order local sensitivity approximation.
+static std::pair<double,double> sensitivityRegimeDivergence(const Law&start,
+        const Law&end){
+    if(start.p.size()!=end.p.size())throw std::invalid_argument("HEMath sensitivityRegimeDivergence: size mismatch");
+    return {kl(end.p,start.p),.5*sq(end.s-start.s)*sensitivityFisher(start)};
+}
+static double inverseGaussianKL(double m2,double shape2,double m1,double shape1){
+    // Eq 64, IG(mean m2, shape2) || IG(mean m1, shape1).
+    if(m1<=0||m2<=0||shape1<=0||shape2<=0)return NAN;
+    return .5*(std::log(shape1/shape2)+shape2/shape1-1.0
+                +shape1*sq(m2-m1)/(sq(m1)*m2));
+}
+// 65-67: two-regime absorbed diffusion (eigen expansions + quadrature).
+// These are only evaluated if a caller supplies clock-change parameters.
+static double transitionStateDensity(double y,double t,const Diffusion&a,int terms=180){
+    if(!(t>0&&a.B>0&&std::fabs(y)<a.B))return 0;
+    double z=0;for(int n=1;n<=terms;++n){
+        double term=std::sin(n*pi/2)*std::sin(n*pi*(y+a.B)/(2*a.B))
+            *std::exp(-sq(n*pi*a.sigma)*t/(8*sq(a.B)));
+        z+=term;if(n>24&&std::fabs(term)<1e-14)break;
+    }
+    return std::max(0.0,std::exp(a.mu*y/sq(a.sigma)-sq(a.mu)*t/(2*sq(a.sigma)))*z/a.B);
+}
+static double postTransitionExit(double t,double y,const Diffusion&a,int terms=180){
+    if(!(t>0&&a.B>0&&std::fabs(y)<a.B))return 0;
+    double sum=0;
+    for(int n=1;n<=terms;++n){
+        double a1=-a.mu*(a.B+y)/sq(a.sigma),a2=a.mu*(a.B-y)/sq(a.sigma);
+        double term=n*std::sin(n*pi*(y+a.B)/(2*a.B))
+            *std::exp(-sq(n*pi*a.sigma)*t/(8*sq(a.B)))
+            *(std::exp(clamp(a1,-700,700))+((n&1)?1:-1)*std::exp(clamp(a2,-700,700)));
+        sum+=term;
+        if(n>24&&std::fabs(term)<1e-13)break;
+    }
+    return std::max(0.0,std::exp(-sq(a.mu)*t/(2*sq(a.sigma)))*pi*sq(a.sigma)*sum/(4*sq(a.B)));
+}
+static double integrateMidpoint(const std::function<double(double)>&f,double l,double r,int steps=240){
+    if(r<=l)return 0;double d=(r-l)/steps,sum=0;
+    for(int i=0;i<steps;++i)sum+=f(l+(i+.5)*d);return sum*d;
+}
+struct ChangedBoundary {double density=0,pointMass=0;};
+static ChangedBoundary changedBoundaryTime(double t,double changeTime,const Diffusion&before,const Diffusion&after){
+    if(!(before.B>=after.B&&after.B>0&&changeTime>0))return {};
+    if(t<changeTime)return {exitDensity(t,before),0};
+    auto g=[&](double y){return transitionStateDensity(y,changeTime,before);};
+    double atom=integrateMidpoint(g,-before.B,-after.B)+integrateMidpoint(g,after.B,before.B);
+    if(t==changeTime)return {0,atom};
+    double continuous=integrateMidpoint([&](double y){return g(y)*postTransitionExit(t-changeTime,y,after);},-after.B,after.B);
+    return {continuous,atom};
+}
+// 68-70: clock-conditioned complete conditional law and generalized statistic.
+static double clockConditionedJoint(double moveP,double logTime){return std::exp(jointLog(moveP,logTime));}
+static double generalizedThreshold(double alpha,double lambda){
+    if(!(alpha>0&&alpha<1&&lambda>0&&lambda<=1))return INFINITY;
+    return std::log(1/alpha)/lambda;
+}
+// 71-72: model class and second-order lower sample bound.
+static double secondOrderSampleBound(double alpha,double beta,double lambda,double theta,const Fisher&f,
+                                      double boundaryPenalty){
+    double d=.5*sq(theta)*f.effective()+boundaryPenalty;
+    if(!(lambda>0&&d>0))return INFINITY;
+    double H=-(beta>0?beta*std::log(beta):0)-((1-beta)>0?(1-beta)*std::log(1-beta):0);
+    return std::max(0.0,((1-beta)*std::log(1/alpha)/lambda-H)/d);
+}
+// Candidate-rating fit: use historical AEe target as a working experiment;
+// saturation occurs when a position's legal move losses cannot reach target.
+static Law fitLaw(const Vec&d,int elo,double consistency=.50){
+    double target=targetError(elo);
+    // Wide bracket: at high s the law approaches uniform choice. The
+    // target is capped only by the position's attainable uniform error.
+    double l=1.e-8,r=1.e10;
+    for(int j=0;j<64;++j){double mid=std::sqrt(l*r);
+        Law m=choice(d,mid,consistency);
+        if(expectedError(m.p,d)>target)r=mid;else l=mid;}
+    return choice(d,std::sqrt(l*r),consistency);
+}
+struct Observation {
+    double entropy=0,expectedLoss=0,actualLoss=0,expectedQuality=0,
+           qualityVariance=0,centered=0,reganIPR=0,
+           moveKL=0,thetaFisher=0,effFisher=0,
+           evidence=0,localEvidence=0,score=0,
+           predictedTimeSec=0,timeLogLikelihood=0;
+    bool hasTime=false,possibleModelCrossing=false;
+};
+struct Tracker {
+    long long moves=0;double sumExpectedLoss=0,sumLoss=0,sumCentered=0,sumVariance=0,
+          logEvidence=0,localEvidence=0,residualM=0,residualPrev=0,
+          residualCross=0,residualSquares=0,sumTimingLog=0;
+    long long timingSamples=0;
+    Observation latest;
+    void record(const Law&law,const Vec&alt,const Vec&quality,int chosen,
+                double observedTimeSec,double expectedTimeSec,double motor=.12){
+        if(chosen<0||size_t(chosen)>=law.p.size())return;
+        latest=Observation{};latest.entropy=entropy(law.p);
+        latest.expectedLoss=expectedError(law.p,law.d);latest.actualLoss=law.d[chosen];
+        latest.expectedQuality=mean(law.p,quality);latest.qualityVariance=variance(law.p,quality);
+        latest.centered=quality[chosen]-latest.expectedQuality;
+        latest.reganIPR=intrinsicRating(latest.expectedLoss);
+        latest.moveKL=kl(alt,law.p);latest.thetaFisher=latest.qualityVariance;
+        Vec st=scoreTilt(quality,law.p),sr=scaleScore(law);
+        latest.effFisher=fisher(law.p,sr,st).effective();
+        latest.predictedTimeSec=expectedTimeSec;
+        double step=safeLog(alt[chosen])-safeLog(law.p[chosen]);
+        logEvidence=appendLogEvidence(logEvidence,step);
+        latest.evidence=logEvidence;
+        latest.localEvidence=localLogLR(.35,latest.centered,latest.qualityVariance);
+        localEvidence+=latest.localEvidence;
+        ++moves;sumExpectedLoss+=latest.expectedLoss;sumLoss+=latest.actualLoss;
+        sumCentered+=latest.centered;sumVariance+=latest.qualityVariance;
+        latest.score=standardizedScore(sumCentered,sumVariance);
+        // No spurious mean reversion imposed: measured residual autocorrelation.
+        if(moves>1)residualCross+=residualPrev*latest.centered;
+        residualPrev=latest.centered;residualSquares+=sq(latest.centered);
+        residualM+=latest.centered;
+        if(observedTimeSec>motor){
+            double m=std::log(std::max(expectedTimeSec-motor,.01))-.5*sq(.55);
+            latest.timeLogLikelihood=logNormalLogDensity(observedTimeSec,motor,m,.55);
+            latest.hasTime=true;++timingSamples;sumTimingLog+=latest.timeLogLikelihood;
+        }
+        // Only meaningful with externally calibrated H0; never label bot as human.
+        latest.possibleModelCrossing=crossed(logEvidence,0.01);
+    }
+    double observedIPR()const{return moves?intrinsicRating(sumLoss/moves):NAN;}
+    double expectedIPR()const{return moves?intrinsicRating(sumExpectedLoss/moves):NAN;}
+    double lagOne()const{return moves>1&&residualSquares>tiny?residualCross/residualSquares:0;}
+};
+} // namespace HEMath
+
+struct HEClockTiming {
+    bool active=false;
+    double motor=.12,spread=.55,baseMean=0,altMean=0;
+};
+static HEClockTiming HEPendingTime;
+static HEMath::Tracker HEStats;
+static void HEStatsReset(void){HEStats=HEMath::Tracker{};HEPendingTime=HEClockTiming{};}
+
+// ===========================================================================
+// MARK: - Move choice
+// ===========================================================================
+
+
+static HELine HEL[HE_MAX_PV];
+static char     HEChosen[8];
+
+
+static int HEClassOf(double lossW) {
+    for (int c = HE_NCLASS - 1; c > 0; c--) if (lossW >= HEClassLo[c]) return c;
+    return HE_TOP;
+}
+
+
+static const char *HECommit(int i, double lossW) {
+    HELastOwnTo       = HEParseMove(HEL[i].move).to;
+    HES.lastCp        = HEL[i].cp;
+    HES.haveLastCp = 1;
+    HES.ownMoves++;
+    HES.count[HEClassOf(lossW)]++;
+    memcpy(HEChosen, HEL[i].move, sizeof(HEChosen));
+    return HEChosen;
+}
+
+
+// Returns the move to play, or NULL when outside the human band.
+// Positions must be searched to completion using MultiPV; this ONLY selects
+// among returned Stockfish root moves. Unreported legal moves are out of scope.
+static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
+    if (!HEHumanBand(elo) || HELineCount<1) return NULL;
+    HEHP=HEParamsFor(elo);
+    if(!HES.init)HECoreNewGame((ply%2)==0,elo);
+
+    int high=0;
+    for(int i=0;i<HELineCount;++i)if(HELines[i].valid)high=std::max(high,HELines[i].depth);
+    int chosenDepth=-1;
+    for(int depth=high;depth>=1;--depth){
+        int count=0;
+        for(int i=0;i<HELineCount;++i)if(HELines[i].valid&&HELines[i].depth==depth)++count;
+        if(count>=2){chosenDepth=depth;break;}
+    }
+    // Stockfish may return a single legal/root line. Never combine
+    // unreliable different-depth evaluations into the probability law.
+    int n=0;
+    if(chosenDepth>=0){
+        for(int i=0;i<HELineCount;++i)
+            if(HELines[i].valid&&HELines[i].depth==chosenDepth)HEL[n++]=HELines[i];
+    } else {
+        int bestI=-1;
+        for(int i=0;i<HELineCount;++i)if(HELines[i].valid&&
+           (bestI<0||HELines[i].depth>HELines[bestI].depth))bestI=i;
+        if(bestI>=0)HEL[n++]=HELines[bestI];
+    }
+    if(n==0)return NULL;
+    std::sort(HEL,HEL+n,[](const HELine&a,const HELine&b){return a.cp>b.cp;});
+
+    HEBoard board{};
+    bool haveBoard=HEParseFEN(fen,&board)!=0;
+    int side=haveBoard?board.whiteToMove:HES.isWhite;
+    HEMath::Vec values(n), quality(n), proposedMix(HE_NCLASS), winLoss(n);
+    std::vector<HEFeatures> features(n);
+    double bestWin=HEWinPct(HEL[0].cp);
+    int jump=HES.haveLastCp?HEL[0].cp-HES.lastCp:0;
+    bool mateNow=HEL[0].mateIn>0&&HEL[0].mateIn<=3;
+    bool opportunity=mateNow || (HES.haveLastCp&&jump>=250&&HEL[0].cp>=200
+                 &&HES.lastCp<HEHP.convThresh);
+
+    for(int i=0;i<n;++i){
+        values[i]=std::max(-2000.0,std::min(2000.0,(double)HEL[i].cp))/100.0;
+        quality[i]=HEWinPct(HEL[i].cp)/100.0;
+        winLoss[i]=std::max(0.0,bestWin-HEWinPct(HEL[i].cp));
+        if(haveBoard)features[i]=HEExtract(&board,HEParseMove(HEL[i].move));
+        else memset(&features[i],0,sizeof(HEFeatures));
+    }
+    // Eq 01-04, 10-11, 73-75: position-specific root equation and fit to the
+    // reference's extrapolated rating/expected-loss scale (not a measured Elo).
+    HEMath::Vec delta=HEMath::losses(values);
+    HEMath::Law law=HEMath::fitLaw(delta,elo,.50);
+    // Eq 61-63, 68-69: a CLOCK-CONDITIONED regime changes sensitivity.
+    // This is a provisional policy parameter, not fitted human time data.
+    // The no-clock path reproduces the original position-specific law.
+    if(HEClockSeconds>0){
+        const double clockScale=HEMath::clamp(
+            1.0+0.10*std::log(61.0/(HEClockSeconds+1.0)),0.82,1.55);
+        law=HEMath::choice(delta,law.s*clockScale,law.c);
+    }
+
+    // Model the alternative's intent to win through a positive exponential
+    // tilt (Eq 17-20) without choosing the best move deterministically.
+    double theta=.60+0.75*HEHP.t;
+    HEMath::Vec winning=HEMath::tilt(law.p,quality,theta);
+    double cx=haveBoard?HEComplexity(&board,side):1.0;
+    double sharp=std::min(1.5,std::max(.70,.60+.40*cx));
+    for(int c=0;c<HE_NCLASS;++c)proposedMix[c]=HEHP.mix[c];
+    proposedMix[HE_MISTAKE]*=sharp;proposedMix[HE_BLUNDER]*=sharp;
+    if(ply<8){proposedMix[HE_MISTAKE]*=.50;proposedMix[HE_BLUNDER]*=.35;}
+    if(HES.haveLastCp&&HES.lastCp>=HEHP.convThresh&&HEL[0].cp>=HEHP.convThresh){
+        proposedMix[HE_MISTAKE]*=.75;proposedMix[HE_BLUNDER]*=.50;
+    }
+    proposedMix=HEMath::normalize(proposedMix);
+
+    // Actual available quality classes are constrained by Stockfish's finite
+    // MultiPV list; unrepresented classes are not fabricated.
+    HEMath::Vec classMass(HE_NCLASS,0),candidate(n,0);
+    for(int i=0;i<n;++i)classMass[HEClassOf(winLoss[i])]+=winning[i];
+    for(int i=0;i<n;++i){
+        int c=HEClassOf(winLoss[i]);
+        double factor=proposedMix[c]/std::max(classMass[c],HEMath::tiny);
+        candidate[i]=winning[i]*factor*HEHumanBias(&features[i],ply);
+        // Low-rating visual mistakes remain possible, but a bot trying to win
+        // does not deliberately choose a forced losing mate on every cycle.
+        if(HEL[i].mateIn<0&&HEL[0].mateIn>=0)candidate[i]*=.10+.15*(1.0-HEHP.t);
+        if(c>=HE_MISTAKE&&features[i].visibleMistake)candidate[i]*=HEHP.visW;
+    }
+
+    if(opportunity&&n>1){
+        double spot=(HEL[0].mateIn==1)?HEHP.spotMate1:
+             ((!mateNow&&features[0].isCapture&&features[0].capturedValue>=300)
+               ?HEHP.spotObvious:HEHP.spotTactic);
+        // Reflect intermittent tactical recognition, without a fixed periodic
+        // blunder or a deterministic rule that always sees short mates.
+        spot=HEMath::clamp(spot+.10*HES.missStreak,.02,.995);
+        bool saw=HEFrand()<spot;
+        if(saw){for(int i=0;i<n;++i)if(winLoss[i]>5)candidate[i]*=.20;
+            HES.missStreak=0;
+        }else{
+            for(int i=0;i<n;++i)if(winLoss[i]<2.0)candidate[i]*=.12;
+        }
+    }
+
+    HEMath::Vec selectedLaw=HEMath::normalize(candidate);
+    int k=HEPick(selectedLaw.data(),n);
+    if(k<0)k=0;
+    if(opportunity&&k!=0){HES.misses++;HES.missStreak++;}
+    else if(opportunity)HES.missStreak=0;
+
+    // 05-08, 17-63: observe the actually selected quality and update the
+    // diagnostics under the reference and the actual human-biased policy.
+    double suggested=0;
+    HEPendingTime=HEClockTiming{};
+    if(HEClockSeconds>0){
+        double logM=HEMath::timeLogMean(-.9,.30,.10,HEMath::entropy(selectedLaw),HEClockSeconds);
+        HEPendingTime.active=true;
+        HEPendingTime.baseMean=HEMath::timeLogMean(-.9,.30,.10,HEMath::entropy(law.p),HEClockSeconds);
+        HEPendingTime.altMean=logM;
+        suggested=.12+std::exp(logM+.5*.55*.55);
+        // Eq 13-16: diffusion mean used as a secondary timing descriptor.
+        double gap=0;
+        if(delta.size()>1)gap=*std::min_element(delta.begin()+1,delta.end());
+        HEMath::Diffusion d=HEMath::diffusion(HEMath::entropy(selectedLaw),HEClockSeconds,
+                                      gap,law.s,.8,.24,.04,.12,.35);
+        double diffusionSec=HEMath::expectedExit(d);
+        if(std::isfinite(diffusionSec)&&diffusionSec>0)suggested=.5*suggested+.5*diffusionSec;
+        suggested=HEMath::clamp(suggested,.15,std::max(.15,HEClockSeconds*.15));
+    }
+    HEStats.record(law,selectedLaw,quality,k,-1,suggested);
+    return HECommit(k,winLoss[k]);
+}
+
+// Optional caller-supplied clock, not a fabricated game clock. User controls
+// clock/observed timings from the bot match controller.
+void HEClockRemainingSeconds(double seconds){
+    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    HEClockSeconds=(std::isfinite(seconds)&&seconds>0)?seconds:-1;
+}
+void HERecordDecisionTimeSeconds(double seconds){
+    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    if(HEPendingTime.active&&std::isfinite(seconds)&&seconds>HEPendingTime.motor){
+        double l0=HEMath::logNormalLogDensity(seconds,HEPendingTime.motor,
+                                    HEPendingTime.baseMean,HEPendingTime.spread);
+        double l1=HEMath::logNormalLogDensity(seconds,HEPendingTime.motor,
+                                    HEPendingTime.altMean,HEPendingTime.spread);
+        // Eq 23-28: joint move+time log evidence and conditional KL.
+        HEStats.logEvidence+=l1-l0;
+        HEStats.latest.evidence=HEStats.logEvidence;
+        HEStats.latest.hasTime=true;
+        HEStats.latest.timeLogLikelihood=l0;
+        HEStats.sumTimingLog+=l0;++HEStats.timingSamples;
+        HEPendingTime.active=false; // a timing observation is applied once
+    }
+}
+// One sample of time to optionally delay applying the chosen move in a bot
+// controller. Search time is separate from move presentation/think time.
+int HESuggestThinkTimeMilliseconds(){
+    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    if(!HEPendingTime.active)return 0;
+    double u=std::max(1.0e-12,HEFrand());
+    double z=std::sqrt(-2.0*std::log(u))*std::cos(2*HEMath::pi*HEFrand());
+    double seconds=HEPendingTime.motor+
+        std::exp(HEPendingTime.altMean+HEPendingTime.spread*z);
+    seconds=HEMath::clamp(seconds,.12,std::max(.12,HEClockSeconds*.15));
+    return static_cast<int>(std::lround(seconds*1000));
+}
+// Inspect actual source-derived statistics. These have no human-calibration
+// meaning until fitted to a defined human rating pool and time control.
+struct HEFormulaReport {
+    double expectedIPR,observedIPR,expectedLoss,observedLoss,scoreZ,lagOne;
+    double moveLogEvidence,localLogEvidence,moveKLDivergence,effectiveInformation;
+    double entropy,predictedThinkSeconds,timingLogLikelihood;
+    double timingKLDivergence,expectedWinProbability,modelSampleLowerBound;
+    long long moves,timingSamples;
+};
+HEFormulaReport HEGetFormulaReport(){
+    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    HEFormulaReport r{};
+    r.expectedIPR=HEStats.expectedIPR();r.observedIPR=HEStats.observedIPR();
+    r.moves=HEStats.moves;r.timingSamples=HEStats.timingSamples;
+    if(r.moves){r.expectedLoss=HEStats.sumExpectedLoss/r.moves;
+                r.observedLoss=HEStats.sumLoss/r.moves;}
+    r.scoreZ=HEMath::standardizedScore(HEStats.sumCentered,HEStats.sumVariance);
+    r.lagOne=HEStats.lagOne();r.moveLogEvidence=HEStats.logEvidence;
+    r.localLogEvidence=HEStats.localEvidence;
+    r.moveKLDivergence=HEStats.latest.moveKL;
+    r.effectiveInformation=HEStats.latest.effFisher;
+    r.entropy=HEStats.latest.entropy;
+    r.predictedThinkSeconds=HEStats.latest.predictedTimeSec;
+    r.timingLogLikelihood=HEStats.sumTimingLog;
+    r.timingKLDivergence=HEPendingTime.active?
+        HEMath::logNormalKL(HEPendingTime.altMean,HEPendingTime.baseMean,
+                             HEPendingTime.spread):0.0;
+    r.expectedWinProbability=HEStats.latest.expectedQuality;
+    r.modelSampleLowerBound=HEStats.latest.moveKL>HEMath::tiny?
+        HEMath::effectiveSampleLower(.01,.10,HEStats.latest.moveKL):INFINITY;
+    return r;
+}
+
+// ===========================================================================
+// MARK: - Objective-C API
+// ===========================================================================
+
+
+#ifdef __OBJC__
+
+
+void HENewGame(BOOL playingWhite, int elo) {
+    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    HECoreNewGame(playingWhite ? 1 : 0, elo);
+}
+
+
+NSArray<NSString *> *HEConfigureCommands(int elo) {
+    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    char cmds[8][HE_CMD_LEN];
+    int n = HECoreConfigure(elo, cmds, 8);
+    NSMutableArray<NSString *> *out = [NSMutableArray arrayWithCapacity:n];
+    for (int i = 0; i < n; i++) [out addObject:[NSString stringWithUTF8String:cmds[i]]];
+    return out;
+}
+
+
+NSString *HEChooseMove(const char *fen, int ply, int elo) {
+    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    try {
+        const char *m = HECoreChooseMove(fen, ply, elo);
+        return m ? [NSString stringWithUTF8String:m] : nil;
+    } catch (const std::exception &error) {
+        NSLog(@"[ChessAssistantPro] Human move equation failed: %s", error.what());
+        return nil; // Use Stockfish's own bestmove rather than terminate the app.
+    } catch (...) {
+        NSLog(@"[ChessAssistantPro] Human move equation failed: unknown C++ error");
+        return nil;
+    }
+}
+
+
+NSDictionary *HEDescribeElo(int elo) {
+    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    if (!HEHumanBand(elo)) {
+        return @{ @"mode"     : (elo < 3190 ? @"Stockfish UCI ELO limit"
+                                              : @"Full strength · no fixed ELO"),
+                     @"skill" : @20 };
+    }
+    HEParams p = HEParamsFor(elo);
+    return @{
+        @"mode"          : [NSString stringWithFormat:
+                            @"Human sim · depth %d · MultiPV %d · blunder %.0f%%/move",
+                            p.depth, p.multipv, p.mix[HE_BLUNDER] * 100.0],
+        @"depth"         : @(p.depth),
+        @"multipv"       : @(p.multipv),
+        @"moves"         : @(HES.ownMoves),
+         @"best"       : @(HES.count[HE_TOP]),
+         @"good"       : @(HES.count[HE_GOOD]),
+         @"inaccuracy" : @(HES.count[HE_INACC]),
+         @"mistake"    : @(HES.count[HE_MISTAKE]),
+         @"blunder"    : @(HES.count[HE_BLUNDER]),
+         @"miss"       : @(HES.misses),
+         @"expectedIPR": @(HEStats.expectedIPR()),
+         @"observedIPR": @(HEStats.observedIPR()),
+         @"moveEvidence": @(HEStats.logEvidence),
+         @"moveScoreZ" : @(HEMath::standardizedScore(HEStats.sumCentered,HEStats.sumVariance)),
+         @"predictedThinkSeconds": @(HEStats.latest.predictedTimeSec)
+    };
+}
+
+
+#endif
+
+// Preserve the existing FEN-transition observer for opponent recapture bias.
 // Accept a transition only when exactly one move reproduces the next board.
 // This also handles castling, en passant and promotions without guessing from
 // a changed-square count.
@@ -1814,504 +3028,14 @@ NSString *HEInferOpponentMove(const char *priorFen, const char *selectedMove,
     return HEInferMoveBetweenBoards(&afterOurs, &current);
 }
 
-// ===========================================================================
-// MARK: - Move features
-// ===========================================================================
 
-typedef struct {
-    int isCapture, isRecapture, capturesHigher, givesCheck, attacksQueen;
-    int isBackward, isQuiet, isSamePieceAgain, isPawnPush, hangsPiece;
-    int isDeveloping, isCastle, isEarlyQueenSortie, isRookPawn, isPromotion;
-    int visibleMistake;
-} HEFeatures;
-
-static int HELastOwnTo   = -1;   // destination of our previous move
-static int HEOppLastTo   = -1;   // destination of the opponent's last move
-
-static HEFeatures HEExtract(const HEBoard *b, HEMove m) {
-    HEFeatures f;
-    memset(&f, 0, sizeof(f));
-    if (m.from < 0 || m.to < 0) return f;
-
-    char piece = b->sq[m.from];
-    char lower = (char)tolower((unsigned char)piece);
-    int  white = HEIsWhitePiece(piece);
-    char target = b->sq[m.to];
-
-    f.isCapture      = (target != '.') ||
-                       (lower == 'p' && m.to == b->epSquare);
-    f.isRecapture    = f.isCapture && (m.to == HEOppLastTo);
-    f.capturesHigher = f.isCapture && target != '.' &&
-                       HEPieceValue(target) > HEPieceValue(piece);
-    f.isPromotion    = (m.promo != 0);
-    f.isPawnPush     = (lower == 'p') && !f.isCapture;
-    f.isRookPawn     = (lower == 'p') && (HEFile(m.from) == 0 || HEFile(m.from) == 7);
-    f.isCastle       = (lower == 'k') && abs(HEFile(m.to) - HEFile(m.from)) == 2;
-    f.isSamePieceAgain = (m.from == HELastOwnTo);
-
-    int dr = HERank(m.to) - HERank(m.from);
-    f.isBackward = white ? (dr < 0) : (dr > 0);
-
-    int homeRank = white ? 0 : 7;
-    f.isDeveloping = (lower == 'n' || lower == 'b') && (HERank(m.from) == homeRank);
-    f.isEarlyQueenSortie = (lower == 'q') && (HERank(m.from) == homeRank);
-
-    HEBoard after = HEApply(b, m);
-
-    int oppKing = HEFindKing(&after, !white);
-    f.givesCheck = (oppKing >= 0) && HEAttackedBy(&after, oppKing, white);
-
-    char oq = white ? 'q' : 'Q';
-    for (int i = 0; i < 64; i++) {
-        if (after.sq[i] != oq) continue;
-        if (HEAttackedBy(&after, i, white)) f.attacksQueen = 1;
-        break;
-    }
-
-    f.isQuiet = !f.isCapture && !f.givesCheck && !f.isPromotion && !f.attacksQueen;
-
-    // SEE-lite on the destination square
-    int movedValue  = HEPieceValue(after.sq[m.to]);
-    int attackedBy  = HEAttackedBy(&after, m.to, !white);
-    int defended    = HEAttackedBy(&after, m.to, white);
-    int cheapest    = attackedBy ? HECheapestAttacker(&after, m.to, !white) : HE_MATE_CP;
-    int captured    = (target != '.') ? HEPieceValue(target) : 0;
-
-    if (attackedBy && (cheapest < movedValue || !defended)) {
-        int net = captured - movedValue;
-        if (net < -80) f.hangsPiece = 1;
-    }
-
-    // A mistake is "visible" to a weak player when the refutation is one move
-    // deep: the piece just moved can be taken for profit, or a piece was left
-    // hanging that is now attacked by something cheaper.
-    f.visibleMistake = f.hangsPiece;
-    if (!f.visibleMistake) {
-        char own = white ? 'A' : 'a';
-        (void)own;
-        for (int i = 0; i < 64; i++) {
-            char c = after.sq[i];
-            if (c == '.' || HEIsWhitePiece(c) != white) continue;
-            if (tolower((unsigned char)c) == 'p' || tolower((unsigned char)c) == 'k') continue;
-            if (i == m.to) continue;
-            if (!HEAttackedBy(&after, i, !white)) continue;
-            int ca = HECheapestAttacker(&after, i, !white);
-            if (ca < HEPieceValue(c) && !HEAttackedBy(&after, i, white)) {
-                f.visibleMistake = 1;
-                break;
-            }
-        }
-    }
-
-    return f;
-}
-
-// ---------------------------------------------------------------------------
-// Position descriptors
-// ---------------------------------------------------------------------------
-
-typedef enum { HEOpening = 0, HEMiddlegame = 1, HEEndgame = 2 } HEPhase;
-
-static int HEPieceCount(const HEBoard *b) {
-    int n = 0;
-    for (int i = 0; i < 64; i++) if (b->sq[i] != '.') n++;
-    return n;
-}
-
-static int HENonPawnMaterial(const HEBoard *b) {
-    int v = 0;
-    for (int i = 0; i < 64; i++) {
-        char c = b->sq[i];
-        if (c == '.') continue;
-        char l = (char)tolower((unsigned char)c);
-        if (l == 'p' || l == 'k') continue;
-        v += HEPieceValue(c);
-    }
-    return v;
-}
-
-static HEPhase HEPhaseOf(const HEBoard *b, int ply) {
-    int npm = HENonPawnMaterial(b);
-    if (npm <= 2200) return HEEndgame;
-    if (ply < 16 && npm >= 5600) return HEOpening;
-    return HEMiddlegame;
-}
-
-// How tangled the position is — drives when blunders happen.
-static double HEComplexity(const HEBoard *b, int white) {
-    int hits = 0, nearKing = 0;
-    for (int i = 0; i < 64; i++) {
-        char c = b->sq[i];
-        if (c == '.' || HEIsWhitePiece(c) == white) continue;
-        if (HEAttackedBy(b, i, white)) hits++;
-    }
-    int ok = HEFindKing(b, !white);
-    if (ok >= 0) {
-        int f = HEFile(ok), r = HERank(ok);
-        for (int i = 0; i < 8; i++) {
-            int nf = f + HEKingD[i][0], nr = r + HEKingD[i][1];
-            if (!HEOnBoard(nf, nr)) continue;
-            if (HEAttackedBy(b, HESq(nf, nr), white)) nearKing++;
-        }
-    }
-    return hits / 6.0 + nearKing / 4.0;
-}
-
-// ===========================================================================
-// MARK: - Per-game persona
-// ===========================================================================
-
-typedef struct {
-    double greed, aggro, fear;
-    double blunderBudget, mistakeBudget;
-    int    bookChoice;
-    int    isWhite;
-    int    init;
-} HEPersona;
-
-static HEPersona HEP;
-static HEParams  HEHP;
-
-void HENewGame(BOOL playingWhite, int elo) {
-    HEHP = HEParamsFor(elo);
-
-    HEP.isWhite = playingWhite ? 1 : 0;
-    HEP.greed   = HEHP.greedBase + HEFrand() * 0.50;
-    HEP.aggro   = HEHP.aggroBase + HEFrand() * 0.45;
-    HEP.fear    = HEHP.fearBase  + HEFrand() * 0.30;
-
-    HEP.blunderBudget = HEHP.blunderBudget + (HEFrand() - 0.5);
-    HEP.mistakeBudget = HEHP.mistakeBudget + (HEFrand() * 2.0 - 1.0);
-
-    HEP.bookChoice = (int)arc4random_uniform(1000);
-
-    // white plays for the initiative, black reacts
-    if (playingWhite) HEP.aggro *= 1.25; else HEP.fear *= 1.18;
-
-    HELastOwnTo = -1;
-    HEOppLastTo = -1;
-    HEP.init    = 1;
-}
-
-// Call when the opponent moves, so recapture / same-piece logic works.
-void HENoteOpponentMove(const char *uci) {
-    HEMove m = HEParseMove(uci);
-    HEOppLastTo = m.to;
-}
-
-// ===========================================================================
-// MARK: - UCI plumbing
-// ===========================================================================
-
-typedef struct {
-    int  cp;        // score from the engine's point of view, centipawns
-    int  mateIn;    // 0 = none, >0 = we mate in N, <0 = we get mated in N
-    int  valid;
-    char move[8];
-} HELine;
-
-static HELine HELines[HE_MAX_PV];
-static int    HELineCount = 0;
-static int    HELineDepth = 0;
-static HELine HEPreviousLines[HE_MAX_PV];
-static int    HEPreviousLineCount = 0;
-
-void HEResetLines(void) {
-    memset(HELines, 0, sizeof(HELines));
-    HELineCount = 0;
-    HELineDepth = 0;
-    memset(HEPreviousLines, 0, sizeof(HEPreviousLines));
-    HEPreviousLineCount = 0;
-}
-
-// The search command is returned last. The caller sends the setoption commands
-// before isready/position and sends go only after position fen.
-NSArray<NSString *> *HEConfigureCommands(int elo) {
-    NSMutableArray<NSString *> *commands = [NSMutableArray array];
-    if (!HEHumanBand(elo)) {
-        [commands addObject:@"setoption name MultiPV value 1"];
-        [commands addObject:@"setoption name Skill Level value 20"];
-        if (elo < 3190) {
-            [commands addObject:@"setoption name UCI_LimitStrength value true"];
-            [commands addObject:[NSString stringWithFormat:@"setoption name UCI_Elo value %d", elo]];
-        } else {
-            [commands addObject:@"setoption name UCI_LimitStrength value false"];
-        }
-        [commands addObject:@"go movetime 200"];
-        return commands;
-    }
-    if (!HEP.init) HENewGame(YES, elo);
-    HEHP = HEParamsFor(elo);
-    [commands addObject:@"setoption name UCI_LimitStrength value false"];
-    [commands addObject:@"setoption name Threads value 1"];
-    // Keep every MultiPV score comparable. Weakening happens in HEChooseMove.
-    [commands addObject:@"setoption name Skill Level value 20"];
-    [commands addObject:[NSString stringWithFormat:@"setoption name MultiPV value %d", HEHP.multipv]];
-    [commands addObject:[NSString stringWithFormat:@"go depth %d movetime %d",
-                         HEHP.depth + (int)arc4random_uniform(3),
-                         110 + (int)arc4random_uniform(140)]];
-    return commands;
-}
-
-// Parses one "info ... multipv K ... score cp X ... pv MOVE ..." line.
-void HEParseInfo(const char *line) {
-    if (!line) return;
-    if (!strstr(line, " multipv ") || !strstr(line, " pv ")) return;
-    // Bounds from an unfinished aspiration search are not comparable scores.
-    if (strstr(line, " lowerbound") || strstr(line, " upperbound")) return;
-
-    const char *depthField = strstr(line, " depth ");
-    if (!depthField) return;
-    int depth = atoi(depthField + 7);
-    if (depth <= 0 || depth < HELineDepth) return;
-    if (depth > HELineDepth) {
-        if (HELineCount >= 2 && HELines[0].valid) {
-            memcpy(HEPreviousLines, HELines, sizeof(HELines));
-            HEPreviousLineCount = HELineCount;
-        }
-        memset(HELines, 0, sizeof(HELines));
-        HELineCount = 0;
-        HELineDepth = depth;
-    }
-
-    int idx = 0, cp = 0, mate = 0, haveScore = 0;
-    char mv[8] = {0};
-
-    const char *p = strstr(line, " multipv ");
-    if (p) idx = atoi(p + 9);
-    if (idx < 1 || idx > HE_MAX_PV) return;
-
-    p = strstr(line, " score cp ");
-    if (p) { cp = atoi(p + 10); haveScore = 1; }
-
-    p = strstr(line, " score mate ");
-    if (p) {
-        mate = atoi(p + 12);
-        cp = (mate > 0) ? (HE_MATE_CP - mate) : (-HE_MATE_CP - mate);
-        haveScore = 1;
-    }
-    if (!haveScore) return;
-
-    p = strstr(line, " pv ");
-    if (!p) return;
-    p += 4;
-    int n = 0;
-    while (*p && *p != ' ' && n < 7) mv[n++] = *p++;
-    mv[n] = 0;
-    if ((n != 4 && n != 5) || HEParseSquare(mv) < 0 ||
-        HEParseSquare(mv + 2) < 0 ||
-        (n == 5 && !strchr("qrbn", mv[4]))) return;
-
-    HELine *l = &HELines[idx - 1];
-    l->cp     = cp;
-    l->mateIn = mate;
-    l->valid  = 1;
-    strncpy(l->move, mv, sizeof(l->move) - 1);
-    l->move[sizeof(l->move) - 1] = 0;
-
-    if (idx > HELineCount) HELineCount = idx;
-}
-
-// ===========================================================================
-// MARK: - Human bias
-// ===========================================================================
-
-static double HEHumanBias(const HEFeatures *f, int ply) {
-    double t = HEHP.t, inv = 1.0 - t, w = 1.0;
-
-    if (f->isCapture)        w *= HEP.greed;
-    if (f->isRecapture)      w *= 1.0 + 0.90 * inv;
-    if (f->capturesHigher)   w *= 1.0 + 0.60 * inv;
-    if (f->givesCheck)       w *= HEP.aggro;
-    if (f->attacksQueen)     w *= 1.0 + 0.30 * inv;
-    if (f->isPromotion)      w *= 1.6;
-
-    if (f->isBackward)       w *= HEP.fear;
-    if (f->isQuiet)          w *= HEHP.quietW;
-    if (f->isSamePieceAgain) w *= 1.0 + 0.35 * inv;
-    if (f->isPawnPush)       w *= 1.0 + 0.20 * inv;
-    if (f->hangsPiece)       w *= 0.25 + 0.60 * t;
-
-    if (ply < 16) {
-        if (f->isDeveloping)       w *= 1.15 + 0.35 * t;
-        if (f->isCastle)           w *= 0.65 + 0.45 * t;
-        if (f->isEarlyQueenSortie) w *= 1.0 + 0.55 * inv;
-        if (f->isRookPawn)         w *= 0.45 + 0.45 * t;
-    }
-
-    if (w < 0.01) w = 0.01;
-    return w;
-}
-
-// ===========================================================================
-// MARK: - Move choice
-// ===========================================================================
-
-// Returns the move to play, or nil when the ELO is outside the human band
-// (caller should then use the engine's own bestmove).
-static NSString *HECommitMove(const HELine *lines, int index) {
-    HEMove m = HEParseMove(lines[index].move);
-    HELastOwnTo = m.to;
-    return [NSString stringWithUTF8String:lines[index].move];
-}
-
-NSString *HEChooseMove(const char *fen, int ply, int elo) {
-    if (!HEHumanBand(elo)) return nil;
-    const HELine *source = HELines;
-    int sourceCount = HELineCount;
-    if (sourceCount < 2 && HEPreviousLineCount >= 2) {
-        source = HEPreviousLines;
-        sourceCount = HEPreviousLineCount;
-    }
-    if (sourceCount < 1 || !source[0].valid) return nil;
-
-    HEHP = HEParamsFor(elo);
-    if (!HEP.init) HENewGame(ply % 2 == 0, elo);
-
-    // compact the valid lines
-    HELine L[HE_MAX_PV];
-    int n = 0;
-    for (int i = 0; i < sourceCount && i < HE_MAX_PV; i++)
-        if (source[i].valid) L[n++] = source[i];
-    if (n == 0) return nil;
-
-    // A timed search can leave the MultiPV slots out of score order.
-    for (int i = 1; i < n; i++) {
-        HELine key = L[i];
-        int j = i - 1;
-        while (j >= 0 && L[j].cp < key.cp) { L[j + 1] = L[j]; j--; }
-        L[j + 1] = key;
-    }
-
-    HEBoard b;
-    int haveBoard = HEParseFEN(fen, &b) ? 1 : 0;
-    int white     = haveBoard ? b.whiteToMove : HEP.isWhite;
-    int best      = L[0].cp;
-
-    // -------------------------------------------------------------------
-    // 1. Play to win — never err where the game is decided
-    // -------------------------------------------------------------------
-    if (best > HEHP.convThresh)                           return HECommitMove(L, 0);
-    if (L[0].mateIn > 0 && L[0].mateIn <= 3 + (int)(3 * HEHP.t)) return HECommitMove(L, 0);
-    if (best < -500)                                      return HECommitMove(L, 0);
-
-    HEPhase ph = haveBoard ? HEPhaseOf(&b, ply) : HEMiddlegame;
-    if (haveBoard && ph == HEEndgame &&
-        HEPieceCount(&b) <= 7 + (int)(3 * HEHP.t))        return HECommitMove(L, 0);
-
-    // -------------------------------------------------------------------
-    // 2. Opening variety — a different game every time, still Stockfish moves
-    // -------------------------------------------------------------------
-    if (ply <= 10 && n >= 3) {
-        int pool = (ply < 4) ? 6 - (int)(2 * HEHP.t) : 4 - (int)HEHP.t;
-        if (pool > n) pool = n;
-        if (pool < 2) pool = 2;
-        int pick = (HEP.bookChoice + ply * 7 + (int)arc4random_uniform((uint32_t)pool)) % pool;
-        if (best - L[pick].cp <= 120) return HECommitMove(L, pick);
-    }
-
-    // -------------------------------------------------------------------
-    // 3. Spend the blunder budget, concentrated in complex middlegames
-    // -------------------------------------------------------------------
-    double complexity = haveBoard ? HEComplexity(&b, white) : 0.6;
-    double rate = 0.0;
-    if (HEP.blunderBudget > 0.0 && ph == HEMiddlegame) {
-        rate = (0.045 + 0.025 * (1.0 - HEHP.t)) * fmin(2.0, 0.6 + complexity);
-        if (ply < 12) rate *= 0.3;
-    }
-
-    if (n >= 4 && HEFrand() < rate) {
-        int candidates[HE_MAX_PV], count = 0;
-        for (int i = 1; i < n; i++) {
-            int loss = best - L[i].cp;
-            if (loss >= 150 && loss <= 500 && L[i].mateIn >= 0)
-                candidates[count++] = i;
-        }
-        if (count > 0) {
-            int k = candidates[arc4random_uniform((uint32_t)count)];
-            HEFeatures bf = {};
-            if (haveBoard) bf = HEExtract(&b, HEParseMove(L[k].move));
-            // Obvious one-move errors are less likely than hidden mistakes.
-            if (!bf.visibleMistake || HEFrand() < 0.40 - 0.25 * HEHP.t) {
-                HEP.blunderBudget -= 1.0;
-                return HECommitMove(L, k);
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // 4. Normal human sampling over Stockfish's own lines
-    // -------------------------------------------------------------------
-    double w[HE_MAX_PV], sum = 0.0;
-
-    for (int i = 0; i < n; i++) {
-        int loss = best - L[i].cp;
-        if (loss < 0) loss = 0;
-
-        HEFeatures f;
-        if (haveBoard) f = HEExtract(&b, HEParseMove(L[i].move));
-        else           memset(&f, 0, sizeof(f));
-
-        double perceived = f.visibleMistake ? (double)loss : loss * 0.30;
-        perceived = loss * HEHP.seeThrough + perceived * (1.0 - HEHP.seeThrough);
-
-        if (loss > 200) {
-            if (HEP.mistakeBudget <= 0.0) { w[i] = 0.0; continue; }
-            perceived *= 0.75;
-        }
-
-        w[i] = exp(-perceived / HEHP.T) * HEHumanBias(&f, ply);
-
-        if (loss > 700 && f.visibleMistake) w[i] *= 0.10;
-        if (L[i].mateIn < 0 && L[0].mateIn >= 0) w[i] = 0.0;
-
-        sum += w[i];
-    }
-
-    if (sum <= 0.0) return HECommitMove(L, 0);
-
-    double r = HEFrand() * sum, acc = 0.0;
-    for (int i = 0; i < n; i++) {
-        acc += w[i];
-        if (r <= acc) {
-            if (best - L[i].cp > 200) HEP.mistakeBudget -= 1.0;
-            return HECommitMove(L, i);
-        }
-    }
-
-    return HECommitMove(L, 0);
-}
-
-// ===========================================================================
-// MARK: - Introspection (for your canvas / debug overlay)
-// ===========================================================================
-
-NSDictionary *HEDescribeElo(int elo) {
-    if (!HEHumanBand(elo)) {
-        return @{ @"mode"  : (elo < 3190 ? @"Stockfish UCI ELO limit"
-                                         : @"Full strength · no fixed ELO"),
-                  @"skill" : @20 };
-    }
-    HEParams p = HEParamsFor(elo);
-    return @{
-        @"mode"     : [NSString stringWithFormat:
-                        @"Human sim · preset %d · depth %d · MultiPV %d · ~%.1f blunders",
-                        p.skill, p.depth, p.multipv, p.blunderBudget],
-        @"skill"    : @(p.skill),
-        @"depth"    : @(p.depth),
-        @"multipv"  : @(p.multipv),
-        @"temp"     : @(p.T),
-        @"blunders" : @(p.blunderBudget),
-        @"mistakes" : @(p.mistakeBudget),
-        @"convCp"   : @(p.convThresh)
-    };
+static void HEInvalidateConfiguration(void) {
+    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    HECfgElo = -1;
 }
 
 static double CAPStockfishSkillForElo(int elo) {
-    if (elo < 1320) {
-        NSNumber *skill = HEDescribeElo(elo)[@"skill"];
-        return skill.doubleValue;
-    }
+    if (elo <= 1320) return 20; // Search skill, not the human move-class profile.
     if (elo >= 3190) return 20;
     double e = (double)(elo - 1320) / (3190 - 1320);
     return fmax(0.0, fmin(19.0,
@@ -2383,7 +3107,7 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
     }
     BOOL success = NO;
     std::string line;
-    BOOL lowElo = stockfish19 && requestedElo < 1320;
+    BOOL lowElo = stockfish19 && requestedElo <= 1320;
     int ply = lowElo ? CAPFenPly(fen) : -1;
     NSString *humanGo = nil;
     if (lowElo) {
@@ -2398,12 +3122,13 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
             BOOL havePrior = HEParseFEN(humanLastFen.c_str(), &priorBoard);
             NSString *played = havePrior ?
                 HEInferOnePlyMove(humanLastFen.c_str(), fen) : nil;
-            BOOL opponentMoved = havePrior && priorBoard.whiteToMove != HEP.isWhite;
+            BOOL opponentMoved = havePrior && priorBoard.whiteToMove != HES.isWhite;
             if (opponentMoved) {
                 HENoteOpponentMove(played.UTF8String);
                 NSLog(@"[ChessAssistantPro] Human band opponent move %@",
                       played ?: @"unavailable from one-ply FEN transition");
             } else if (played) {
+                std::lock_guard<std::recursive_mutex> lock(HEMutex);
                 HELastOwnTo = HEParseMove(played.UTF8String).to;
             }
         } else if (ply == humanLastPly + 2 && !humanLastFen.empty() &&
@@ -2425,9 +3150,11 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
     if (!reused) {
         if (!CAPWrite(input[1], "uci\n") || !CAPWaitForLine(output[0], "uciok", deadline)) goto done;
         if (stockfish19 && !CAPWrite(input[1], "setoption name Hash value 32\n")) goto done;
+        if (stockfish19) HEInvalidateConfiguration();
     }
     if (stockfish19) {
-        // Reapply on every position: the engine process is reused after slider changes.
+        // The engine process is reused, so slider and engine-mode transitions
+        // must restore the corresponding UCI options.
         int uciElo = MAX(1320, MIN(3190, requestedElo));
         if (!lowElo && cachedThreads != 2) {
             if (!CAPWrite(input[1], "setoption name Threads value 2\n")) goto done;
@@ -2449,6 +3176,9 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
             NSLog(@"[ChessAssistantPro] Stockfish human band ELO=%d ply=%d %@",
                   requestedElo, ply, humanGo);
         } else {
+            // The high-Elo path changes UCI options directly; restore all
+            // human-band options if the slider later returns to 600–1320.
+            HEInvalidateConfiguration();
             if (!CAPWrite(input[1], "setoption name MultiPV value 1\n") ||
                 !CAPWrite(input[1], "setoption name Skill Level value 20\n") ||
                 !CAPWrite(input[1], std::string("setoption name UCI_LimitStrength value ") +
@@ -2769,18 +3499,19 @@ static void CAPUpdateStockfishSkillUI(id panel, UISlider *slider) {
     if (elo >= 3190) {
         label.text = @"Max · Skill 20/20";
         label.accessibilityLabel = @"Stockfish 19 full strength, skill level 20 of 20, no fixed Elo rating";
-    } else if (elo >= 1320) {
+    } else if (elo >= 1321) {
         label.text = [NSString stringWithFormat:@"%d · Skill ~%.1f/20",
                       elo, CAPStockfishSkillForElo(elo)];
         label.accessibilityLabel = [NSString stringWithFormat:
             @"Stockfish 19 ELO limit %d, approximate effective skill %.1f of 20",
             elo, CAPStockfishSkillForElo(elo)];
     } else {
-        label.text = [NSString stringWithFormat:@"~%d · Human preset %.0f/3",
-                      elo, CAPStockfishSkillForElo(elo)];
+        NSDictionary *profile = HEDescribeElo(elo);
+        label.text = [NSString stringWithFormat:@"%d · Human mix · Depth %@",
+                      elo, profile[@"depth"] ?: @"?"];
         label.accessibilityLabel = [NSString stringWithFormat:
-            @"Stockfish 19 uncalibrated human preset %d, setting %.0f of 3; engine searches at full skill and selects among legal moves",
-            elo, CAPStockfishSkillForElo(elo)];
+            @"Stockfish 19 uncalibrated human move profile %d, depth %@, up to %@ scored moves; engine search skill 20 of 20",
+            elo, profile[@"depth"] ?: @"?", profile[@"multipv"] ?: @"?"];
     }
 }
 

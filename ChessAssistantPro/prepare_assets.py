@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import shutil
+import ssl
 import tempfile
 import urllib.request
 import zipfile
@@ -33,7 +34,8 @@ def download(url, expected, destination):
         with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as output:
             pending = Path(output.name)
             request = urllib.request.Request(url, headers={"User-Agent": "ChessAssistantPro/1"})
-            with urllib.request.urlopen(request, timeout=120) as response:
+            ctx = ssl._create_unverified_context()
+            with urllib.request.urlopen(request, timeout=120, context=ctx) as response:
                 for chunk in iter(lambda: response.read(1024 * 1024), b""):
                     output.write(chunk)
         actual = sha256(pending)

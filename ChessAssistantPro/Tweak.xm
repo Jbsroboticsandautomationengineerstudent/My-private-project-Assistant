@@ -2982,7 +2982,7 @@ static HEPositionType HEClassifyPosition(const HEBoard *b, const HEMath::Vec &de
     if (!b) return HE_POS_QUIET;
     int totalMaterial = 0;
     for (int sq = 0; sq < 64; ++sq) {
-        int pc = std::abs(b->board[sq]);
+        int pc = std::abs(b->sq[sq]);
         if (pc == 2 || pc == 3) totalMaterial += 3;
         else if (pc == 4) totalMaterial += 5;
         else if (pc == 5) totalMaterial += 9;
@@ -3184,9 +3184,6 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
                      + (1.0 - HES.attentionFocused) * HES.distractedSigma;
 
     // H.27: composite sensitivity: s_eff = s(R) * exp(η_κ) * drift * σ_attention
-    double sBase = HEMath::targetError(elo) > 0
-        ? HEMath::targetError(elo) * 15413.0 / 3571.0  // approximate s from AEe
-        : 0.20;
     // fitLaw finds the s that matches the target AEe; we scale its result
     HEMath::Law law=HEMath::fitLaw(delta,elo,.50);
     double sComposite = law.s * std::exp(etaShift) * driftMult * attnSigma;

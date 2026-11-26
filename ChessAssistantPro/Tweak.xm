@@ -39,7 +39,6 @@
 #include <numeric>
 #include <random>
 #include <utility>
-#include <stdexcept>
 #include <vector>
 
 extern char **environ;
@@ -2370,7 +2369,7 @@ static Vec normalize(Vec a) {
     for(double &x:a)x/=sum;return a;
 }
 static double dot(const Vec &a,const Vec &b) {
-    if(a.size()!=b.size())throw std::invalid_argument("HEMath dot: vector size mismatch");
+    if(a.size()!=b.size()){NSLog(@"[ChessAssistantPro] HEMath dot: vector size mismatch");return 0;}
     double v=0;for(size_t i=0;i<a.size();++i)v+=a[i]*b[i];return v;
 }
 static double entropy(const Vec &p) {double h=0;for(double v:p)if(v>0)h-=v*std::log(v);return h;}
@@ -2399,11 +2398,11 @@ struct Law {Vec p,w,d;double p0=1,s=0,c=0;int iterations=0;
     }
 };
 static Law choice(const Vec &d,double s,double c){
-    if(!(s>0&&c>0)||!std::isfinite(s)||!std::isfinite(c))throw std::invalid_argument("HEMath choice: positive finite s,c required");
+    if(!(s>0&&c>0)||!std::isfinite(s)||!std::isfinite(c)){NSLog(@"[ChessAssistantPro] HEMath choice: positive finite s,c required");return out;}
     Law out;out.d=d;out.s=s;out.c=c;out.w.resize(d.size());out.p.resize(d.size());
     if(d.empty())return out;
     for(size_t i=0;i<d.size();++i){
-        if(d[i]<0||!std::isfinite(d[i]))throw std::invalid_argument("HEMath choice: invalid loss");
+        if(d[i]<0||!std::isfinite(d[i])){NSLog(@"[ChessAssistantPro] HEMath choice: invalid loss at %zu",i);return out;}
         double exponent=std::pow(d[i]/s,c);
         out.w[i]=std::exp(std::min(exponent,40.0)); // numerical cap; not statistical calibration
     }
@@ -2496,7 +2495,7 @@ static double simulateFirstExit(const Diffusion&a,std::mt19937_64 &rng,double dt
 }
 // 17-20: exponential tilt, cumulants, KL and local score expansion.
 static Vec tilt(const Vec&p,const Vec&q,double theta){
-    if(p.size()!=q.size())throw std::invalid_argument("HEMath tilt: vector size mismatch");
+    if(p.size()!=q.size()){NSLog(@"[ChessAssistantPro] HEMath tilt: vector size mismatch");return normalize(Vec(p.size(),1));}
     Vec logs(p.size()),r(p.size());double mx=-INFINITY;
     for(size_t i=0;i<p.size();++i){logs[i]=safeLog(p[i])+theta*q[i];mx=std::max(mx,logs[i]);}
     for(size_t i=0;i<p.size();++i)r[i]=std::exp(logs[i]-mx);return normalize(r);
@@ -2506,7 +2505,7 @@ static double logPartition(const Vec&p,const Vec&q,double theta){
     double sum=0;for(size_t i=0;i<p.size();++i)sum+=std::exp(safeLog(p[i])+theta*q[i]-mx);
     return mx+std::log(std::max(sum,tiny));
 }
-static double kl(const Vec&a,const Vec&b){if(a.size()!=b.size())throw std::invalid_argument("HEMath KL size mismatch");
+static double kl(const Vec&a,const Vec&b){if(a.size()!=b.size()){NSLog(@"[ChessAssistantPro] HEMath KL size mismatch");return 0;}
     double d=0;for(size_t i=0;i<a.size();++i)if(a[i]>0)d+=a[i]*(std::log(a[i])-safeLog(b[i]));return std::max(0.0,d);}
 static double localLogLR(double theta,double qMinusMu,double v){return theta*qMinusMu-.5*sq(theta)*v;}
 // 21: standardized score statistic; 22: Elo-to-expected-score gain.
@@ -2530,9 +2529,9 @@ static bool ratingStepAllowed(int prev,int next,int lo,int hi,int velocity){
 static double maxLogPath(const std::vector<Vec>&ll,const Vec&ratings,double maxVelocity){
     if(ll.empty())return 0;
     size_t n=ratings.size();if(n==0)return -INFINITY;
-    Vec previous=ll.front();if(previous.size()!=n)throw std::invalid_argument("HEMath rating lattice mismatch");
+    Vec previous=ll.front();if(previous.size()!=n){NSLog(@"[ChessAssistantPro] HEMath rating lattice mismatch");return -INFINITY;}
     for(size_t t=1;t<ll.size();++t){
-        if(ll[t].size()!=n)throw std::invalid_argument("HEMath rating path mismatch");
+        if(ll[t].size()!=n){NSLog(@"[ChessAssistantPro] HEMath rating path mismatch");return -INFINITY;}
         Vec next(n,-INFINITY);
         for(size_t j=0;j<n;++j)for(size_t k=0;k<n;++k)
             if(std::fabs(ratings[j]-ratings[k])<=maxVelocity)
@@ -2559,7 +2558,7 @@ static double minFamilyKL(const Vec&alternative,const std::vector<Vec>&ratingLaw
 }
 // 36-38,71: binary KL and necessary sample sizes for alpha / power.
 static double binaryKL(double p,double q){
-    if(!(p>=0&&p<=1&&q>=0&&q<=1))throw std::invalid_argument("HEMath binaryKL: probabilities outside [0,1]");
+    if(!(p>=0&&p<=1&&q>=0&&q<=1)){NSLog(@"[ChessAssistantPro] HEMath binaryKL: probabilities outside [0,1]");return 0;}
     if(q==0)return p==0?0:INFINITY;
     if(q==1)return p==1?0:INFINITY;
     p=clamp(p,0,1);q=clamp(q,tiny,1-tiny);
@@ -2626,9 +2625,9 @@ static double criticalMismatch(double altKL){return .25*altKL;}
 // 57-60: history-conditional projection and conditional-information decomposition.
 static Vec historyAverage(const std::vector<Vec>&laws,const Vec&freq){
     if(laws.empty())return {};
-    if(laws.size()!=freq.size())throw std::invalid_argument("HEMath historyAverage: history/weight mismatch");
+    if(laws.size()!=freq.size()){NSLog(@"[ChessAssistantPro] HEMath historyAverage: history/weight mismatch");return {};}
     for(const Vec& law:laws)if(law.size()!=laws.front().size())
-        throw std::invalid_argument("HEMath historyAverage: law size mismatch");
+        {NSLog(@"[ChessAssistantPro] HEMath historyAverage: law size mismatch");return {};}
     Vec a(laws[0].size(),0);Vec freqN=normalize(freq);
     for(size_t k=0;k<laws.size();++k)for(size_t i=0;i<a.size();++i)a[i]+=freqN[k]*laws[k][i];
     return normalize(a);
@@ -2638,7 +2637,7 @@ static double conditionalMutualInformation(const std::vector<Vec>&laws,const Vec
     for(size_t i=0;i<laws.size();++i)mi+=f[i]*kl(laws[i],avg);return mi;}
 static double historyConditionalRatioMean(const Vec&historyLaw,const Vec&alternative,const Vec&baseline){
     if(historyLaw.size()!=alternative.size()||alternative.size()!=baseline.size())
-        throw std::invalid_argument("HEMath historyConditionalRatioMean: law size mismatch");
+        {NSLog(@"[ChessAssistantPro] HEMath historyConditionalRatioMean: law size mismatch");return 0;}
     double out=0;
     for(size_t i=0;i<historyLaw.size();++i)
         out+=historyLaw[i]*alternative[i]/std::max(baseline[i],tiny);
@@ -2670,7 +2669,7 @@ static Vec logProbabilityRatingDerivative(const Law&l,double dsByRating){
 // 51: E_true[L]=1+Cov_p0(L,p_true/p0), when L=q/p0.
 static double mismatchExpectation(const Vec&trueLaw,const Vec&alternative,const Vec&reference){
     if(trueLaw.size()!=alternative.size()||reference.size()!=alternative.size())
-        throw std::invalid_argument("HEMath mismatchExpectation: law size mismatch");
+        {NSLog(@"[ChessAssistantPro] HEMath mismatchExpectation: law size mismatch");return 0;}
     double v=0;
     for(size_t i=0;i<trueLaw.size();++i)
         v+=trueLaw[i]*alternative[i]/std::max(reference[i],tiny);
@@ -2685,7 +2684,7 @@ static double historyInformationDecomposition(const std::vector<Vec>&laws,
 // 62: exact regime KL and its second-order local sensitivity approximation.
 static std::pair<double,double> sensitivityRegimeDivergence(const Law&start,
         const Law&end){
-    if(start.p.size()!=end.p.size())throw std::invalid_argument("HEMath sensitivityRegimeDivergence: size mismatch");
+    if(start.p.size()!=end.p.size()){NSLog(@"[ChessAssistantPro] HEMath sensitivityRegimeDivergence: size mismatch");return {0,0};}
     return {kl(end.p,start.p),.5*sq(end.s-start.s)*sensitivityFisher(start)};
 }
 static double inverseGaussianKL(double m2,double shape2,double m1,double shape1){
@@ -2979,16 +2978,16 @@ static HEMath::Vec HEStyleTilt(const HEMath::Vec &p,
 // H.21: Position classification for strength-by-type
 enum HEPositionType { HE_POS_QUIET = 0, HE_POS_TACTICAL, HE_POS_ENDGAME };
 static HEPositionType HEClassifyPosition(const HEBoard *b, const HEMath::Vec &delta, int n) {
+    if (n >= 2 && delta[1] > 1.25) return HE_POS_TACTICAL;
     if (!b) return HE_POS_QUIET;
     int totalMaterial = 0;
     for (int sq = 0; sq < 64; ++sq) {
-        int pc = std::abs(b->sq[sq]);
-        if (pc == 2 || pc == 3) totalMaterial += 3;
-        else if (pc == 4) totalMaterial += 5;
-        else if (pc == 5) totalMaterial += 9;
+        int v = HEPieceValue(b->sq[sq]);
+        if (v >= 300 && v <= 400) totalMaterial += 3;
+        else if (v == 500) totalMaterial += 5;
+        else if (v == 900) totalMaterial += 9;
     }
     if (totalMaterial <= 16) return HE_POS_ENDGAME;
-    if (n >= 2 && delta[1] > 1.25) return HE_POS_TACTICAL;
     return HE_POS_QUIET;
 }
 
@@ -3533,30 +3532,14 @@ NSArray<NSString *> *HEConfigureCommands(int elo) {
 
 NSString *HEChooseMove(const char *fen, int ply, int elo) {
     std::lock_guard<std::recursive_mutex> lock(HEMutex);
-    try {
-        const char *m = HECoreChooseMove(fen, ply, elo);
-        return m ? [NSString stringWithUTF8String:m] : nil;
-    } catch (const std::exception &error) {
-        NSLog(@"[ChessAssistantPro] Human move equation failed: %s", error.what());
-        return nil; // Use Stockfish's own bestmove rather than terminate the app.
-    } catch (...) {
-        NSLog(@"[ChessAssistantPro] Human move equation failed: unknown C++ error");
-        return nil;
-    }
+    const char *m = HECoreChooseMove(fen, ply, elo);
+    return m ? [NSString stringWithUTF8String:m] : nil;
 }
 
 static NSString *HEPdfChooseMove(int elo,int ply) {
     std::lock_guard<std::recursive_mutex> lock(HEMutex);
-    try {
-        const char *move=HEPdfCoreChooseMove(elo,ply);
-        return move ? [NSString stringWithUTF8String:move] : nil;
-    } catch (const std::exception &error) {
-        NSLog(@"[ChessAssistantPro] PDF move law failed: %s",error.what());
-        return nil;
-    } catch (...) {
-        NSLog(@"[ChessAssistantPro] PDF move law failed: unknown C++ error");
-        return nil;
-    }
+    const char *move=HEPdfCoreChooseMove(elo,ply);
+    return move ? [NSString stringWithUTF8String:move] : nil;
 }
 
 

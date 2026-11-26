@@ -2082,6 +2082,15 @@ typedef struct {
     int    runningAccN;
     double accTarget;              // per-game accuracy target (65–85%)
     double gameMixShift;           // per-game mix randomization (-1..+1)
+    // Anti-pattern: per-game jitter on every tunable parameter
+    double gameThetaJitter;        // additive jitter on theta tilt
+    double gameOverrideMult;       // multiplier on all safety override strengths
+    double gameBookJitter;         // additive jitter on book skip probability
+    double gameSpotMult;           // multiplier on spotObvious / spotTactic
+    double gameGovernorSens;       // multiplier on governor sensitivity (kAcc exponent)
+    double gamePhaseMult;          // multiplier on phase sensitivity shift
+    double gameSClampMult;         // per-game jitter on sComposite clamp ceiling
+    int    gameDepthOffset;        // -1, 0, or +1 depth jitter (set once per game)
 } HEState;
 
 
@@ -2128,6 +2137,15 @@ static void HECoreNewGame(int playingWhite, int elo) {
     HES.runningAccN   = 0;
     HES.accTarget     = 65.0 + HEFrand() * 20.0;
     HES.gameMixShift  = HEGauss() * 0.35;
+    // Anti-pattern: randomize every tunable so no two games share a fingerprint
+    HES.gameThetaJitter   = HEGauss() * 0.12;
+    HES.gameOverrideMult  = 0.50 + HEFrand() * 1.00;
+    HES.gameBookJitter    = HEGauss() * 0.15;
+    HES.gameSpotMult      = 0.60 + HEFrand() * 0.80;
+    HES.gameGovernorSens  = 0.70 + HEFrand() * 0.60;
+    HES.gamePhaseMult     = 0.75 + HEFrand() * 0.50;
+    HES.gameSClampMult    = 0.70 + HEFrand() * 0.60;
+    HES.gameDepthOffset   = (int)arc4random_uniform(3) - 1;
 
     HEClockSeconds = -1;
     HELastOwnTo = -1;
@@ -2208,9 +2226,12 @@ static int HECoreConfigure(int elo, char out[][HE_CMD_LEN], int max) {
         HE_ADD("setoption name UCI_LimitStrength value false");
         HE_ADD("setoption name Threads value 1");
         HE_ADD("setoption name Skill Level value 20");       // honest scores
-        HE_ADD("setoption name MultiPV value %d", HEHP.multipv);
+        int mpvJitter = (int)arc4random_uniform(5) - 2;
+        int mpv = std::max(5, std::min(50, HEHP.multipv + mpvJitter));
+        HE_ADD("setoption name MultiPV value %d", mpv);
     }
-    HE_ADD("go depth %d movetime 1500", HEHP.depth + (int)arc4random_uniform(2));
+    int depthFinal = std::max(3, HEHP.depth + HES.gameDepthOffset + (int)arc4random_uniform(2));
+    HE_ADD("go depth %d movetime 1500", depthFinal);
 #undef HE_ADD
     return n;
 }
@@ -3313,7 +3334,7 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     // At low ELO, skip book most of the time — 400-rated players don't play theory
     if (ply < 20) {
         double exitP = HEBookExitProb(ply, HEHP.bookExitPlyHalf);
-        double bookSkip = HEMath::clamp(0.50 - 0.40 * HEHP.t, 0.0, 0.90);
+        double bookSkip = HEMath::clamp(0.50 - 0.40 * HEHP.t + HES.gameBookJitter + HEGauss()*0.05, 0.0, 0.92);
         if (HEFrand() > exitP && HEFrand() > bookSkip && n > 0) {
             return HECommit(0, 0);
         }
@@ -3366,11 +3387,11 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     // Section 2.3: phase multiplier on s_eff
     HEGamePhase gamePhase = haveBoard ? HEDetectPhase(&board, ply)
                                       : HE_PHASE_MIDDLEGAME;
-    double phaseMult = HEPhaseMult(gamePhase);
+    double phaseMult = HEPhaseMult(gamePhase) * HES.gamePhaseMult;
 
     // Section 2.2: winning-position blunder surge — multiply s when winning
     double winSurgeMult = 1.0;
-    if (HEL[0].cp > 250) winSurgeMult = HEHP.winningSMult;
+    if (HEL[0].cp > 250) winSurgeMult = HEHP.winningSMult * (0.85 + HEFrand() * 0.30);
 
     // Section 5.1: game-to-game form multiplier (drawn at game start)
     double gameForm = HES.gameFormMult;
@@ -3380,13 +3401,15 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
 
     double sComposite = law.s * std::exp(etaShift) * driftMult * attnSigma
                       * phaseMult * winSurgeMult * gameForm * tiltSMult;
-    sComposite = HEMath::clamp(sComposite, law.s * 0.3, law.s * 8.0);
+    double sClampCeil = law.s * (6.0 + 4.0 * HES.gameSClampMult);
+    sComposite = HEMath::clamp(sComposite, law.s * 0.3, sClampCeil);
 
     // Section 5.4: accuracy governor — always active to keep accuracy in target range
     bool winMode = [[NSUserDefaults standardUserDefaults] boolForKey:kWinEveryGameKey];
     if (HES.runningAccN >= 3) {
         double avgAcc = HES.runningAccSum / std::max(1, HES.runningAccN);
-        double kAcc = std::exp(0.08 * (avgAcc - HES.accTarget));
+        double govSens = 0.08 * HES.gameGovernorSens;
+        double kAcc = std::exp(govSens * (avgAcc - HES.accTarget));
         kAcc = HEMath::clamp(kAcc, 0.25, 5.0);
         sComposite *= kAcc;
     }
@@ -3412,7 +3435,8 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
 
     // Model the alternative's intent to win through a positive exponential
     // tilt (Eq 17-20) using risk-adjusted quality.
-    double theta=.35+0.40*HEHP.t;
+    double theta=.35+0.40*HEHP.t + HES.gameThetaJitter + HEGauss()*0.04;
+    theta = std::max(0.05, theta);
     HEMath::Vec winning=HEMath::tilt(law.p,riskQ,theta);
 
     // H.20: apply playing style as feature tilt
@@ -3436,7 +3460,7 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     // Section 5.4: win-safe floor (winEveryGameMode) — prevent throwing won games
     // Scale with ELO: low-rated players throw winning positions regularly
     if (winMode && HEL[0].cp >= 180) {
-        double floorStr = HEMath::clamp(0.05 + 0.40 * HEHP.t, 0.0, 0.50);
+        double floorStr = HEMath::clamp((0.05 + 0.40 * HEHP.t) * HES.gameOverrideMult + HEGauss()*0.03, 0.0, 0.50);
         double cpFloor = std::max(100.0, 0.45 * (double)HEL[0].cp);
         for (int i = 0; i < n; ++i) {
             if ((double)HEL[0].cp - (double)HEL[i].cp > cpFloor) {
@@ -3447,12 +3471,13 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     }
 
     double cx=haveBoard?HEComplexity(&board,side):1.0;
-    double sharp=std::min(1.5,std::max(.70,.60+.40*cx));
+    double sharp=std::min(1.5,std::max(.70,.60+.40*cx)) * (0.90 + HEFrand() * 0.20);
     for(int c=0;c<HE_NCLASS;++c)proposedMix[c]=HEHP.mix[c];
     {
-        double sh = HES.gameMixShift;
+        double sh = HES.gameMixShift + HEGauss() * 0.10;
         proposedMix[HE_TOP]     *= std::exp(-1.0 * sh);
         proposedMix[HE_GOOD]    *= std::exp(-0.5 * sh);
+        proposedMix[HE_INACC]   *= std::exp( 0.1 * HEGauss());
         proposedMix[HE_MISTAKE] *= std::exp( 0.5 * sh);
         proposedMix[HE_BLUNDER] *= std::exp( 0.8 * sh);
         proposedMix = HEMath::normalize(proposedMix);
@@ -3464,16 +3489,17 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     // Low-rated players still blunder constantly even when ahead.
     bool isAhead = (quality[0] >= 0.60);
     if(isAhead){
-        double aheadStr = HEMath::clamp(0.08 + 0.30 * HEHP.t, 0.0, 0.40);
+        double aheadStr = HEMath::clamp((0.08 + 0.30 * HEHP.t) * HES.gameOverrideMult + HEGauss()*0.03, 0.0, 0.40);
         proposedMix[HE_BLUNDER] *= (1.0 - aheadStr);
         proposedMix[HE_MISTAKE] *= (1.0 - 0.40 * aheadStr);
     }
     if(ply<8){
-        proposedMix[HE_MISTAKE]*=.92-.15*HEHP.t;
-        proposedMix[HE_BLUNDER]*=.88-.18*HEHP.t;
+        double openJit = HES.gameOverrideMult * (0.85 + HEFrand() * 0.30);
+        proposedMix[HE_MISTAKE]*= 1.0 - (0.08 + 0.15 * HEHP.t) * openJit;
+        proposedMix[HE_BLUNDER]*= 1.0 - (0.12 + 0.18 * HEHP.t) * openJit;
     }
     if(HES.haveLastCp&&HES.lastCp>=HEHP.convThresh&&HEL[0].cp>=HEHP.convThresh){
-        double convStr = HEMath::clamp(0.05 + 0.30 * HEHP.t, 0.0, 0.35);
+        double convStr = HEMath::clamp((0.05 + 0.30 * HEHP.t) * HES.gameOverrideMult + HEGauss()*0.03, 0.0, 0.35);
         proposedMix[HE_MISTAKE] *= 1.0 - convStr * 0.25;
         proposedMix[HE_BLUNDER] *= (1.0 - convStr);
     }
@@ -3515,15 +3541,17 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
         bool obviousWin = (HEL[0].mateIn>0 && HEL[0].mateIn<=2)
             || (features[0].isCapture && features[0].capturedValue>=300
                 && winLoss[0]<2.0);
-        if(obviousWin && HEFrand() < HEHP.spotObvious){
-            double obSupp = 0.25 + 0.40 * HEMath::clamp(-HEHP.t, 0.0, 1.0);
+        double spotOb = HEHP.spotObvious * HES.gameSpotMult;
+        if(obviousWin && HEFrand() < spotOb){
+            double obSupp = 0.25 + 0.40 * HEMath::clamp(-HEHP.t, 0.0, 1.0) + HEGauss()*0.05;
+            obSupp = std::max(0.05, obSupp);
             for(int i=0;i<n;++i)if(winLoss[i]>5)candidate[i]*=obSupp;
             HES.missStreak=0;
         }else if(obviousWin){
             HES.missStreak++;
         }else{
             // Non-obvious tactics: roll for recognition
-            double spot=HEHP.spotTactic;
+            double spot=HEHP.spotTactic * HES.gameSpotMult;
             spot=HEMath::clamp(spot+.10*HES.missStreak,.02,.995);
             bool saw=HEFrand()<spot;
             if(saw){

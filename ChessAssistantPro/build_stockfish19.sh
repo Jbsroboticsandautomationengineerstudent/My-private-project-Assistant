@@ -31,6 +31,11 @@ git -C "$SOURCE_DIR" checkout --detach FETCH_HEAD
 grep -q "EvalFileDefaultName \"$NET_NAME\"" "$SOURCE_DIR/src/evaluate.h"
 cp "$CACHE_DIR/$NET_NAME" "$SOURCE_DIR/src/$NET_NAME"
 
+if [[ -f "$DEST_DIR/stockfish19" ]] && xcrun lipo -archs "$DEST_DIR/stockfish19" 2>/dev/null | grep -qw arm64; then
+  echo "Stockfish 19 already built, skipping compilation"
+  exit 0
+fi
+
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 CXX=$(xcrun --sdk iphoneos --find clang++)
 TARGET_FLAGS="-target arm64-apple-ios17.0 -isysroot $SDK"

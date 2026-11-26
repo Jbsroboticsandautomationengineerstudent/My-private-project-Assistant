@@ -50,6 +50,11 @@ if 'cap_executable_path' not in source:
     path.write_text(source.replace(marker, marker + '\n' + patch, 1))
 PY
 
+if [[ -f "$DEST_DIR/triumviratus" ]] && xcrun lipo -archs "$DEST_DIR/triumviratus" 2>/dev/null | grep -qw arm64; then
+  echo "Triumviratus already built, skipping compilation"
+  exit 0
+fi
+
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 CXX=$(xcrun --sdk iphoneos --find clang++)
 CC=$(xcrun --sdk iphoneos --find clang)

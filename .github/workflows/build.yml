@@ -1,0 +1,29 @@
+name: Build Chess Assistant Pro
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Theos
+        uses: Randomblock1/theos-action@v1
+
+      - name: Build package
+        working-directory: ./ChessAssistantPro
+        run: |
+          make clean package FINALPACKAGE=1
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chess-assistant-pro-deb
+          path: ChessAssistantPro/packages/*.deb

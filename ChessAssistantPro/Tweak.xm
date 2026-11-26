@@ -2398,7 +2398,7 @@ struct Law {Vec p,w,d;double p0=1,s=0,c=0;int iterations=0;
     }
 };
 static Law choice(const Vec &d,double s,double c){
-    if(!(s>0&&c>0)||!std::isfinite(s)||!std::isfinite(c)){NSLog(@"[ChessAssistantPro] HEMath choice: positive finite s,c required");return out;}
+    if(!(s>0&&c>0)||!std::isfinite(s)||!std::isfinite(c)){NSLog(@"[ChessAssistantPro] HEMath choice: positive finite s,c required");return {};}
     Law out;out.d=d;out.s=s;out.c=c;out.w.resize(d.size());out.p.resize(d.size());
     if(d.empty())return out;
     for(size_t i=0;i<d.size();++i){

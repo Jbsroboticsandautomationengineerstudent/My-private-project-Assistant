@@ -1,0 +1,9 @@
+Package: com.jerich.chessassistantpro
+Name: Chess Assistant Pro
+Version: 0.8.10
+Architecture: iphoneos-arm64
+Description: Maia ONNX, three engine choices, and passive Swift move-path diagnostics
+Maintainer: Jerich
+Author: Jerich
+Section: Tweaks
+Depends: firmware (>= 17.0), mobilesubstrate

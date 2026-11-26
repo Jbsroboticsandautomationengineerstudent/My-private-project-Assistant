@@ -1,0 +1,68 @@
+
+Function range 0x53cdc:0x54418
+0x53d40 -> __cfstring 0x26bcf40: loaded v2.3 (SF16 + Maia3)
+0x53e7c -> __cfstring 0x26bd480: ChessAssist_ELO
+0x53eb4 -> __cfstring 0x26bd4a0: ChessAssist_Enabled
+0x53ef0 -> __cfstring 0x26bd4c0: ChessAssist_WinPct
+0x53f2c -> __cfstring 0x26bd4e0: ChessAssist_ArrowCount
+0x53f68 -> __cfstring 0x26bd500: ChessAssist_ArrowAlpha
+0x53fa4 -> __cfstring 0x26bd520: ChessAssist_ArrowThick
+0x53fe0 -> __cfstring 0x26bd540: ChessAssist_ArrowEvalColor
+0x5401c -> __cfstring 0x26bd560: ChessAssist_TrackQuality
+0x54058 -> __cfstring 0x26bd580: ChessAssist_EvalLabels
+0x54094 -> __cfstring 0x26bd5a0: ChessAssist_UseMaia
+0x54190 -> __cfstring 0x26bcfa0: maia3_5m.mlpackage
+0x541c0 -> __cfstring 0x26bcfc0: Chess/maia3_5m.mlpackage
+0x541f0 -> __cfstring 0x26bcfe0: Frameworks/Chess.dylib/maia3_5m.mlpackage
+0x542f4 -> __cfstring 0x26bd040: FAIL
+0x542fc -> __cfstring 0x26bd020: OK
+0x54310 -> __cfstring 0x26bd000: maia load %@: %@
+
+Function range 0x54418:0x54c00
+0x54474 -> __objc_selrefs 0x26c02d0: layoutSubviews
+0x5448c -> __cfstring 0x26bd7c0: HOOKED layoutSubviews on %@
+0x54554 -> __cstring 0x6cef0: ^?
+0x545f4 -> __cfstring 0x26bd7e0: SwiftChessBoard
+0x545fc -> __cfstring 0x26bd800: BoardView
+0x54640 -> __cfstring 0x26bd820: ChessBoard
+0x546f0 -> __cfstring 0x26bd840: HOOKED layoutSubviews on %@ (SwiftBoard)
+0x54750 -> __cstring 0x6cf5d: $sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF
+0x54764 -> __cfstring 0x26bd860: Found Swift String bridge
+0x5476c -> __cfstring 0x26bd880: WARN: Swift String bridge NOT found
+0x5485c -> __cfstring 0x26bd920: HOOKED Swift getCurrentFen: %@
+0x54964 -> __cfstring 0x26bd980: HOOKED Swift getMainLineTcnString: %@
+0x54a6c -> __cfstring 0x26bda80: HOOKED Swift FEN (broad): %@
+0x54aac -> __cfstring 0x26bdaa0: setEncodedMoves:
+0x54ac8 -> __cfstring 0x26bdac0: UI
+0x54ad0 -> __cfstring 0x26bdae0: NS
+0x54ad8 -> __cfstring 0x26bdb00: _
+0x54bb0 -> __cfstring 0x26bdb20: HOOKED setEncodedMoves: on %@
+
+Function range 0x56460:0x56500
+0x5646c -> __cstring 0x6cc5c: UIWindow
+0x56478 -> __objc_selrefs 0x26c02c0: hitTest:withEvent:
+0x56494 -> __cstring 0x6cc65: CHAppDelegate
+0x564a0 -> __objc_selrefs 0x26c02c8: applicationDidBecomeActive:
+
+Function range 0x5bd24:0x5c2b8
+0x5bd78 -> __cfstring 0x26be560:  
+0x5be94 -> __cfstring 0x26be760: skip illegal pos
+0x5bf74 -> __cfstring 0x26be4e0:  w 
+0x5c02c -> __cfstring 0x26be7e0: fetch d%ld: %@
+0x5c110 -> __cfstring 0x26be780: maia elo%ld: %@
+
+Function range 0x5d344:0x5d800
+0x5d4b0 -> __cfstring 0x26bca20: %.0f%%
+0x5d4b8 -> __cfstring 0x26bd5e0: move
+0x5d4dc -> __cfstring 0x26bd640: label
+0x5d7b0 -> __cfstring 0x26be7a0: stale resp
+0x5d7bc -> __cfstring 0x26be7c0: maia no move
+0x5d7d8 -> __cfstring 0x26be7e0: fetch d%ld: %@
+
+Function range 0x63ef0:0x65800
+0x641c4 -> __cfstring 0x26beb40: tokens
+0x641f4 -> __cfstring 0x26beb60: self_elo
+0x6421c -> __cfstring 0x26beb80: oppo_elo
+0x642f4 -> __cfstring 0x26beba0: move_logits
+0x6432c -> __cfstring 0x26bebc0: value_logits
+0x6514c -> __cstring 0x6db0d: vector

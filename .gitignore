@@ -1,0 +1,10 @@
+*.ipa
+*.zip
+*.dylib
+*.deb
+extracted_ipa/
+__pycache__/
+.theos/
+.asset-cache/
+packages/
+ChessAssistantPro/.git/

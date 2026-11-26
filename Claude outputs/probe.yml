@@ -1,0 +1,24 @@
+name: Build Chess Probe
+on:
+  workflow_dispatch:
+  push:
+    paths: [ 'probe/**', '.github/workflows/probe.yml' ]
+jobs:
+  build:
+    runs-on: macos-26-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Randomblock1/theos-action@v1
+      - name: Build
+        working-directory: probe
+        run: make clean package FINALPACKAGE=1
+      - name: Collect dylib
+        run: |
+          mkdir -p out
+          find probe/.theos -name 'ChessProbe.dylib' -exec cp {} out/ \;
+          cp probe/packages/*.deb out/ || true
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chess-probe
+          path: out/*

@@ -1,0 +1,45 @@
+@interface CHAssistBtnHandler  // class VM 0x26c0c80
++ floatBtnTapped	v16@0:8	IMP 0x4e028
++ handlePan:	v24@0:8@16	IMP 0x4e03c
+@end
+
+@interface CHPad  // class VM 0x26c0ca8
+- drawTextInRect:	v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16	IMP 0x4e13c
+- intrinsicContentSize	{CGSize=dd}16@0:8	IMP 0x4e190
+@end
+
+@interface CHSettingsPanel  // class VM 0x26c0cf8
+- initWithFrame:	@48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16	IMP 0x4e6e4
+- bgTap:	v24@0:8@16	IMP 0x4e7dc
+- lbl:size:weight:color:	@48@0:8@16d24d32@40	IMP 0x4e864
+- sep	@16@0:8	IMP 0x4e964
+- group:	@24@0:8@16	IMP 0x4ea4c
+- rowTitle:control:	@32@0:8@16@24	IMP 0x4ee20
+- styleSeg:	v24@0:8@16	IMP 0x4f0a4
+- switchOn:sel:	@28@0:8B16:20	IMP 0x4f2e4
+- chip:color:	@32@0:8@16@24	IMP 0x4f3ac
+- bigBtn:color:sel:	@40@0:8@16@24:32	IMP 0x4f524
+- smallBtn:sel:	@32@0:8@16:24	IMP 0x4f70c
+- statsCard	@16@0:8	IMP 0x4f910
+- build	v16@0:8	IMP 0x506e4
+- populate	v16@0:8	IMP 0x51568
+- eloSlide:	v24@0:8@16	IMP 0x52acc
+- eloDone:	v24@0:8@16	IMP 0x52c00
+- evalSeg:	v24@0:8@16	IMP 0x53058
+- arrSeg:	v24@0:8@16	IMP 0x530c4
+- thickSeg:	v24@0:8@16	IMP 0x53128
+- opSlide:	v24@0:8@16	IMP 0x531b8
+- swAnalysis:	v24@0:8@16	IMP 0x53220
+- swLabels:	v24@0:8@16	IMP 0x532ec
+- swColor:	v24@0:8@16	IMP 0x53350
+- swMaia:	v24@0:8@16	IMP 0x533b4
+- enableTap	v16@0:8	IMP 0x53414
+- debugTap	v16@0:8	IMP 0x53588
+- creditsTap	v16@0:8	IMP 0x537a0
+- closeTap	v16@0:8	IMP 0x53894
+- animateIn	v16@0:8	IMP 0x53898
+- animateOut	v16@0:8	IMP 0x53a58
+- .cxx_destruct	v16@0:8	IMP 0x53c74
++ show	v16@0:8	IMP 0x4e1d4
+@end
+

@@ -4007,9 +4007,15 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
             ply < humanLastPly ||
             (ply <= 1 && humanLastPly > 1);
         if (newGame) {
+            // Section 5.2: update tilt from previous game result before resetting
+            if (HES.init && HES.haveLastCp) {
+                bool wasLoss = (HES.lastCp < -300);
+                bool wasBlunder = (HES.lastCp < -500);
+                HETiltUpdate(wasLoss, wasBlunder);
+            }
             HENewGame(strstr(fen, " b ") == nullptr, requestedElo);
             humanLastFen.clear(); humanLastMove.clear();
-            NSLog(@"[ChessAssistantPro] Human band new game, ply=%d", ply);
+            NSLog(@"[ChessAssistantPro] Human band new game, ply=%d tilt=%.2f", ply, HES.tiltLevel);
         } else if (ply == humanLastPly + 1 && !humanLastFen.empty()) {
             HEBoard priorBoard;
             BOOL havePrior = HEParseFEN(humanLastFen.c_str(), &priorBoard);

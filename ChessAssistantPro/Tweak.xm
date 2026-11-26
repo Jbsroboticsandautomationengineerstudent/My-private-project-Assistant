@@ -2113,6 +2113,11 @@ typedef struct {
     // CPL fat-tail: probability of a single large blunder per move
     double gameFatTailProb;        // per-game probability of a sudden big error
     double gameFatTailMag;         // magnitude of the fat-tail blunder
+    // Beginner patterns: dirty blunders and piece-hanging
+    double gameHangProb;           // probability per move of hanging a piece
+    double gameQueenOutProb;       // extra queen-sortie bias in opening
+    double gameSamePieceBias;      // extra bias for moving same piece repeatedly
+    int    gamePreferredPiece;     // 0-5: which piece type the "player" gravitates to
 } HEState;
 
 
@@ -2122,6 +2127,23 @@ static HEParams HEHP;
 static double HEClockSeconds = -1.0; // set with HEClockRemainingSeconds(), optional
 static int            HECfgElo = -1;      // last ELO whose options were sent
 
+
+// Opening repertoire: a real human plays the same 2-3 openings repeatedly.
+// Stored persistently so it's consistent across games/sessions.
+static NSString *HERepertoireKey = @"HE_OpeningRepertoire";
+static const char *HERepertoireMoves[][3] = {
+    {"e2e4","d2d4","c2c4"},   // white first moves: e4, d4, c4
+    {"e7e5","c7c5","d7d5"},   // black vs e4: e5, Sicilian, d5
+    {"d7d5","g8f6","e7e6"},   // black vs d4: d5, Nf6, e6
+};
+static int HEGetRepertoireSlot(void) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSNumber *stored = [ud objectForKey:HERepertoireKey];
+    if (stored) return [stored intValue] % 3;
+    int slot = (int)arc4random_uniform(3);
+    [ud setObject:@(slot) forKey:HERepertoireKey];
+    return slot;
+}
 
 static void HEStatsReset(void);
 static void HECoreNewGame(int playingWhite, int elo) {
@@ -2190,6 +2212,14 @@ static void HECoreNewGame(int playingWhite, int elo) {
     // CPL fat tails: occasional single-move large blunders (right-skewed distribution)
     HES.gameFatTailProb    = 0.03 + HEFrand() * 0.07;
     HES.gameFatTailMag     = 0.40 + HEFrand() * 0.40;
+    // Beginner patterns: scale with ELO — low ELO hangs pieces, plays queen early
+    {
+        double beginner = HEMath::clamp(1.0 - HEHP.t, 0.0, 1.5);
+        HES.gameHangProb      = (0.04 + HEFrand() * 0.08) * beginner;
+        HES.gameQueenOutProb  = (0.15 + HEFrand() * 0.25) * beginner;
+        HES.gameSamePieceBias = (0.20 + HEFrand() * 0.30) * beginner;
+        HES.gamePreferredPiece = (int)arc4random_uniform(6);
+    }
 
     HEClockSeconds = -1;
     HELastOwnTo = -1;
@@ -2360,7 +2390,7 @@ static double HEHumanBias(const HEFeatures *f, int ply) {
     if (f->isQuiet)             w *= HEHP.quietW * HEHP.quietBackward;
     if (f->isSamePieceAgain) w *= 1.0 + 0.35 * inv;
     if (f->isPawnPush)          w *= 1.0 + 0.20 * inv;
-    if (f->hangsPiece)          w *= 0.25 + 0.60 * t;
+    if (f->hangsPiece)          w *= 0.45 + 0.45 * t;
 
 
     if (ply < 16) {
@@ -3374,6 +3404,20 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     bool opportunity=mateNow || (HES.haveLastCp&&jump>=250&&HEL[0].cp>=200
                  &&HES.lastCp<HEHP.convThresh);
 
+    // Opening repertoire: in the first few plies, prefer the "player's" stored
+    // opening move if it's available. This creates the consistent opening
+    // patterns that fair-play specialists expect from real humans.
+    if (ply <= 4 && n > 1) {
+        int repSlot = HEGetRepertoireSlot();
+        int repRow = (ply == 0) ? 0 : (ply <= 2 ? (HES.isWhite ? 0 : 1) : 2);
+        const char *repMove = HERepertoireMoves[repRow][repSlot];
+        for (int i = 0; i < n; ++i) {
+            if (strcmp(HEL[i].move, repMove) == 0 && HEFrand() < 0.75) {
+                return HECommit(i, 0);
+            }
+        }
+    }
+
     // Section 3.2: probabilistic book exit — early plies may use book instead
     // At low ELO, skip book most of the time — 400-rated players don't play theory
     if (ply < 20) {
@@ -3706,6 +3750,39 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
             selectedLaw[i] *= std::exp(HEGauss() * 0.05 + phaseNoise * (HEClassOf(winLoss[i]) >= HE_INACC ? 0.5 : -0.3));
         selectedLaw = HEMath::normalize(selectedLaw);
     }
+    // Dirty blunder injection: real beginners hang pieces and make structural
+    // mistakes. This is what distinguishes human errors from engine-picked
+    // "clean" errors. When triggered, heavily boost moves that hang material.
+    if (HEFrand() < HES.gameHangProb && n > 1) {
+        for (int i = 0; i < n; ++i) {
+            if (features[i].hangsPiece)
+                selectedLaw[i] *= 3.0 + HEFrand() * 4.0;
+        }
+        selectedLaw = HEMath::normalize(selectedLaw);
+    }
+    // Beginner patterns: boost moves that look like real low-rated play
+    if (n > 1) {
+        for (int i = 0; i < n; ++i) {
+            // Same piece obsession: beginners move their favorite piece
+            if (features[i].isSamePieceAgain && HEFrand() < HES.gameSamePieceBias)
+                selectedLaw[i] *= 1.3 + HEFrand() * 0.5;
+            // Early queen: beginners bring the queen out for no reason
+            if (ply < 14 && features[i].isEarlyQueenSortie && HEFrand() < HES.gameQueenOutProb)
+                selectedLaw[i] *= 1.4 + HEFrand() * 0.6;
+            // Pawn pushing: beginners push random pawns when unsure
+            if (features[i].isPawnPush && features[i].isQuiet && HEFrand() < 0.10 * HEMath::clamp(1.0 - HEHP.t, 0.0, 1.0))
+                selectedLaw[i] *= 1.2 + HEFrand() * 0.3;
+        }
+        selectedLaw = HEMath::normalize(selectedLaw);
+    }
+    // Worst-candidate bias: sometimes the final pick should be one of the
+    // absolute worst candidates, not just an Inaccuracy-class move —
+    // real beginners play moves that make titled reviewers wince
+    if (n >= 4 && HEFrand() < 0.04 * HEMath::clamp(1.3 - HEHP.t, 0.0, 1.5)) {
+        int worstIdx = n - 1 - (int)arc4random_uniform(std::min(3, n/2));
+        selectedLaw[worstIdx] *= 5.0 + HEFrand() * 5.0;
+        selectedLaw = HEMath::normalize(selectedLaw);
+    }
     // Final entropy injection
     for (int i = 0; i < n; ++i) {
         selectedLaw[i] *= std::exp(HEGauss() * 0.08);
@@ -3805,6 +3882,28 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     }
     // Section 5.2: apply tilt to timing
     suggested *= HETiltTimeMult();
+
+    // Move-quality timing correlation: blunders are often impulsive (fast),
+    // good moves in complex positions need thought (slow). This is a key
+    // signal that human reviewers check — engines don't correlate timing.
+    {
+        int pickedC = HEClassOf(winLoss[k]);
+        if (pickedC >= HE_MISTAKE) {
+            // Impulsive blunder: often fast, sometimes overthink then blunder
+            if (HEFrand() < 0.65)
+                suggested *= 0.35 + HEFrand() * 0.40;
+            else
+                suggested *= 1.3 + HEFrand() * 0.8;
+        } else if (pickedC == HE_TOP && n >= 3 && delta[1] > 0.5) {
+            // Finding the best move in a complex position: takes time
+            suggested *= 1.1 + HEFrand() * 0.5;
+        }
+        // Recaptures: near-instant regardless of quality
+        if (features[k].isRecapture)
+            suggested *= 0.30 + HEFrand() * 0.35;
+        // Add human timing noise: ±20% variance on every move
+        suggested *= 0.80 + HEFrand() * 0.40;
+    }
 
     HEStats->record(law,selectedLaw,quality,k,-1,suggested,topFirstDepth);
     if(HEStats->residualCount>=5&&HEStats->residualCount%10==0)

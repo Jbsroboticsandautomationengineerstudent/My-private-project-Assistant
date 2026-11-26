@@ -3,7 +3,6 @@ import hashlib
 import json
 import os
 import shutil
-import ssl
 import tempfile
 import urllib.request
 import zipfile
@@ -13,8 +12,8 @@ ROOT = Path(__file__).resolve().parent
 CACHE = ROOT / ".asset-cache"
 MODEL = ROOT / "layout/Library/Application Support/ChessAssistantPro/maia3_79m_int32.onnx"
 FRAMEWORK = CACHE / "ort/ios-arm64/onnxruntime.framework"
-ORT_URL = "https://download.onnxruntime.ai/pod-archive-onnxruntime-c-1.24.2.zip"
-ORT_SHA256 = "f7100a992d2a8135168c8afd831e6a58b465349101982aa58b3e11d36e600b54"
+ORT_URL = "https://github.com/csukuangfj/onnxruntime-libs/releases/download/v1.24.2/onnxruntime-ios-shared-xcframework-1.24.2.zip"
+ORT_SHA256 = "c13b057969fc4985853c5b423792cf21b941cf77717a913342529c05d1b2a453"
 HF_API = "https://huggingface.co/api/models/cstr/maia3-onnx-int32/tree/main?recursive=true"
 MODEL_URL = "https://huggingface.co/cstr/maia3-onnx-int32/resolve/main/maia3_79m_int32.onnx"
 
@@ -34,8 +33,7 @@ def download(url, expected, destination):
         with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as output:
             pending = Path(output.name)
             request = urllib.request.Request(url, headers={"User-Agent": "ChessAssistantPro/1"})
-            ctx = ssl._create_unverified_context()
-            with urllib.request.urlopen(request, timeout=120, context=ctx) as response:
+            with urllib.request.urlopen(request, timeout=120) as response:
                 for chunk in iter(lambda: response.read(1024 * 1024), b""):
                     output.write(chunk)
         actual = sha256(pending)

@@ -2091,6 +2091,15 @@ typedef struct {
     double gamePhaseMult;          // multiplier on phase sensitivity shift
     double gameSClampMult;         // per-game jitter on sComposite clamp ceiling
     int    gameDepthOffset;        // -1, 0, or +1 depth jitter (set once per game)
+    // Streak breaker: track consecutive move classes to force variety
+    int    lastMoveClass;          // HE_TOP..HE_BLUNDER of last move played
+    int    consecutiveSameClass;   // how many in a row of the same class
+    int    consecutiveGoodMoves;   // consecutive Top+Good moves (streak detection)
+    // Per-game randomized thresholds
+    double gameAheadThresh;        // randomized isAhead quality threshold
+    double gameLapseMult;          // per-game lapse rate multiplier
+    double gameEvalNoise;          // per-game eval perception noise scale
+    double gameArchetypeShift;     // per-game archetype tilt magnitude shift
 } HEState;
 
 
@@ -2146,6 +2155,15 @@ static void HECoreNewGame(int playingWhite, int elo) {
     HES.gamePhaseMult     = 0.75 + HEFrand() * 0.50;
     HES.gameSClampMult    = 0.70 + HEFrand() * 0.60;
     HES.gameDepthOffset   = (int)arc4random_uniform(3) - 1;
+    // Streak breaker init
+    HES.lastMoveClass        = -1;
+    HES.consecutiveSameClass = 0;
+    HES.consecutiveGoodMoves = 0;
+    // Per-game randomized thresholds
+    HES.gameAheadThresh    = 0.50 + HEFrand() * 0.20;
+    HES.gameLapseMult      = 0.60 + HEFrand() * 0.80;
+    HES.gameEvalNoise      = 0.03 + HEFrand() * 0.07;
+    HES.gameArchetypeShift = 0.70 + HEFrand() * 0.60;
 
     HEClockSeconds = -1;
     HELastOwnTo = -1;
@@ -3359,6 +3377,7 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
             }
         }
         double vPerceived = (1.0 - HEHP.lambda) * vShallow + HEHP.lambda * vTrue;
+        vPerceived += HEGauss() * HES.gameEvalNoise * (1.0 + 0.5 * std::fabs(vPerceived));
         values[i] = vPerceived;
         quality[i]=HEWinPct(HEL[i].cp)/100.0;
         winLoss[i]=std::max(0.0,bestWin-HEWinPct(HEL[i].cp));
@@ -3372,14 +3391,16 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     // H.21: classify position and shift sensitivity by type
     HEPositionType posType = haveBoard ? HEClassifyPosition(&board, delta, n)
                                        : HE_POS_QUIET;
-    double etaShift = HEPositionTypeShift(posType);
+    double etaShift = HEPositionTypeShift(posType) + HEGauss() * 0.06;
 
     // H.13: within-session sensitivity drift (fatigue + error reaction)
-    double driftMult = HESensitivityDrift(ply);
+    double driftMult = HESensitivityDrift(ply) * (0.92 + HEFrand() * 0.16);
 
     // H.10: attention-weighted sensitivity — blend focused and distracted
+    double attnNoise = HEGauss() * 0.04;
     double attnSigma = HES.attentionFocused * HES.focusedSigma
-                     + (1.0 - HES.attentionFocused) * HES.distractedSigma;
+                     + (1.0 - HES.attentionFocused) * HES.distractedSigma
+                     + attnNoise;
 
     // H.27: composite sensitivity: s_eff = s(R) * exp(η_κ) * drift * σ_attention
     // fitLaw finds the s that matches the target AEe; we scale its result
@@ -3430,7 +3451,8 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     }
 
     // H.19: risk-adjusted quality — risk-averse when ahead, simplify trades
-    HEMath::Vec riskQ = HERiskTilt(quality, law.p, HEHP.riskAversion,
+    double riskAv = HEHP.riskAversion * (0.75 + HEFrand() * 0.50);
+    HEMath::Vec riskQ = HERiskTilt(quality, law.p, riskAv,
                                    HEL[0].cp, features, n);
 
     // Model the alternative's intent to win through a positive exponential
@@ -3444,14 +3466,15 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
 
     // Section 5.1: game archetype tilt on log P — shift capture/check vs quiet
     if (std::fabs(HES.gameAggroTilt) > 0.01 || std::fabs(HES.gameRiskTilt) > 0.01) {
+        double archMag = HES.gameArchetypeShift;
         for (int i = 0; i < n; ++i) {
-            double shift = 0;
+            double shift = HEGauss() * 0.03;
             if (features[i].isCapture || features[i].givesCheck)
-                shift += HES.gameAggroTilt * 0.5;
+                shift += HES.gameAggroTilt * 0.5 * archMag;
             if (features[i].isQuiet && features[i].isBackward)
-                shift -= HES.gameAggroTilt * 0.3;
+                shift -= HES.gameAggroTilt * 0.3 * archMag;
             if (features[i].isPawnPush)
-                shift += HES.gameRiskTilt * 0.4;
+                shift += HES.gameRiskTilt * 0.4 * archMag;
             winning[i] *= std::exp(shift);
         }
         winning = HEMath::normalize(winning);
@@ -3487,7 +3510,7 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     // When winning (bestQuality >= 0.60 i.e. eval >= +1.5 pawns or so),
     // suppress blunders and mistakes — but scale with ELO.
     // Low-rated players still blunder constantly even when ahead.
-    bool isAhead = (quality[0] >= 0.60);
+    bool isAhead = (quality[0] >= HES.gameAheadThresh);
     if(isAhead){
         double aheadStr = HEMath::clamp((0.08 + 0.30 * HEHP.t) * HES.gameOverrideMult + HEGauss()*0.03, 0.0, 0.40);
         proposedMix[HE_BLUNDER] *= (1.0 - aheadStr);
@@ -3528,7 +3551,8 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     for(int i=0;i<n;++i){
         int c=HEClassOf(winLoss[i]);
         double factor=proposedMix[c]/std::max(classMass[c],HEMath::tiny);
-        candidate[i]=winning[i]*factor*HEHumanBias(&features[i],ply);
+        double hBias = HEHumanBias(&features[i],ply) * (0.88 + HEFrand() * 0.24);
+        candidate[i]=winning[i]*factor*hBias;
         // Low-rating visual mistakes remain possible, but a bot trying to win
         // does not deliberately choose a forced losing mate on every cycle.
         if(HEL[i].mateIn<0&&HEL[0].mateIn>=0)candidate[i]*=.10+.15*(1.0-HEHP.t);
@@ -3572,10 +3596,47 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     HEMath::Vec selectedLaw=HEMath::normalize(candidate);
 
     // H.8: lapse model — mix with human-prior (not uniform), gated by safety
-    selectedLaw = HEApplyLapse(selectedLaw, law.p, winLoss, HEHP.lapseRate);
+    double effectiveLapse = HEHP.lapseRate * HES.gameLapseMult * (0.85 + HEFrand() * 0.30);
+    selectedLaw = HEApplyLapse(selectedLaw, law.p, winLoss, effectiveLapse);
+
+    // Streak breaker: suppress top-class probability when too many consecutive
+    // good moves have been played — real humans don't play 5 Best in a row
+    if (HES.consecutiveGoodMoves >= 2 && n > 1) {
+        double streakPenalty = HEMath::clamp(0.15 * (HES.consecutiveGoodMoves - 1), 0.0, 0.60);
+        streakPenalty *= (0.80 + HEFrand() * 0.40);
+        for (int i = 0; i < n; ++i) {
+            int c = HEClassOf(winLoss[i]);
+            if (c == HE_TOP) selectedLaw[i] *= (1.0 - streakPenalty);
+        }
+        selectedLaw = HEMath::normalize(selectedLaw);
+    }
+    // Same-class streak breaker: avoid picking the same class 3+ times in a row
+    if (HES.consecutiveSameClass >= 2 && HES.lastMoveClass >= 0 && n > 1) {
+        double sameClassPen = HEMath::clamp(0.20 * (HES.consecutiveSameClass - 1), 0.0, 0.50);
+        for (int i = 0; i < n; ++i) {
+            if (HEClassOf(winLoss[i]) == HES.lastMoveClass)
+                selectedLaw[i] *= (1.0 - sameClassPen);
+        }
+        selectedLaw = HEMath::normalize(selectedLaw);
+    }
+    // Final entropy injection: add small random noise to every candidate
+    // to prevent deterministic picks from repeated positions
+    for (int i = 0; i < n; ++i) {
+        selectedLaw[i] *= std::exp(HEGauss() * 0.08);
+    }
+    selectedLaw = HEMath::normalize(selectedLaw);
 
     int k=HEPick(selectedLaw.data(),n);
     if(k<0)k=0;
+    // Update streak tracking
+    {
+        int pickedClass = HEClassOf(winLoss[k]);
+        if (pickedClass == HES.lastMoveClass) HES.consecutiveSameClass++;
+        else HES.consecutiveSameClass = 1;
+        HES.lastMoveClass = pickedClass;
+        if (pickedClass <= HE_GOOD) HES.consecutiveGoodMoves++;
+        else HES.consecutiveGoodMoves = 0;
+    }
     NSLog(@"[ChessAssistantPro] Human choice ELO=%d ply=%d depth=%d candidates=%d classes=%d/%d/%d/%d/%d picked=%d loss=%.1fpp attn=%.2f drift=%.3f eta=%.3f",
           elo,ply,chosenDepth,n,available[0],available[1],available[2],
           available[3],available[4],HEClassOf(winLoss[k]),winLoss[k],

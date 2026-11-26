@@ -1,0 +1,1799 @@
+Chess Assistant Pro — Stockfish Elo 400–1319 source reference
+
+Extracted from the checked-in Tweak.xm at commit 937f863. This file preserves the exact source text and original line numbers for the low Elo policy and its shared helpers.
+
+LIVE 400–1319 MOVE PATH: HEParamsFor, HECoreConfigure, HEParseInfo, HEMath::losses, HEMath::choice, HEMath::targetError, HEMath::fitLaw, HEMath::tilt, HEHumanBias, HECoreChooseMove, and the lowElo branch in CAPExternalEngineMove.
+
+The HEMath namespace also contains equations used only for reporting/diagnostics or other optional timing/statistics features. Their presence in the source does not mean they all change the selected move. The selector uses only Stockfish MultiPV candidates (up to 43), not every legal move.
+
+==========================================================================================
+1. Elo band and parameter formulas — Tweak.xm 1477-1569
+==========================================================================================
+1477: // Low-ELO move selection and FEN feature analysis.
+1478: // Embedded from Humaneengine.mm (new).txt; move policy and all equation groups.
+1479: // Some supplied equation identities are callable diagnostics rather than live
+1480: // move pickers. Theos treats unused static diagnostics as build errors.
+1481: #pragma clang diagnostic push
+1482: #pragma clang diagnostic ignored "-Wunused-function"
+1483: #define HE_BAND_LO            400
+1484: #define HE_BAND_HI            1320         // exclusive
+1485: #define HE_MAX_PV             43
+1486: #define HE_MAX_TRACKED_DEPTH  64
+1487: #define HE_MATE_CP            30000
+1488: #define HE_CMD_LEN            96
+1489: 
+1490: 
+1491: // Move classes by WIN% lost vs Stockfish's best line (same idea as Game Review)
+1492: //    Best/Excellent < 2%      Good 2–5%      Inaccuracy 5–10%       Mistake 10–20%     Blunder 20%+
+1493: enum { HE_TOP = 0, HE_GOOD, HE_INACC, HE_MISTAKE, HE_BLUNDER, HE_NCLASS };
+1494: static const double HEClassLo[HE_NCLASS] = { 0.0, 2.0,             5.0, 10.0, 20.0 };
+1495: 
+1496: 
+1497: 
+1498: // Weaker human-band class targets. Preserve the 600 and 1319 anchors; 400 is
+1499: // a continuous extrapolation of the same formula, not a separate move policy.
+1500: // These are weights before position-specific availability and human biases.
+1501: //                                             top      good   inacc mistake blunder
+1502: static const double HEMix600 [HE_NCLASS] = { 0.08, 0.12, 0.20, 0.25, 0.35 };
+1503: static const double HEMix1319[HE_NCLASS] = { 0.22, 0.23, 0.23, 0.18, 0.14 };
+1504: 
+1505: 
+1506: // Win% for a centipawn score (Lichess curve, close to Game Review)
+1507: static double HEWinPct(int cp) {
+1508:      if (cp >    2000) cp =   2000;
+1509:      if (cp < -2000) cp = -2000;
+1510:      return 50.0 + 50.0 * (2.0 / (1.0 + exp(-0.00368208 * cp)) - 1.0);
+1511: }
+1512: 
+1513: 
+1514: // ===========================================================================
+1515: // MARK: - Band parameters (400 → 1319, anchored at 600)
+1516: // ===========================================================================
+1517: 
+1518: 
+1519: typedef struct {
+1520:      double t;                     // -200/719 at 400, 0 at 600, 1 at 1319
+1521:      int    depth;                 // search depth                         5 → 9
+1522:      int    multipv;               // candidate lines                     43 → 30
+1523:      double mix[HE_NCLASS];        // per-move class probabilities
+1524:      double spotObvious;           // takes a free piece               0.60 → 0.85
+1525:      double spotTactic;            // finds a non-capture win/mate 0.15 → 0.60
+1526:     double spotMate1;          // finds mate in 1              0.85 → 1.00
+1527:     double visW;               // likes "hangs a piece" blunders 1.5 → 0.5
+1528:     int       convThresh;      // winning → fewer errors        500 → 300
+1529:     double quietW;             // weight on quiet moves        0.55 → 0.95
+1530:     double greedBase, aggroBase, fearBase;
+1531: } HEParams;
+1532: 
+1533: 
+1534: static inline int HEHumanBand(int elo) {
+1535:     return elo >= HE_BAND_LO && elo < HE_BAND_HI;
+1536: }
+1537: static inline bool HEPdfBand(int elo) {
+1538:     return elo == 1320 || elo == 1400 || elo == 1600 || elo == 1800;
+1539: }
+1540: 
+1541: 
+1542: static HEParams HEParamsFor(int elo) {
+1543:     HEParams p;
+1544:     double t = (elo - 600.0) / 719.0;
+1545:     if (t < -200.0 / 719.0) t = -200.0 / 719.0;
+1546:     if (t > 1.0) t = 1.0;
+1547:     p.t = t;
+1548: 
+1549: 
+1550:     p.depth          = (int)lround(6.0 + 3.0 * t);
+1551:     p.multipv        = (int)lround(40.0 - 10.0 * t);
+1552:     for (int c = 0; c < HE_NCLASS; c++)
+1553:           p.mix[c]   = HEMix600[c] + (HEMix1319[c] - HEMix600[c]) * t;
+1554:     p.spotObvious = 0.60 + 0.25 * t;
+1555:     p.spotTactic     = 0.15 + 0.45 * t;
+1556:     p.spotMate1      = 0.85 + 0.15 * t;
+1557:     p.visW           = 1.50 - 1.00 * t;
+1558:     p.convThresh     = (int)lround(500.0 - 200.0 * t);
+1559:     p.quietW         = 0.55 + 0.40 * t;
+1560:     p.greedBase      = 1.50 - 0.40 * t;
+1561:     p.aggroBase      = 1.45 - 0.35 * t;
+1562:     p.fearBase       = 0.45 + 0.40 * t;
+1563:     return p;
+1564: }
+1565: 
+1566: 
+1567: // ===========================================================================
+1568: // MARK: - RNG
+1569: // ===========================================================================
+
+==========================================================================================
+2. Board, FEN parsing, legal move features — Tweak.xm 1572-1941
+==========================================================================================
+1572: static inline double HEFrand(void) {
+1573:     return (double)arc4random_uniform(1000000u) / 1000000.0;
+1574: }
+1575: 
+1576: 
+1577: // ===========================================================================
+1578: // MARK: - Board (index 0 = a1 … 63 = h8)
+1579: // ===========================================================================
+1580: typedef struct {
+1581:     char sq[64];             // '.' = empty, uppercase = white, lowercase = black
+1582:     int    whiteToMove;
+1583:     int    epSquare;         // -1 if none
+1584: } HEBoard;
+1585: 
+1586: 
+1587: static inline int HEFile(int s) { return s & 7; }
+1588: static inline int HERank(int s) { return s >> 3; }
+1589: static inline int HEOnBoard(int f, int r) { return f >= 0 && f < 8 && r >= 0 && r < 8; }
+1590: static inline int HESq(int f, int r) { return r * 8 + f; }
+1591: static inline int HEIsWhitePiece(char c) { return c != '.' && isupper((unsigned char)c); }
+1592: 
+1593: 
+1594: static int HEPieceValue(char p) {
+1595:     switch (tolower((unsigned char)p)) {
+1596:           case 'p': return 100;
+1597:           case 'n': return 320;
+1598:           case 'b': return 330;
+1599:           case 'r': return 500;
+1600:           case 'q': return 900;
+1601:           case 'k': return 10000;
+1602:           default:     return 0;
+1603:     }
+1604: }
+1605: 
+1606: 
+1607: static int HEParseSquare(const char *s) {
+1608:     if (!s || !s[0] || !s[1]) return -1;
+1609:     int f = s[0] - 'a';
+1610:     int r = s[1] - '1';
+1611:     if (!HEOnBoard(f, r)) return -1;
+1612:     return HESq(f, r);
+1613: }
+1614: 
+1615: 
+1616: static int HEParseFEN(const char *fen, HEBoard *out) {
+1617:     if (!fen || !out) return 0;
+1618:     memset(out->sq, '.', sizeof(out->sq));
+1619:     out->whiteToMove = 1;
+1620:     out->epSquare         = -1;
+1621: 
+1622: 
+1623:     int rank = 7, file = 0;
+1624:     const char *p = fen;
+1625: 
+1626: 
+1627:     for (; *p && *p != ' '; p++) {
+1628:           if (*p == '/') { rank--; file = 0; if (rank < 0) return 0; continue; }
+1629:           if (isdigit((unsigned char)*p)) { file += *p - '0'; continue; }
+1630:           if (file < 0 || file > 7 || rank < 0) return 0;
+1631:           out->sq[HESq(file, rank)] = *p;
+1632:         file++;
+1633:     }
+1634: 
+1635: 
+1636:     while (*p == ' ') p++;
+1637:     if (*p) { out->whiteToMove = (*p == 'w'); p++; }
+1638: 
+1639: 
+1640:     while (*p == ' ') p++;
+1641:     while (*p && *p != ' ') p++;           // castling rights
+1642:     while (*p == ' ') p++;
+1643:     if (*p && *p != '-') out->epSquare = HEParseSquare(p);
+1644: 
+1645: 
+1646:     return 1;
+1647: }
+1648: 
+1649: 
+1650: // ---------------------------------------------------------------------------
+1651: // Attack detection
+1652: // ---------------------------------------------------------------------------
+1653: 
+1654: 
+1655: static const int HEKnightD[8][2] = {{1,2},{2,1},{2,-1},{1,-2},{-1,-2},{-2,-1},{-2,1},{-1,2}};
+1656: static const int HEKingD[8][2]      = {{0,1},{1,1},{1,0},{1,-1},{0,-1},{-1,-1},{-1,0},{-1,1}};
+1657: static const int HEBishopD[4][2] = {{1,1},{1,-1},{-1,-1},{-1,1}};
+1658: static const int HERookD[4][2]      = {{0,1},{1,0},{0,-1},{-1,0}};
+1659: 
+1660: 
+1661: // Cheapest piece of side `byWhite` attacking sq (0 if none).
+1662: static int HECheapestAttacker(const HEBoard *b, int sq, int byWhite) {
+1663:     int best = 0;
+1664:     int f = HEFile(sq), r = HERank(sq);
+1665: #define HE_TAKE(v) do { if (best == 0 || (v) < best) best = (v); } while (0)
+1666: 
+1667: 
+1668:     int pr = byWhite ? r - 1 : r + 1;
+1669:     char P = byWhite ? 'P' : 'p';
+1670:     if (HEOnBoard(f - 1, pr) && b->sq[HESq(f - 1, pr)] == P) return 100;
+1671:     if (HEOnBoard(f + 1, pr) && b->sq[HESq(f + 1, pr)] == P) return 100;
+1672: 
+1673: 
+1674:     char N = byWhite ? 'N' : 'n';
+1675:     for (int i = 0; i < 8; i++) {
+1676:         int nf = f + HEKnightD[i][0], nr = r + HEKnightD[i][1];
+1677:         if (HEOnBoard(nf, nr) && b->sq[HESq(nf, nr)] == N) { HE_TAKE(320); break; }
+1678:     }
+1679: 
+1680: 
+1681:     for (int i = 0; i < 4; i++) {
+1682:         int nf = f, nr = r;
+1683:         for (;;) {
+1684:             nf += HEBishopD[i][0]; nr += HEBishopD[i][1];
+1685:             if (!HEOnBoard(nf, nr)) break;
+1686:             char c = b->sq[HESq(nf, nr)];
+1687:             if (c == '.') continue;
+1688:             if (c == (byWhite ? 'B' : 'b')) HE_TAKE(330);
+1689:             else if (c == (byWhite ? 'Q' : 'q')) HE_TAKE(900);
+1690:             break;
+1691:         }
+1692:     }
+1693: 
+1694: 
+1695:     for (int i = 0; i < 4; i++) {
+1696:         int nf = f, nr = r;
+1697:         for (;;) {
+1698:             nf += HERookD[i][0]; nr += HERookD[i][1];
+1699:             if (!HEOnBoard(nf, nr)) break;
+1700:             char c = b->sq[HESq(nf, nr)];
+1701:             if (c == '.') continue;
+1702:             if (c == (byWhite ? 'R' : 'r')) HE_TAKE(500);
+1703:             else if (c == (byWhite ? 'Q' : 'q')) HE_TAKE(900);
+1704:             break;
+1705:         }
+1706:     }
+1707: 
+1708: 
+1709:     char K = byWhite ? 'K' : 'k';
+1710:     for (int i = 0; i < 8; i++) {
+1711:         int nf = f + HEKingD[i][0], nr = r + HEKingD[i][1];
+1712:         if (HEOnBoard(nf, nr) && b->sq[HESq(nf, nr)] == K) { HE_TAKE(10000); break; }
+1713:     }
+1714: #undef HE_TAKE
+1715:     return best;
+1716: }
+1717: 
+1718: 
+1719: static inline int HEAttackedBy(const HEBoard *b, int sq, int byWhite) {
+1720:     return HECheapestAttacker(b, sq, byWhite) != 0;
+1721: }
+1722: 
+1723: 
+1724: static int HEFindKing(const HEBoard *b, int white) {
+1725:     char k = white ? 'K' : 'k';
+1726:     for (int i = 0; i < 64; i++) if (b->sq[i] == k) return i;
+1727:     return -1;
+1728: }
+1729: 
+1730: 
+1731: // ---------------------------------------------------------------------------
+1732: // Move application
+1733: // ---------------------------------------------------------------------------
+1734: 
+1735: 
+1736: typedef struct { int from, to; char promo; } HEMove;
+1737: 
+1738: 
+1739: static HEMove HEParseMove(const char *uci) {
+1740:     HEMove m = { -1, -1, 0 };
+1741:     if (!uci || strlen(uci) < 4) return m;
+1742:     m.from     = HEParseSquare(uci);
+1743:     m.to       = HEParseSquare(uci + 2);
+1744:     m.promo = (strlen(uci) >= 5) ? (char)tolower((unsigned char)uci[4]) : 0;
+1745:     return m;
+1746: }
+1747: 
+1748: 
+1749: static HEBoard HEApply(const HEBoard *in, HEMove m) {
+1750:     HEBoard b = *in;
+1751:     if (m.from < 0 || m.to < 0) return b;
+1752: 
+1753: 
+1754:     char piece = b.sq[m.from];
+1755:     char lower = (char)tolower((unsigned char)piece);
+1756:     int     white = HEIsWhitePiece(piece);
+1757: 
+1758: 
+1759:     if (lower == 'p' && m.to == in->epSquare && b.sq[m.to] == '.') {
+1760:            int capSq = white ? m.to - 8 : m.to + 8;
+1761:            if (capSq >= 0 && capSq < 64) b.sq[capSq] = '.';
+1762:     }
+1763: 
+1764: 
+1765:     if (lower == 'k' && abs(HEFile(m.to) - HEFile(m.from)) == 2) {
+1766:         int r=HERank(m.from);
+1767:         if (HEFile(m.to)==6) {
+1768:             b.sq[HESq(5,r)] = b.sq[HESq(7,r)];
+1769:             b.sq[HESq(7,r)] = '.';
+1770:         } else if (HEFile(m.to)==2) {
+1771:             b.sq[HESq(3,r)] = b.sq[HESq(0,r)];
+1772:             b.sq[HESq(0,r)] = '.';
+1773:         }
+1774:     }
+1775:     b.sq[m.to] = m.promo ? (white ? (char)toupper((unsigned char)m.promo) : m.promo) : piece;
+1776:     b.sq[m.from] = '.';
+1777: 
+1778:     b.epSquare = -1;
+1779:     if (lower == 'p' && abs(HERank(m.to) - HERank(m.from)) == 2)
+1780:            b.epSquare = white ? m.from + 8 : m.from - 8;
+1781: 
+1782: 
+1783:     b.whiteToMove = !in->whiteToMove;
+1784:     return b;
+1785: }
+1786: 
+1787: 
+1788: // ===========================================================================
+1789: // MARK: - Move features
+1790: // ===========================================================================
+1791: 
+1792: 
+1793: typedef struct {
+1794:     int isCapture, capturedValue, isRecapture, capturesHigher, givesCheck;
+1795:     int attacksQueen, isBackward, isQuiet, isSamePieceAgain, isPawnPush;
+1796:     int hangsPiece, isDeveloping, isCastle, isEarlyQueenSortie, isRookPawn;
+1797:     int isPromotion, visibleMistake;
+1798: } HEFeatures;
+1799: 
+1800: 
+1801: static int HELastOwnTo = -1;      // destination of our previous move
+1802: static int HEOppLastTo = -1;      // destination of the opponent's last move
+1803: 
+1804: 
+1805: static HEFeatures HEExtract(const HEBoard *b, HEMove m) {
+1806:     HEFeatures f;
+1807:     memset(&f, 0, sizeof(f));
+1808:     if (m.from < 0 || m.to < 0) return f;
+1809: 
+1810: 
+1811:     char piece     = b->sq[m.from];
+1812:     char lower     = (char)tolower((unsigned char)piece);
+1813:     int    white   = HEIsWhitePiece(piece);
+1814:     char target = b->sq[m.to];
+1815: 
+1816: 
+1817:     f.isCapture         = (target != '.') || (lower == 'p' && m.to == b->epSquare);
+1818:     f.capturedValue     = (target != '.') ? HEPieceValue(target) : (f.isCapture ? 100 : 0);
+1819:     f.isRecapture       = f.isCapture && (m.to == HEOppLastTo);
+1820:     f.capturesHigher = f.isCapture && f.capturedValue > HEPieceValue(piece);
+1821:     f.isPromotion       = (m.promo != 0);
+1822:     f.isPawnPush        = (lower == 'p') && !f.isCapture;
+1823:     f.isRookPawn        = (lower == 'p') && (HEFile(m.from) == 0 || HEFile(m.from) == 7);
+1824:     f.isCastle          = (lower == 'k') && abs(HEFile(m.to) - HEFile(m.from)) == 2;
+1825:     f.isSamePieceAgain = (m.from == HELastOwnTo);
+1826: 
+1827: 
+1828:     int dr = HERank(m.to) - HERank(m.from);
+1829:     f.isBackward = white ? (dr < 0) : (dr > 0);
+1830: 
+1831: 
+1832:     int homeRank = white ? 0 : 7;
+1833:     f.isDeveloping          = (lower == 'n' || lower == 'b') && (HERank(m.from) == homeRank);
+1834:     f.isEarlyQueenSortie = (lower == 'q') && (HERank(m.from) == homeRank);
+1835: 
+1836: 
+1837:     HEBoard after = HEApply(b, m);
+1838: 
+1839: 
+1840:     int oppKing     = HEFindKing(&after, !white);
+1841:     f.givesCheck = (oppKing >= 0) && HEAttackedBy(&after, oppKing, white);
+1842: 
+1843: 
+1844:     char oq = white ? 'q' : 'Q';
+1845:     for (int i = 0; i < 64; i++) {
+1846:           if (after.sq[i] != oq) continue;
+1847:           if (HEAttackedBy(&after, i, white)) f.attacksQueen = 1;
+1848:           break;
+1849:     }
+1850: 
+1851: 
+1852:     f.isQuiet = !f.isCapture && !f.givesCheck && !f.isPromotion && !f.attacksQueen;
+1853:     // SEE-lite on the destination square
+1854:     int movedValue = HEPieceValue(after.sq[m.to]);
+1855:     int cheapest      = HECheapestAttacker(&after, m.to, !white);
+1856:     int defended      = HEAttackedBy(&after, m.to, white);
+1857:     if (cheapest && (cheapest < movedValue || !defended)) {
+1858:         if (f.capturedValue - movedValue < -80) f.hangsPiece = 1;
+1859:     }
+1860: 
+1861: 
+1862:     // "Visible" = refutation is one move deep: the moved piece hangs, or any
+1863:     // other piece is attacked by something cheaper OR is attacked and undefended.
+1864:     f.visibleMistake = f.hangsPiece;
+1865:     if (!f.visibleMistake) {
+1866:         for (int i = 0; i < 64; i++) {
+1867:             char c = after.sq[i];
+1868:             if (c == '.' || HEIsWhitePiece(c) != white || i == m.to) continue;
+1869:             char l = (char)tolower((unsigned char)c);
+1870:             if (l == 'p' || l == 'k') continue;
+1871:             int ca = HECheapestAttacker(&after, i, !white);
+1872:             if (!ca) continue;
+1873:             if (ca < HEPieceValue(c) || !HEAttackedBy(&after, i, white)) {
+1874:                    f.visibleMistake = 1;
+1875:                    break;
+1876:             }
+1877:         }
+1878:     }
+1879:     return f;
+1880: }
+1881: 
+1882: 
+1883: // ---------------------------------------------------------------------------
+1884: // Position descriptors
+1885: // ---------------------------------------------------------------------------
+1886: 
+1887: 
+1888: typedef enum { HEOpening = 0, HEMiddlegame = 1, HEEndgame = 2 } HEPhase;
+1889: 
+1890: 
+1891: static int HEPieceCount(const HEBoard *b) {
+1892:     int n = 0;
+1893:     for (int i = 0; i < 64; i++) if (b->sq[i] != '.') n++;
+1894:     return n;
+1895: }
+1896: 
+1897: 
+1898: static int HENonPawnMaterial(const HEBoard *b) {
+1899:     int v = 0;
+1900:     for (int i = 0; i < 64; i++) {
+1901:         char l = (char)tolower((unsigned char)b->sq[i]);
+1902:         if (l == '.' || l == 'p' || l == 'k') continue;
+1903:           v += HEPieceValue(l);
+1904:     }
+1905:     return v;
+1906: }
+1907: 
+1908: 
+1909: static HEPhase HEPhaseOf(const HEBoard *b, int ply) {
+1910:     int npm = HENonPawnMaterial(b);
+1911:     if (npm <= 2200) return HEEndgame;
+1912:     if (ply < 16 && npm >= 5600) return HEOpening;
+1913:     return HEMiddlegame;
+1914: }
+1915: 
+1916: 
+1917: // How sharp the position is: our attacks, their threats, pressure on their king.
+1918: static double HEComplexity(const HEBoard *b, int white) {
+1919:     int ours = 0, theirs = 0, nearKing = 0;
+1920:     for (int i = 0; i < 64; i++) {
+1921:           char c = b->sq[i];
+1922:           if (c == '.') continue;
+1923:           if (HEIsWhitePiece(c) != white) {
+1924:                if (HEAttackedBy(b, i, white)) ours++;
+1925:           } else if (tolower((unsigned char)c) != 'k') {
+1926:                if (HEAttackedBy(b, i, !white)) theirs++;
+1927:           }
+1928:     }
+1929:     int ok = HEFindKing(b, !white);
+1930:     if (ok >= 0) {
+1931:           int f = HEFile(ok), r = HERank(ok);
+1932:           for (int i = 0; i < 8; i++) {
+1933:                int nf = f + HEKingD[i][0], nr = r + HEKingD[i][1];
+1934:                if (HEOnBoard(nf, nr) && HEAttackedBy(b, HESq(nf, nr), white)) nearKing++;
+1935:           }
+1936:     }
+1937:     return ours / 6.0 + theirs / 4.0 + nearKing / 4.0;
+1938: }
+1939: 
+1940: 
+1941: // ===========================================================================
+
+==========================================================================================
+3. Game state, engine configuration, MultiPV parser, human bias — Tweak.xm 1942-2175
+==========================================================================================
+1942: // MARK: - Per-game state
+1943: // ===========================================================================
+1944: 
+1945: 
+1946: typedef struct {
+1947:     double greed, aggro, fear;
+1948:     int       count[HE_NCLASS];     // moves played per class
+1949:     int       misses;               // opponent blunders not punished
+1950:     int       missStreak;           // misses in a row (it notices eventually)
+1951:     int       ownMoves;
+1952:     int       lastCp, haveLastCp;   // our eval after our previous move
+1953:     int       isWhite, init;
+1954: } HEState;
+1955: 
+1956: 
+1957: static std::recursive_mutex HEMutex;  // protects ALL engine global state, including info lines.
+1958: static HEState        HES;
+1959: static HEParams HEHP;
+1960: static double HEClockSeconds = -1.0; // set with HEClockRemainingSeconds(), optional
+1961: static int            HECfgElo = -1;      // last ELO whose options were sent
+1962: 
+1963: 
+1964: static void HEStatsReset(void);
+1965: static void HECoreNewGame(int playingWhite, int elo) {
+1966:     memset(&HES, 0, sizeof(HES));
+1967:     HEStatsReset();
+1968:     HEHP = HEParamsFor(elo);
+1969: 
+1970: 
+1971:     HES.isWhite = playingWhite ? 1 : 0;
+1972:     HES.greed         = HEHP.greedBase + HEFrand() * 0.50;
+1973:     HES.aggro         = HEHP.aggroBase + HEFrand() * 0.45;
+1974:     HES.fear          = HEHP.fearBase     + HEFrand() * 0.30;
+1975:     if (playingWhite) HES.aggro *= 1.20; else HES.fear *= 1.15;
+1976: 
+1977: 
+1978:     HEClockSeconds = -1;
+1979:     HELastOwnTo = -1;
+1980:     HEOppLastTo = -1;
+1981:     HECfgElo          = -1;               // resend engine options
+1982:     HES.init          = 1;
+1983: }
+1984: 
+1985: 
+1986: void HENoteOpponentMove(const char *uci) {
+1987:     std::lock_guard<std::recursive_mutex> lock(HEMutex);
+1988:     HEOppLastTo = HEParseMove(uci).to;
+1989: }
+1990: 
+1991: 
+1992: // ===========================================================================
+1993: // MARK: - UCI plumbing
+1994: // ===========================================================================
+1995: 
+1996: 
+1997: typedef struct {
+1998:     int     cp;              // side-to-move POV, centipawns
+1999:     int     mateIn;          // 0 none, >0 we mate, <0 we get mated
+2000:     int     depth;
+2001:     int     valid;
+2002:     char move[8];
+2003: } HELine;
+2004: 
+2005: 
+2006: static HELine HELines[HE_MAX_PV];
+2007: static int        HELineCount = 0;
+2008: // Keep each depth's complete MultiPV snapshot. The engine may stop halfway
+2009: // through the next depth; the latest line for each index then spans depths.
+2010: static HELine HELinesAtDepth[HE_MAX_TRACKED_DEPTH][HE_MAX_PV];
+2011: static int HEDepthCounts[HE_MAX_TRACKED_DEPTH];
+2012: 
+2013: 
+2014: void HEResetLines(void) {
+2015:     std::lock_guard<std::recursive_mutex> lock(HEMutex);
+2016:     memset(HELines, 0, sizeof(HELines));
+2017:     HELineCount = 0;
+2018:     memset(HELinesAtDepth, 0, sizeof(HELinesAtDepth));
+2019:     memset(HEDepthCounts, 0, sizeof(HEDepthCounts));
+2020: }
+2021: // Fills `out` with UCI commands (last one is "go"). Options are only resent
+2022: // when the ELO changes or a new game starts.
+2023: static int HECoreConfigure(int elo, char out[][HE_CMD_LEN], int max) {
+2024:     int n = 0;
+2025: #define HE_ADD(...) do { if (n < max) snprintf(out[n++], HE_CMD_LEN, __VA_ARGS__); } while (0)
+2026: 
+2027: 
+2028:     HEResetLines();
+2029:     int fresh = (elo != HECfgElo);
+2030:     HECfgElo = elo;
+2031: 
+2032: 
+2033:     if (!HEHumanBand(elo)) {
+2034:         if (fresh) {
+2035:             HE_ADD("setoption name MultiPV value 1");
+2036:             HE_ADD("setoption name Skill Level value 20");
+2037:             if (elo < 3190) {
+2038:                    HE_ADD("setoption name UCI_LimitStrength value true");
+2039:                    HE_ADD("setoption name UCI_Elo value %d", elo);
+2040:             } else {
+2041:                    HE_ADD("setoption name UCI_LimitStrength value false");
+2042:             }
+2043:         }
+2044:         HE_ADD("go movetime 200");
+2045:         return n;
+2046:     }
+2047: 
+2048: 
+2049:     if (!HES.init) HECoreNewGame(1, elo);
+2050:     HEHP = HEParamsFor(elo);
+2051: 
+2052: 
+2053:     if (fresh) {
+2054:         HE_ADD("setoption name UCI_LimitStrength value false");
+2055:         HE_ADD("setoption name Threads value 1");
+2056:         HE_ADD("setoption name Skill Level value 20");       // honest scores
+2057:         HE_ADD("setoption name MultiPV value %d", HEHP.multipv);
+2058:     }
+2059:     HE_ADD("go depth %d movetime 1500", HEHP.depth + (int)arc4random_uniform(2));
+2060: #undef HE_ADD
+2061:     return n;
+2062: }
+2063: 
+2064: 
+2065: // Parses "info depth D ... multipv K score cp X ... pv MOVE ..."
+2066: void HEParseInfo(const char *line) {
+2067:     std::lock_guard<std::recursive_mutex> lock(HEMutex);
+2068:     if (!line) return;
+2069:     if (!strstr(line, " multipv ") || !strstr(line, " pv ")) return;
+2070:     if (strstr(line, " lowerbound") || strstr(line, " upperbound")) return;
+2071:     int idx = 0, cp = 0, mate = 0, depth = 0, haveScore = 0;
+2072:     char mv[8] = {0};
+2073: 
+2074: 
+2075:     const char *p = strstr(line, " multipv ");
+2076:     idx = atoi(p + 9);
+2077:     if (idx < 1 || idx > HE_MAX_PV) return;
+2078: 
+2079: 
+2080:     p = strstr(line, " depth ");
+2081:     if (p) depth = atoi(p + 7);
+2082: 
+2083: 
+2084:     p = strstr(line, " score cp ");
+2085:     if (p) { cp = atoi(p + 10); haveScore = 1; }
+2086: 
+2087: 
+2088:     p = strstr(line, " score mate ");
+2089:     if (p) {
+2090:         mate = atoi(p + 12);
+2091:         cp = (mate > 0) ? (HE_MATE_CP - mate) : (-HE_MATE_CP - mate);
+2092:         haveScore = 1;
+2093:     }
+2094:     if (!haveScore) return;
+2095: 
+2096: 
+2097:     p = strstr(line, " pv ") + 4;
+2098:     int n = 0;
+2099:     while (*p && *p != ' ' && n < 7) mv[n++] = *p++;
+2100:     mv[n] = 0;
+2101:     if (n < 4 || n > 5) return;
+2102:     HEMove parsed=HEParseMove(mv);
+2103:     if(parsed.from<0||parsed.to<0||depth<1) return;
+2104:     if(n==5 && mv[4]!='q' && mv[4]!='r' && mv[4]!='b' && mv[4]!='n') return;
+2105: 
+2106:     HELine *l = &HELines[idx - 1];
+2107:     l->cp        = cp;
+2108:     l->mateIn = mate;
+2109:     l->depth     = depth;
+2110:     l->valid     = 1;
+2111:     memcpy(l->move, mv, sizeof(l->move));
+2112: 
+2113: 
+2114:     if (idx > HELineCount) HELineCount = idx;
+2115:     if (depth < HE_MAX_TRACKED_DEPTH) {
+2116:         HELine *snapshot = &HELinesAtDepth[depth][idx - 1];
+2117:         if (!snapshot->valid) ++HEDepthCounts[depth];
+2118:         *snapshot = *l;
+2119:     }
+2120: }
+2121: 
+2122: 
+2123: // ===========================================================================
+2124: // MARK: - Human bias
+2125: // ===========================================================================
+2126: 
+2127: 
+2128: static double HEHumanBias(const HEFeatures *f, int ply) {
+2129:     double t = HEHP.t, inv = 1.0 - t, w = 1.0;
+2130: 
+2131: 
+2132:     if (f->isCapture)          w *= HES.greed;
+2133:     if (f->isRecapture)        w *= 1.0 + 0.90 * inv;
+2134:     if (f->capturesHigher)      w *= 1.0 + 0.60 * inv;
+2135:     if (f->givesCheck)          w *= HES.aggro;
+2136:     if (f->attacksQueen)        w *= 1.0 + 0.30 * inv;
+2137:     if (f->isPromotion)         w *= 1.6;
+2138: 
+2139: 
+2140:     if (f->isBackward)          w *= HES.fear;
+2141:     if (f->isQuiet)             w *= HEHP.quietW;
+2142:     if (f->isSamePieceAgain) w *= 1.0 + 0.35 * inv;
+2143:     if (f->isPawnPush)          w *= 1.0 + 0.20 * inv;
+2144:     if (f->hangsPiece)          w *= 0.25 + 0.60 * t;
+2145: 
+2146: 
+2147:     if (ply < 16) {
+2148:         if (f->isDeveloping)          w *= 1.15 + 0.35 * t;
+2149:         if (f->isCastle)              w *= 0.65 + 0.45 * t;
+2150:         if (f->isEarlyQueenSortie) w *= 1.0 + 0.55 * inv;
+2151:         if (f->isRookPawn)            w *= 0.45 + 0.45 * t;
+2152:     }
+2153: 
+2154: 
+2155:     if (w < 0.01) w = 0.01;
+2156:     return w;
+2157: }
+2158: 
+2159: 
+2160: // Weighted random index over w[0..n), -1 if all zero.
+2161: static int HEPick(const double *w, int n) {
+2162:     double sum = 0.0;
+2163:     for (int i = 0; i < n; i++) sum += w[i];
+2164:     if (sum <= 0.0) return -1;
+2165:     double r = HEFrand() * sum, acc = 0.0;
+2166:     int last = -1;
+2167:     for (int i = 0; i < n; i++) {
+2168:         if (w[i] <= 0.0) continue;
+2169:         last = i;
+2170:         acc += w[i];
+2171:         if (r < acc) return i;
+2172:     }
+2173:     return last;
+2174: }
+2175: 
+
+==========================================================================================
+4. Shared probability mathematics — Tweak.xm 2265-2748
+==========================================================================================
+2265: namespace HEMath {
+2266: using Vec = std::vector<double>;
+2267: constexpr double pi = 3.141592653589793238462643383279502884;
+2268: constexpr double tiny = 1.0e-300;
+2269: static double clamp(double x, double lo, double hi) { return std::max(lo, std::min(hi, x)); }
+2270: static double safeLog(double x) { return std::log(std::max(x, tiny)); }
+2271: static double sq(double x) { return x*x; }
+2272: static double total(const Vec& a) { return std::accumulate(a.begin(),a.end(),0.0); }
+2273: static Vec normalize(Vec a) {
+2274:     double sum=0; for (double &x:a) {x=std::isfinite(x)?std::max(0.0,x):0.0;sum+=x;}
+2275:     if(a.empty())return a;
+2276:     if(sum<=0){std::fill(a.begin(),a.end(),1.0/a.size());return a;}
+2277:     for(double &x:a)x/=sum;return a;
+2278: }
+2279: static double dot(const Vec &a,const Vec &b) {
+2280:     if(a.size()!=b.size())throw std::invalid_argument("HEMath dot: vector size mismatch");
+2281:     double v=0;for(size_t i=0;i<a.size();++i)v+=a[i]*b[i];return v;
+2282: }
+2283: static double entropy(const Vec &p) {double h=0;for(double v:p)if(v>0)h-=v*std::log(v);return h;}
+2284: // 01: scaled score loss and sign-safe transform.
+2285: static double phi(double v){return std::copysign(std::log1p(std::fabs(v)),v);}
+2286: static Vec losses(const Vec& v) {Vec d(v.size());if(v.empty())return d;
+2287:     double top=*std::max_element(v.begin(),v.end());
+2288:     for(size_t i=0;i<v.size();++i)d[i]=std::max(0.0,phi(top)-phi(v[i]));return d;
+2289: }
+2290: // 02,03,73-75: implicit Regan-Haworth normalization with analytic g', g'';
+2291: // safeguarded Newton + bisection; equality, extremes, and overflow covered.
+2292: struct Law {Vec p,w,d;double p0=1,s=0,c=0;int iterations=0;
+2293:     double g(double x)const{double z=0;for(double wi:w)z+=std::exp(wi*safeLog(x));return z;}
+2294:     double gp(double x)const{double z=0;for(double wi:w)z+=wi*std::exp((wi-1)*safeLog(x));return z;}
+2295:     double gpp(double x)const{double z=0;for(double wi:w)z+=wi*(wi-1)*std::exp((wi-2)*safeLog(x));return z;}
+2296:     double newtonQuadraticBound(double rootError,double high)const{
+2297:         // Eq 75: M=max_{p in [p*,high]} g''(p), not merely g''(high).
+2298:         // For 1<w<2 the curvature DECREASES; for w>2 it increases.
+2299:         if(!(high>=p0&&high<=1.0&&p0>0))return NAN;
+2300:         double M=0.0;
+2301:         for(double wi:w)if(wi>1.0){
+2302:             const double at=(wi<2.0)?p0:high;
+2303:             M+=wi*(wi-1.0)*std::exp((wi-2.0)*safeLog(at));
+2304:         }
+2305:         return M/std::max(2*gp(p0),tiny)*sq(rootError);
+2306:     }
+2307: };
+2308: static Law choice(const Vec &d,double s,double c){
+2309:     if(!(s>0&&c>0)||!std::isfinite(s)||!std::isfinite(c))throw std::invalid_argument("HEMath choice: positive finite s,c required");
+2310:     Law out;out.d=d;out.s=s;out.c=c;out.w.resize(d.size());out.p.resize(d.size());
+2311:     if(d.empty())return out;
+2312:     for(size_t i=0;i<d.size();++i){
+2313:         if(d[i]<0||!std::isfinite(d[i]))throw std::invalid_argument("HEMath choice: invalid loss");
+2314:         double exponent=std::pow(d[i]/s,c);
+2315:         out.w[i]=std::exp(std::min(exponent,40.0)); // numerical cap; not statistical calibration
+2316:     }
+2317:     double low=0.0,high=1.0,x=1.0/out.w.size();
+2318:     for(int it=0;it<160;++it){
+2319:         double gx=out.g(x)-1.0;out.iterations=it+1;
+2320:         if(std::fabs(gx)<1e-13||high-low<1e-15)break;
+2321:         if(gx>0)high=x;else low=x;
+2322:         double dfx=out.gp(x);double y=(dfx>tiny)?x-gx/dfx:std::numeric_limits<double>::quiet_NaN();
+2323:         x=(std::isfinite(y)&&y>low&&y<high)?y:0.5*(low+high);
+2324:     }
+2325:     out.p0=x;
+2326:     for(size_t i=0;i<d.size();++i)out.p[i]=std::exp(out.w[i]*safeLog(x));
+2327:     out.p=normalize(out.p);
+2328:     return out;
+2329: }
+2330: // Section 8.3: the PDF's independent five-move example is a regression check
+2331: // for the root and probability ordering. It is not a low-Elo calibration.
+2332: static bool referenceSolverCheck(){
+2333:     const Law law=choice({0.0,.04,.12,.28,.55},.098,.483);
+2334:     const double expected[]={.5264203468554158,.2930243324562274,
+2335:         .1447172973036302,.0341823572108512,.0016556661738753};
+2336:     if(law.p.size()!=5||law.iterations>20||
+2337:        std::fabs(law.g(law.p0)-1.0)>1.e-12)return false;
+2338:     for(size_t i=0;i<5;++i)
+2339:         if(std::fabs(law.p[i]-expected[i])>1.e-10)return false;
+2340:     return true;
+2341: }
+2342: // 04,11: historical intrinsic performance rating and inversion (not actual Elo).
+2343: static double expectedError(const Vec&p,const Vec&d){return dot(p,d);}
+2344: static double intrinsicRating(double ae){return 3571.0-15413.0*ae;}
+2345: static double targetError(int rating){return std::max(0.0,(3571.0-rating)/15413.0);}
+2346: // 05,18: conditional moments and Fisher variance in outcome quality.
+2347: static double mean(const Vec&p,const Vec&u){return dot(p,u);}
+2348: static double variance(const Vec&p,const Vec&u){double m=mean(p,u),v=0;
+2349:     for(size_t i=0;i<p.size();++i)v+=p[i]*sq(u[i]-m);return std::max(0.0,v);}
+2350: // 06-08: stationary mean-reverting model / lag-1 regularity diagnostic.
+2351: static double revert(double M,double e,double k){return (1-k)*M+e;}
+2352: static double stationaryVariance(double k){return 1.0/(k*(2-k));}
+2353: static double incrementVariance(double k){return 2.0/(2.0-k);}
+2354: static double lagOneCovariance(double k){return -k/(2.0-k);}
+2355: static double lagOneCorrelation(double k){return -0.5*k;}
+2356: // 09: log-normal decision-time law, conditional on entropy + remaining clock.
+2357: static double timeLogMean(double b0,double b1,double b2,double H,double clockSec){
+2358:     return b0+b1*H+b2*std::log(std::max(clockSec,0.001));}
+2359: static double normalLogDensity(double y,double m,double sd){
+2360:     if(!(sd>0))return -INFINITY;return -.5*sq((y-m)/sd)-std::log(sd)-.5*std::log(2*pi);}
+2361: static double logNormalLogDensity(double elapsed,double motor,double m,double sd){
+2362:     if(elapsed<=motor)return -INFINITY;
+2363:     double t=elapsed-motor;return normalLogDensity(std::log(t),m,sd)-std::log(t);
+2364: }
+2365: // 10: limits are tested by choice(d,s,c), s->0 and s->infinity.
+2366: // 12: deterministic depth-limited point-mass policy for comparison, not generation.
+2367: static Vec depthPolicy(const Vec&v){Vec q(v.size(),0);if(!v.empty())q[std::max_element(v.begin(),v.end())-v.begin()]=1;return q;}
+2368: // 10: compute both limits explicitly using the exact same normalization solver.
+2369: static std::pair<Vec,Vec> sensitivityLimits(const Vec&d,double consistency){
+2370:     return {choice(d,1.e-8,consistency).p,choice(d,1.e8,consistency).p};
+2371: }
+2372: // 13-16: drift diffusion, first-exit density/mean, entropy/clock-dependent drift.
+2373: struct Diffusion {double mu=0,B=1,sigma=1,motor=0;};
+2374: static double expectedExit(const Diffusion &a){if(a.B<=0||a.sigma<=0)return NAN;
+2375:     if(std::fabs(a.mu)<1e-8)return sq(a.B/a.sigma);
+2376:     return a.B/a.mu*std::tanh(a.mu*a.B/sq(a.sigma));}
+2377: static double exitDensity(double t,const Diffusion&a,int terms=160){
+2378:     if(!(t>0&&a.B>0&&a.sigma>0))return 0;
+2379:     double z=0,kappa=sq(pi*a.sigma)/(8*sq(a.B));
+2380:     for(int k=0;k<terms;++k){double term=(2*k+1)*std::exp(-sq(2*k+1)*kappa*t);
+2381:         z+=(k&1)?-term:term;if(k>10&&term<1e-14)break;}
+2382:     double h=a.mu*a.B/sq(a.sigma), pref;
+2383:     // log(cosh) avoids overflow.
+2384:     double logcosh=std::fabs(h)+std::log1p(std::exp(-2*std::fabs(h)))-std::log(2.0);
+2385:     pref=std::exp(logcosh-sq(a.mu)*t/(2*sq(a.sigma)));
+2386:     return std::max(0.0,pref*kappa*4/pi*z);
+2387: }
+2388: static Diffusion diffusion(double entropyX,double clock,double secondGap,double sensitivity,
+2389:                             double b0,double b1,double b2,double m0,double m1){
+2390:     Diffusion a; a.B=std::max(.05,b0+b1*entropyX+b2*std::log(std::max(clock,.001)));
+2391:     a.mu=m0+m1*secondGap/std::max(sensitivity,1e-10);return a;}
+2392: // 13: direct first passage of a drifted Wiener process; optional simulation
+2393: // for testing the theoretical density against Monte Carlo, not move generation.
+2394: static double simulateFirstExit(const Diffusion&a,std::mt19937_64 &rng,double dt=.002){
+2395:     if(!(dt>0&&a.B>0&&a.sigma>0))return NAN;
+2396:     std::normal_distribution<double> normal(0,1);
+2397:     double x=0;
+2398:     for(int k=1;k<=5000000;++k){
+2399:         x+=a.mu*dt+a.sigma*std::sqrt(dt)*normal(rng);
+2400:         if(std::fabs(x)>=a.B)return k*dt;
+2401:     }
+2402:     return NAN; // right-censored simulation, caller must account for censoring
+2403: }
+2404: // 17-20: exponential tilt, cumulants, KL and local score expansion.
+2405: static Vec tilt(const Vec&p,const Vec&q,double theta){
+2406:     if(p.size()!=q.size())throw std::invalid_argument("HEMath tilt: vector size mismatch");
+2407:     Vec logs(p.size()),r(p.size());double mx=-INFINITY;
+2408:     for(size_t i=0;i<p.size();++i){logs[i]=safeLog(p[i])+theta*q[i];mx=std::max(mx,logs[i]);}
+2409:     for(size_t i=0;i<p.size();++i)r[i]=std::exp(logs[i]-mx);return normalize(r);
+2410: }
+2411: static double logPartition(const Vec&p,const Vec&q,double theta){
+2412:     double mx=-INFINITY;for(size_t i=0;i<p.size();++i)mx=std::max(mx,safeLog(p[i])+theta*q[i]);
+2413:     double sum=0;for(size_t i=0;i<p.size();++i)sum+=std::exp(safeLog(p[i])+theta*q[i]-mx);
+2414:     return mx+std::log(std::max(sum,tiny));
+2415: }
+2416: static double kl(const Vec&a,const Vec&b){if(a.size()!=b.size())throw std::invalid_argument("HEMath KL size mismatch");
+2417:     double d=0;for(size_t i=0;i<a.size();++i)if(a[i]>0)d+=a[i]*(std::log(a[i])-safeLog(b[i]));return std::max(0.0,d);}
+2418: static double localLogLR(double theta,double qMinusMu,double v){return theta*qMinusMu-.5*sq(theta)*v;}
+2419: // 21: standardized score statistic; 22: Elo-to-expected-score gain.
+2420: static double standardizedScore(double sumCentered,double sumV){return sumV>0?sumCentered/std::sqrt(sumV):0;}
+2421: static double eloToScoreGain(double deltaR){return .5*std::tanh(std::log(10.0)*deltaR/800.0);}
+2422: // 23-27: joint choice/time likelihood, information chain and Gaussian time KL.
+2423: static double jointLog(double moveProbability,double logTimePdf){return safeLog(moveProbability)+logTimePdf;}
+2424: static double jointKL(const Vec&piX,const Vec&p0X,const Vec&conditionalKL){return kl(piX,p0X)+dot(piX,conditionalKL);}
+2425: static double logOneStepRatio(double q,double p,double f1Log,double f0Log){
+2426:     return safeLog(q)-safeLog(p)+f1Log-f0Log;}
+2427: static double logNormalKL(double m1,double m0,double sd){return sq(m1-m0)/(2*sq(sd));}
+2428: // 28-31: log-domain sequential product and always-valid crossing threshold,
+2429: // conditional on correctly specified p0 and a predictable alternative.
+2430: static double appendLogEvidence(double cumulative,double step){return cumulative+step;}
+2431: static double logThreshold(double alpha){return -std::log(alpha);}
+2432: static bool crossed(double evidence,double alpha){return evidence>=logThreshold(alpha);}
+2433: static double thresholdObservations(double alpha,double d){return d>0?logThreshold(alpha)/d:INFINITY;}
+2434: // 32-35,39-40,70: composite rating model and bounded rating paths.
+2435: static bool ratingStepAllowed(int prev,int next,int lo,int hi,int velocity){
+2436:     return next>=lo&&next<=hi&&prev>=lo&&prev<=hi&&std::abs(next-prev)<=velocity;}
+2437: static double maxLogPath(const std::vector<Vec>&ll,const Vec&ratings,double maxVelocity){
+2438:     if(ll.empty())return 0;
+2439:     size_t n=ratings.size();if(n==0)return -INFINITY;
+2440:     Vec previous=ll.front();if(previous.size()!=n)throw std::invalid_argument("HEMath rating lattice mismatch");
+2441:     for(size_t t=1;t<ll.size();++t){
+2442:         if(ll[t].size()!=n)throw std::invalid_argument("HEMath rating path mismatch");
+2443:         Vec next(n,-INFINITY);
+2444:         for(size_t j=0;j<n;++j)for(size_t k=0;k<n;++k)
+2445:             if(std::fabs(ratings[j]-ratings[k])<=maxVelocity)
+2446:                 next[j]=std::max(next[j],previous[k]+ll[t][j]);
+2447:         previous.swap(next);
+2448:     }
+2449:     return *std::max_element(previous.begin(),previous.end());
+2450: }
+2451: static double compositeLogEvidence(double numerator,const std::vector<Vec>&ll,const Vec&ratings,double maxVelocity){
+2452:     return numerator-maxLogPath(ll,ratings,maxVelocity);}
+2453: static double compositeDecomposition(double lnNumerator,double unrestricted,double constrained){
+2454:     return (lnNumerator-unrestricted)+(unrestricted-constrained);}
+2455: // 33: one-game path-conditional log-likelihood. Missing clock data is not
+2456: // silently estimated: use a move-only conditional law when timeObserved=false.
+2457: static double pathConditionalLog(double pMove,double baselineLogTime,bool timeObserved){
+2458:     return safeLog(pMove)+(timeObserved?baselineLogTime:0.0);
+2459: }
+2460: // 39: effective divergence to a finite reference family of rating profiles.
+2461: static double minFamilyKL(const Vec&alternative,const std::vector<Vec>&ratingLaws){
+2462:     if(ratingLaws.empty())return NAN;
+2463:     double d=INFINITY;
+2464:     for(const Vec&law:ratingLaws)d=std::min(d,kl(alternative,law));
+2465:     return d;
+2466: }
+2467: // 36-38,71: binary KL and necessary sample sizes for alpha / power.
+2468: static double binaryKL(double p,double q){
+2469:     if(!(p>=0&&p<=1&&q>=0&&q<=1))throw std::invalid_argument("HEMath binaryKL: probabilities outside [0,1]");
+2470:     if(q==0)return p==0?0:INFINITY;
+2471:     if(q==1)return p==1?0:INFINITY;
+2472:     p=clamp(p,0,1);q=clamp(q,tiny,1-tiny);
+2473:     return (p>0?p*std::log(p/q):0)+(p<1?(1-p)*std::log((1-p)/(1-q)):0);
+2474: }
+2475: static double minimumSamples(double alpha,double beta,double kl10,double kl01){
+2476:     if(!(alpha>0&&alpha<1&&beta>0&&beta<1))return INFINITY;
+2477:     if(kl10<=0||kl01<=0)return INFINITY;
+2478:     return std::max(binaryKL(1-beta,alpha)/kl10,binaryKL(alpha,1-beta)/kl01);
+2479: }
+2480: static double effectiveSampleLower(double alpha,double beta,double dEff,double lambda=1){
+2481:     if(!(dEff>0&&lambda>0))return INFINITY;
+2482:     return binaryKL(1-beta,std::pow(alpha,1/lambda))/dEff;
+2483: }
+2484: // 41-44,63: rating scores and scale sensitivity (analytic and finite-difference).
+2485: static Vec scaleScore(const Law&l){
+2486:     Vec r(l.p.size(),0);double mnum=0,mden=0;
+2487:     for(size_t i=0;i<r.size();++i){mnum+=l.p[i]*l.w[i]*std::log(l.w[i]);mden+=l.p[i]*l.w[i];}
+2488:     double avg=mden>0?mnum/mden:0;
+2489:     double a=l.c/l.s*std::log(1/std::max(l.p0,tiny));
+2490:     for(size_t i=0;i<r.size();++i)r[i]=a*(l.w[i]*std::log(l.w[i])-l.w[i]*avg);
+2491:     return r;
+2492: }
+2493: static Vec ratingScore(const Law&l,double dsByRating){Vec r=scaleScore(l);for(double &v:r)v*=dsByRating;return r;}
+2494: static Vec scoreTilt(const Vec&q,const Vec&p){Vec a(q.size());double m=mean(p,q);
+2495:     for(size_t i=0;i<a.size();++i)a[i]=q[i]-m;return a;}
+2496: // 45-50: Fisher matrix, orthogonal information, constrained rate corridor.
+2497: struct Fisher {double rr=0,rt=0,tt=0;
+2498:     double effective()const{return rr>tiny?std::max(0.0,tt-sq(rt)/rr):tt;}
+2499:     double correlationSquared()const{return rr*tt>tiny?clamp(sq(rt)/(rr*tt),0,1):0;}
+2500: };
+2501: static Fisher fisher(const Vec&p,const Vec&sr,const Vec&st){
+2502:     Fisher f;for(size_t i=0;i<p.size();++i){f.rr+=p[i]*sq(sr[i]);f.rt+=p[i]*sr[i]*st[i];f.tt+=p[i]*sq(st[i]);}return f;
+2503: }
+2504: static bool informationCollapse(const Fisher&f,double threshold=1e-6){return f.tt>tiny&&f.effective()<threshold*f.tt;}
+2505: static Vec orthogonal(const Vec&h,const Vec&sr,const Vec&p){
+2506:     double varR=0,cov=0;
+2507:     for(size_t i=0;i<p.size();++i){varR+=p[i]*sq(sr[i]);cov+=p[i]*h[i]*sr[i];}
+2508:     Vec out=h;double coef=varR>tiny?cov/varR:0;
+2509:     for(size_t i=0;i<p.size();++i)out[i]-=coef*sr[i];return out;
+2510: }
+2511: static double effectivePerturbation(double epsilon,const Vec&p,const Vec&hPerp){
+2512:     Vec square(hPerp.size());for(size_t i=0;i<hPerp.size();++i)square[i]=sq(hPerp[i]);
+2513:     return .5*sq(epsilon)*dot(p,square);
+2514: }
+2515: static double constrainedInformation(double theta,const Fisher&f,double unconstrainedR,double maxR){
+2516:     return .5*sq(theta)*f.effective()+.5*f.rr*sq(std::max(0.0,unconstrainedR-maxR));
+2517: }
+2518: static double informationWithTiming(const Fisher&f,double timingRatingInfo){
+2519:     return f.tt-sq(f.rt)/std::max(tiny,f.rr+std::max(0.0,timingRatingInfo));}
+2520: // 51-56: misspecification sensitivity and e-process calibration diagnostics.
+2521: static double chiSquared(const Vec&p,const Vec&q){double v=0;
+2522:     for(size_t i=0;i<p.size();++i)v+=sq(p[i]-q[i])/std::max(q[i],tiny);return v;}
+2523: static double mismatchCovarianceBound(double chiAlt,double chiTrue){return std::sqrt(chiAlt*chiTrue);}
+2524: static double expectedLogDrift(double klTrueModel,double klTrueAlt){return klTrueModel-klTrueAlt;}
+2525: static double fractionalCrossing(double alpha,double lambda){return std::pow(alpha,lambda);}
+2526: static double tiltedMoment(const Vec&p,const Vec&q,double theta0,double theta,double lambda){
+2527:     return std::exp(logPartition(p,q,theta0+lambda*theta)
+2528:         -logPartition(p,q,theta0)-lambda*logPartition(p,q,theta));
+2529: }
+2530: static double inflationExponent(double mismatch,double altKL){
+2531:     return altKL>0?clamp(1-2*std::sqrt(std::max(0.0,mismatch)/altKL),0,1):0;}
+2532: static double criticalMismatch(double altKL){return .25*altKL;}
+2533: // 57-60: history-conditional projection and conditional-information decomposition.
+2534: static Vec historyAverage(const std::vector<Vec>&laws,const Vec&freq){
+2535:     if(laws.empty())return {};
+2536:     if(laws.size()!=freq.size())throw std::invalid_argument("HEMath historyAverage: history/weight mismatch");
+2537:     for(const Vec& law:laws)if(law.size()!=laws.front().size())
+2538:         throw std::invalid_argument("HEMath historyAverage: law size mismatch");
+2539:     Vec a(laws[0].size(),0);Vec freqN=normalize(freq);
+2540:     for(size_t k=0;k<laws.size();++k)for(size_t i=0;i<a.size();++i)a[i]+=freqN[k]*laws[k][i];
+2541:     return normalize(a);
+2542: }
+2543: static double conditionalMutualInformation(const std::vector<Vec>&laws,const Vec&freq){
+2544:     Vec avg=historyAverage(laws,freq),f=normalize(freq);double mi=0;
+2545:     for(size_t i=0;i<laws.size();++i)mi+=f[i]*kl(laws[i],avg);return mi;}
+2546: static double historyConditionalRatioMean(const Vec&historyLaw,const Vec&alternative,const Vec&baseline){
+2547:     if(historyLaw.size()!=alternative.size()||alternative.size()!=baseline.size())
+2548:         throw std::invalid_argument("HEMath historyConditionalRatioMean: law size mismatch");
+2549:     double out=0;
+2550:     for(size_t i=0;i<historyLaw.size();++i)
+2551:         out+=historyLaw[i]*alternative[i]/std::max(baseline[i],tiny);
+2552:     return out;
+2553: }
+2554: // 60: history-conditional sequential product; ratios supplied per history
+2555: // and state after conditioning, so the environment transition cancels.
+2556: static double historySequentialLog(const Vec&historyLogRatios){return total(historyLogRatios);}
+2557: // 61-64: two-regime information, sensitivity and inverse-Gaussian KL.
+2558: static double clockRegimeKL(const Vec&p2,const Vec&p1,const Vec&timeKL){return jointKL(p2,p1,timeKL);}
+2559: static double sensitivityFisher(const Law&l){Vec s=scaleScore(l);return variance(l.p,s);}
+2560: // 43: derivatives with respect to rating, assuming ds/dR supplied by fit.
+2561: static Vec exponentRatingDerivative(const Law&l,double dsByRating){
+2562:     Vec out(l.w.size());
+2563:     for(size_t i=0;i<out.size();++i)
+2564:         out[i]=-l.c*dsByRating/l.s*l.w[i]*std::log(l.w[i]);
+2565:     return out;
+2566: }
+2567: static Vec logProbabilityRatingDerivative(const Law&l,double dsByRating){
+2568:     Vec out(l.p.size());
+2569:     if(out.empty())return out;
+2570:     const Vec dw=exponentRatingDerivative(l,dsByRating);
+2571:     double denom=dot(l.p,l.w);
+2572:     double dp0=-safeLog(l.p0)*dot(l.p,dw)/std::max(denom,tiny);
+2573:     for(size_t i=0;i<out.size();++i)
+2574:         out[i]=dw[i]*safeLog(l.p0)+l.w[i]*dp0;
+2575:     return out;
+2576: }
+2577: // 51: E_true[L]=1+Cov_p0(L,p_true/p0), when L=q/p0.
+2578: static double mismatchExpectation(const Vec&trueLaw,const Vec&alternative,const Vec&reference){
+2579:     if(trueLaw.size()!=alternative.size()||reference.size()!=alternative.size())
+2580:         throw std::invalid_argument("HEMath mismatchExpectation: law size mismatch");
+2581:     double v=0;
+2582:     for(size_t i=0;i<trueLaw.size();++i)
+2583:         v+=trueLaw[i]*alternative[i]/std::max(reference[i],tiny);
+2584:     return v;
+2585: }
+2586: // 58: E_H[KL(p_h || H0)] = I(A;H | x) + KL(p_bar || H0).
+2587: static double historyInformationDecomposition(const std::vector<Vec>&laws,
+2588:         const Vec&frequencies,const Vec&reference){
+2589:     return conditionalMutualInformation(laws,frequencies)
+2590:         +kl(historyAverage(laws,frequencies),reference);
+2591: }
+2592: // 62: exact regime KL and its second-order local sensitivity approximation.
+2593: static std::pair<double,double> sensitivityRegimeDivergence(const Law&start,
+2594:         const Law&end){
+2595:     if(start.p.size()!=end.p.size())throw std::invalid_argument("HEMath sensitivityRegimeDivergence: size mismatch");
+2596:     return {kl(end.p,start.p),.5*sq(end.s-start.s)*sensitivityFisher(start)};
+2597: }
+2598: static double inverseGaussianKL(double m2,double shape2,double m1,double shape1){
+2599:     // Eq 64, IG(mean m2, shape2) || IG(mean m1, shape1).
+2600:     if(m1<=0||m2<=0||shape1<=0||shape2<=0)return NAN;
+2601:     return .5*(std::log(shape1/shape2)+shape2/shape1-1.0
+2602:                 +shape1*sq(m2-m1)/(sq(m1)*m2));
+2603: }
+2604: // 65-67: two-regime absorbed diffusion (eigen expansions + quadrature).
+2605: // These are only evaluated if a caller supplies clock-change parameters.
+2606: static double transitionStateDensity(double y,double t,const Diffusion&a,int terms=180){
+2607:     if(!(t>0&&a.B>0&&std::fabs(y)<a.B))return 0;
+2608:     double z=0;for(int n=1;n<=terms;++n){
+2609:         double term=std::sin(n*pi/2)*std::sin(n*pi*(y+a.B)/(2*a.B))
+2610:             *std::exp(-sq(n*pi*a.sigma)*t/(8*sq(a.B)));
+2611:         z+=term;if(n>24&&std::fabs(term)<1e-14)break;
+2612:     }
+2613:     return std::max(0.0,std::exp(a.mu*y/sq(a.sigma)-sq(a.mu)*t/(2*sq(a.sigma)))*z/a.B);
+2614: }
+2615: static double postTransitionExit(double t,double y,const Diffusion&a,int terms=180){
+2616:     if(!(t>0&&a.B>0&&std::fabs(y)<a.B))return 0;
+2617:     double sum=0;
+2618:     for(int n=1;n<=terms;++n){
+2619:         double a1=-a.mu*(a.B+y)/sq(a.sigma),a2=a.mu*(a.B-y)/sq(a.sigma);
+2620:         double term=n*std::sin(n*pi*(y+a.B)/(2*a.B))
+2621:             *std::exp(-sq(n*pi*a.sigma)*t/(8*sq(a.B)))
+2622:             *(std::exp(clamp(a1,-700,700))+((n&1)?1:-1)*std::exp(clamp(a2,-700,700)));
+2623:         sum+=term;
+2624:         if(n>24&&std::fabs(term)<1e-13)break;
+2625:     }
+2626:     return std::max(0.0,std::exp(-sq(a.mu)*t/(2*sq(a.sigma)))*pi*sq(a.sigma)*sum/(4*sq(a.B)));
+2627: }
+2628: static double integrateMidpoint(const std::function<double(double)>&f,double l,double r,int steps=240){
+2629:     if(r<=l)return 0;double d=(r-l)/steps,sum=0;
+2630:     for(int i=0;i<steps;++i)sum+=f(l+(i+.5)*d);return sum*d;
+2631: }
+2632: struct ChangedBoundary {double density=0,pointMass=0;};
+2633: static ChangedBoundary changedBoundaryTime(double t,double changeTime,const Diffusion&before,const Diffusion&after){
+2634:     if(!(before.B>=after.B&&after.B>0&&changeTime>0))return {};
+2635:     if(t<changeTime)return {exitDensity(t,before),0};
+2636:     auto g=[&](double y){return transitionStateDensity(y,changeTime,before);};
+2637:     double atom=integrateMidpoint(g,-before.B,-after.B)+integrateMidpoint(g,after.B,before.B);
+2638:     if(t==changeTime)return {0,atom};
+2639:     double continuous=integrateMidpoint([&](double y){return g(y)*postTransitionExit(t-changeTime,y,after);},-after.B,after.B);
+2640:     return {continuous,atom};
+2641: }
+2642: // 68-70: clock-conditioned complete conditional law and generalized statistic.
+2643: static double clockConditionedJoint(double moveP,double logTime){return std::exp(jointLog(moveP,logTime));}
+2644: static double generalizedThreshold(double alpha,double lambda){
+2645:     if(!(alpha>0&&alpha<1&&lambda>0&&lambda<=1))return INFINITY;
+2646:     return std::log(1/alpha)/lambda;
+2647: }
+2648: // 71-72: model class and second-order lower sample bound.
+2649: static double secondOrderSampleBound(double alpha,double beta,double lambda,double theta,const Fisher&f,
+2650:                                       double boundaryPenalty){
+2651:     double d=.5*sq(theta)*f.effective()+boundaryPenalty;
+2652:     if(!(lambda>0&&d>0))return INFINITY;
+2653:     double H=-(beta>0?beta*std::log(beta):0)-((1-beta)>0?(1-beta)*std::log(1-beta):0);
+2654:     return std::max(0.0,((1-beta)*std::log(1/alpha)/lambda-H)/d);
+2655: }
+2656: // Candidate-rating fit: use historical AEe target as a working experiment;
+2657: // saturation occurs when a position's legal move losses cannot reach target.
+2658: static Law fitLaw(const Vec&d,int elo,double consistency=.50){
+2659:     double target=targetError(elo);
+2660:     // Wide bracket: at high s the law approaches uniform choice. The
+2661:     // target is capped only by the position's attainable uniform error.
+2662:     double l=1.e-8,r=1.e10;
+2663:     for(int j=0;j<64;++j){double mid=std::sqrt(l*r);
+2664:         Law m=choice(d,mid,consistency);
+2665:         if(expectedError(m.p,d)>target)r=mid;else l=mid;}
+2666:     return choice(d,std::sqrt(l*r),consistency);
+2667: }
+2668: struct Observation {
+2669:     double entropy=0,expectedLoss=0,actualLoss=0,expectedQuality=0,
+2670:            qualityVariance=0,centered=0,reganIPR=0,
+2671:            moveKL=0,thetaFisher=0,effFisher=0,
+2672:            evidence=0,localEvidence=0,score=0,
+2673:            predictedTimeSec=0,timeLogLikelihood=0,standardizedResidual=0;
+2674:     int topFirstVisibleDepth=-1;
+2675:     bool hasTime=false,possibleModelCrossing=false;
+2676: };
+2677: struct Tracker {
+2678:     long long moves=0;double sumExpectedLoss=0,sumLoss=0,sumCentered=0,sumVariance=0,
+2679:           logEvidence=0,localEvidence=0,sumTimingLog=0;
+2680:     // Sections 1.4, 1.5 and B.2 use unit-variance residuals, never raw
+2681:     // win-probability differences. Zero-variance positions are excluded.
+2682:     std::array<double,4> lagNumerator{};
+2683:     std::array<double,4> recentResidual{};
+2684:     int recentResidualCount=0;
+2685:     long long residualCount=0;
+2686:     std::array<long long,HE_MAX_TRACKED_DEPTH> depthCount{};
+2687:     std::array<long long,HE_MAX_TRACKED_DEPTH> depthTopCount{};
+2688:     std::array<double,HE_MAX_TRACKED_DEPTH> depthLoss{};
+2689:     long long timingSamples=0;
+2690:     Observation latest;
+2691:     void record(const Law&law,const Vec&alt,const Vec&quality,int chosen,
+2692:                 double observedTimeSec,double expectedTimeSec,int firstTopDepth,
+2693:                 double motor=.12){
+2694:         if(chosen<0||size_t(chosen)>=law.p.size())return;
+2695:         latest=Observation{};latest.entropy=entropy(law.p);
+2696:         latest.expectedLoss=expectedError(law.p,law.d);latest.actualLoss=law.d[chosen];
+2697:         latest.expectedQuality=mean(law.p,quality);latest.qualityVariance=variance(law.p,quality);
+2698:         latest.centered=quality[chosen]-latest.expectedQuality;
+2699:         latest.topFirstVisibleDepth=firstTopDepth;
+2700:         latest.reganIPR=intrinsicRating(latest.expectedLoss);
+2701:         latest.moveKL=kl(alt,law.p);latest.thetaFisher=latest.qualityVariance;
+2702:         Vec st=scoreTilt(quality,law.p),sr=scaleScore(law);
+2703:         latest.effFisher=fisher(law.p,sr,st).effective();
+2704:         latest.predictedTimeSec=expectedTimeSec;
+2705:         double step=safeLog(alt[chosen])-safeLog(law.p[chosen]);
+2706:         logEvidence=appendLogEvidence(logEvidence,step);
+2707:         latest.evidence=logEvidence;
+2708:         latest.localEvidence=localLogLR(.35,latest.centered,latest.qualityVariance);
+2709:         localEvidence+=latest.localEvidence;
+2710:         ++moves;sumExpectedLoss+=latest.expectedLoss;sumLoss+=latest.actualLoss;
+2711:         sumCentered+=latest.centered;sumVariance+=latest.qualityVariance;
+2712:         latest.score=standardizedScore(sumCentered,sumVariance);
+2713:         if(firstTopDepth>=1&&firstTopDepth<HE_MAX_TRACKED_DEPTH){
+2714:             ++depthCount[firstTopDepth];
+2715:             if(chosen==0)++depthTopCount[firstTopDepth];
+2716:             depthLoss[firstTopDepth]+=law.d[chosen];
+2717:         }
+2718:         if(latest.qualityVariance>1.e-15){
+2719:             const double e=latest.centered/std::sqrt(latest.qualityVariance);
+2720:             latest.standardizedResidual=e;
+2721:             for(int k=1;k<=recentResidualCount;++k)
+2722:                 lagNumerator[k-1]+=e*recentResidual[k-1];
+2723:             for(int k=3;k>0;--k)recentResidual[k]=recentResidual[k-1];
+2724:             recentResidual[0]=e;
+2725:             recentResidualCount=std::min(4,recentResidualCount+1);
+2726:             ++residualCount;
+2727:         }
+2728:         if(observedTimeSec>motor){
+2729:             double m=std::log(std::max(expectedTimeSec-motor,.01))-.5*sq(.55);
+2730:             latest.timeLogLikelihood=logNormalLogDensity(observedTimeSec,motor,m,.55);
+2731:             latest.hasTime=true;++timingSamples;sumTimingLog+=latest.timeLogLikelihood;
+2732:         }
+2733:         // Only meaningful with externally calibrated H0; never label bot as human.
+2734:         latest.possibleModelCrossing=crossed(logEvidence,0.01);
+2735:     }
+2736:     double observedIPR()const{return moves?intrinsicRating(sumLoss/moves):NAN;}
+2737:     double expectedIPR()const{return moves?intrinsicRating(sumExpectedLoss/moves):NAN;}
+2738:     double lag(int k)const{return k>=1&&k<=4&&residualCount>k?
+2739:         lagNumerator[k-1]/residualCount:0;}
+2740:     double lagOne()const{return lag(1);}
+2741:     double portmanteau()const{
+2742:         double q=0;
+2743:         for(int k=1;k<=4&&residualCount>k;++k)
+2744:             q+=sq(lagNumerator[k-1])/(residualCount-k);
+2745:         return q;
+2746:     }
+2747: };
+2748: } // namespace HEMath
+
+==========================================================================================
+5. Low-band move picker — Tweak.xm 2824-3006
+==========================================================================================
+2824: static const char *HECommit(int i, double lossW) {
+2825:     HELastOwnTo       = HEParseMove(HEL[i].move).to;
+2826:     HES.lastCp        = HEL[i].cp;
+2827:     HES.haveLastCp = 1;
+2828:     HES.ownMoves++;
+2829:     HES.count[HEClassOf(lossW)]++;
+2830:     memcpy(HEChosen, HEL[i].move, sizeof(HEChosen));
+2831:     return HEChosen;
+2832: }
+2833: 
+2834: 
+2835: // Returns the move to play, or NULL when outside the human band.
+2836: // Positions must be searched to completion using MultiPV; this ONLY selects
+2837: // among returned Stockfish root moves. Unreported legal moves are out of scope.
+2838: static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
+2839:     if (!HEHumanBand(elo) || HELineCount<1) return NULL;
+2840:     static const bool solverOK=HEMath::referenceSolverCheck();
+2841:     if(!solverOK)NSLog(@"[ChessAssistantPro] Reference move-law solver check failed");
+2842:     HEHP=HEParamsFor(elo);
+2843:     if(!HES.init)HECoreNewGame((ply%2)==0,elo);
+2844: 
+2845:     int widest=0;
+2846:     for(int depth=1;depth<HE_MAX_TRACKED_DEPTH;++depth)
+2847:         widest=std::max(widest,HEDepthCounts[depth]);
+2848:     // At 400, keep about 82% of the widest candidate set before accepting a
+2849:     // deeper partial search; the fraction tapers to 50% at 1319. An absolute
+2850:     // floor of 9 -> 5 covers positions with only a few reported legal moves.
+2851:     // If fewer lines exist, use the widest available set.
+2852:     int needed=std::min(widest,std::max((int)lround(8.0-3.0*HEHP.t),
+2853:         (int)lround(widest*(.75-.25*HEHP.t))));
+2854:     int chosenDepth=-1;
+2855:     for(int depth=HE_MAX_TRACKED_DEPTH-1;depth>=1;--depth)
+2856:         if(HEDepthCounts[depth]>=needed&&HEDepthCounts[depth]>0){
+2857:             chosenDepth=depth;break;
+2858:         }
+2859:     // Never combine evaluations from different depths in the probability law.
+2860:     int n=0;
+2861:     if(chosenDepth>=0){
+2862:         for(int i=0;i<HE_MAX_PV;++i)
+2863:             if(HELinesAtDepth[chosenDepth][i].valid)
+2864:                 HEL[n++]=HELinesAtDepth[chosenDepth][i];
+2865:     } else {
+2866:         int bestI=-1;
+2867:         for(int i=0;i<HELineCount;++i)if(HELines[i].valid&&
+2868:            (bestI<0||HELines[i].depth>HELines[bestI].depth))bestI=i;
+2869:         if(bestI>=0)HEL[n++]=HELines[bestI];
+2870:     }
+2871:     if(n==0)return NULL;
+2872:     std::sort(HEL,HEL+n,[](const HELine&a,const HELine&b){return a.cp>b.cp;});
+2873:     // Section 1.8: first depth where the final-depth top move was itself the
+2874:     // top-scored move in a snapshot with at least two reported candidates.
+2875:     int topFirstDepth=-1;
+2876:     if(chosenDepth>=1&&n>1){
+2877:         for(int depth=1;depth<=chosenDepth;++depth){
+2878:             if(HEDepthCounts[depth]<2)continue;
+2879:             const HELine *top=nullptr;
+2880:             for(int i=0;i<HE_MAX_PV;++i){
+2881:                 const HELine *line=&HELinesAtDepth[depth][i];
+2882:                 if(line->valid&&(!top||line->cp>top->cp))top=line;
+2883:             }
+2884:             if(top&&strcmp(top->move,HEL[0].move)==0){topFirstDepth=depth;break;}
+2885:         }
+2886:     }
+2887: 
+2888:     HEBoard board{};
+2889:     bool haveBoard=HEParseFEN(fen,&board)!=0;
+2890:     int side=haveBoard?board.whiteToMove:HES.isWhite;
+2891:     HEMath::Vec values(n), quality(n), proposedMix(HE_NCLASS), winLoss(n);
+2892:     std::vector<HEFeatures> features(n);
+2893:     double bestWin=HEWinPct(HEL[0].cp);
+2894:     int jump=HES.haveLastCp?HEL[0].cp-HES.lastCp:0;
+2895:     bool mateNow=HEL[0].mateIn>0&&HEL[0].mateIn<=3;
+2896:     bool opportunity=mateNow || (HES.haveLastCp&&jump>=250&&HEL[0].cp>=200
+2897:                  &&HES.lastCp<HEHP.convThresh);
+2898: 
+2899:     for(int i=0;i<n;++i){
+2900:         values[i]=std::max(-2000.0,std::min(2000.0,(double)HEL[i].cp))/100.0;
+2901:         quality[i]=HEWinPct(HEL[i].cp)/100.0;
+2902:         winLoss[i]=std::max(0.0,bestWin-HEWinPct(HEL[i].cp));
+2903:         if(haveBoard)features[i]=HEExtract(&board,HEParseMove(HEL[i].move));
+2904:         else memset(&features[i],0,sizeof(HEFeatures));
+2905:     }
+2906:     // Eq 01-04, 10-11, 73-75: position-specific root equation and fit to the
+2907:     // reference's extrapolated rating/expected-loss scale (not a measured Elo).
+2908:     HEMath::Vec delta=HEMath::losses(values);
+2909:     HEMath::Law law=HEMath::fitLaw(delta,elo,.50);
+2910:     // Eq 61-63, 68-69: a CLOCK-CONDITIONED regime changes sensitivity.
+2911:     // This is a provisional policy parameter, not fitted human time data.
+2912:     // The no-clock path reproduces the original position-specific law.
+2913:     if(HEClockSeconds>0){
+2914:         const double clockScale=HEMath::clamp(
+2915:             1.0+0.10*std::log(61.0/(HEClockSeconds+1.0)),0.82,1.55);
+2916:         law=HEMath::choice(delta,law.s*clockScale,law.c);
+2917:     }
+2918: 
+2919:     // Model the alternative's intent to win through a positive exponential
+2920:     // tilt (Eq 17-20) without choosing the best move deterministically.
+2921:     double theta=.60+0.75*HEHP.t;
+2922:     HEMath::Vec winning=HEMath::tilt(law.p,quality,theta);
+2923:     double cx=haveBoard?HEComplexity(&board,side):1.0;
+2924:     double sharp=std::min(1.5,std::max(.70,.60+.40*cx));
+2925:     for(int c=0;c<HE_NCLASS;++c)proposedMix[c]=HEHP.mix[c];
+2926:     proposedMix[HE_MISTAKE]*=sharp;proposedMix[HE_BLUNDER]*=sharp;
+2927:     if(ply<8){
+2928:         // Keep the opening adjustment, but do not erase the weaker band's
+2929:         // mistake and blunder weights before any move can be selected.
+2930:         proposedMix[HE_MISTAKE]*=.85-.25*HEHP.t;
+2931:         proposedMix[HE_BLUNDER]*=.75-.30*HEHP.t;
+2932:     }
+2933:     if(HES.haveLastCp&&HES.lastCp>=HEHP.convThresh&&HEL[0].cp>=HEHP.convThresh){
+2934:         proposedMix[HE_MISTAKE]*=.95-.15*HEHP.t;
+2935:         proposedMix[HE_BLUNDER]*=.90-.25*HEHP.t;
+2936:     }
+2937:     proposedMix=HEMath::normalize(proposedMix);
+2938: 
+2939:     // Actual available quality classes are constrained by Stockfish's finite
+2940:     // MultiPV list; unrepresented classes are not fabricated.
+2941:     HEMath::Vec classMass(HE_NCLASS,0),candidate(n,0);
+2942:     int available[HE_NCLASS]={0};
+2943:     for(int i=0;i<n;++i){
+2944:         int c=HEClassOf(winLoss[i]);
+2945:         classMass[c]+=winning[i];
+2946:         ++available[c];
+2947:     }
+2948:     for(int i=0;i<n;++i){
+2949:         int c=HEClassOf(winLoss[i]);
+2950:         double factor=proposedMix[c]/std::max(classMass[c],HEMath::tiny);
+2951:         candidate[i]=winning[i]*factor*HEHumanBias(&features[i],ply);
+2952:         // Low-rating visual mistakes remain possible, but a bot trying to win
+2953:         // does not deliberately choose a forced losing mate on every cycle.
+2954:         if(HEL[i].mateIn<0&&HEL[0].mateIn>=0)candidate[i]*=.10+.15*(1.0-HEHP.t);
+2955:         if(c>=HE_MISTAKE&&features[i].visibleMistake)candidate[i]*=HEHP.visW;
+2956:     }
+2957: 
+2958:     if(opportunity&&n>1){
+2959:         double spot=(HEL[0].mateIn==1)?HEHP.spotMate1:
+2960:              ((!mateNow&&features[0].isCapture&&features[0].capturedValue>=300)
+2961:                ?HEHP.spotObvious:HEHP.spotTactic);
+2962:         // Reflect intermittent tactical recognition, without a fixed periodic
+2963:         // blunder or a deterministic rule that always sees short mates.
+2964:         spot=HEMath::clamp(spot+.10*HES.missStreak,.02,.995);
+2965:         bool saw=HEFrand()<spot;
+2966:         if(saw){for(int i=0;i<n;++i)if(winLoss[i]>5)candidate[i]*=.20;
+2967:             HES.missStreak=0;
+2968:         }else{
+2969:             for(int i=0;i<n;++i)if(winLoss[i]<2.0)candidate[i]*=.12;
+2970:         }
+2971:     }
+2972: 
+2973:     HEMath::Vec selectedLaw=HEMath::normalize(candidate);
+2974:     int k=HEPick(selectedLaw.data(),n);
+2975:     if(k<0)k=0;
+2976:     NSLog(@"[ChessAssistantPro] Human choice ELO=%d ply=%d depth=%d candidates=%d classes=%d/%d/%d/%d/%d picked=%d loss=%.1fpp",
+2977:           elo,ply,chosenDepth,n,available[0],available[1],available[2],
+2978:           available[3],available[4],HEClassOf(winLoss[k]),winLoss[k]);
+2979:     if(opportunity&&k!=0){HES.misses++;HES.missStreak++;}
+2980:     else if(opportunity)HES.missStreak=0;
+2981: 
+2982:     // 05-08, 17-63: observe the actually selected quality and update the
+2983:     // diagnostics under the reference and the actual human-biased policy.
+2984:     double suggested=0;
+2985:     HEPendingTime=HEClockTiming{};
+2986:     if(HEClockSeconds>0){
+2987:         double logM=HEMath::timeLogMean(-.9,.30,.10,HEMath::entropy(selectedLaw),HEClockSeconds);
+2988:         HEPendingTime.active=true;
+2989:         HEPendingTime.baseMean=HEMath::timeLogMean(-.9,.30,.10,HEMath::entropy(law.p),HEClockSeconds);
+2990:         HEPendingTime.altMean=logM;
+2991:         suggested=.12+std::exp(logM+.5*.55*.55);
+2992:         // Eq 13-16: diffusion mean used as a secondary timing descriptor.
+2993:         double gap=0;
+2994:         if(delta.size()>1)gap=*std::min_element(delta.begin()+1,delta.end());
+2995:         HEMath::Diffusion d=HEMath::diffusion(HEMath::entropy(selectedLaw),HEClockSeconds,
+2996:                                       gap,law.s,.8,.24,.04,.12,.35);
+2997:         double diffusionSec=HEMath::expectedExit(d);
+2998:         if(std::isfinite(diffusionSec)&&diffusionSec>0)suggested=.5*suggested+.5*diffusionSec;
+2999:         suggested=HEMath::clamp(suggested,.15,std::max(.15,HEClockSeconds*.15));
+3000:     }
+3001:     HEStats.record(law,selectedLaw,quality,k,-1,suggested,topFirstDepth);
+3002:     if(HEStats.residualCount>=5&&HEStats.residualCount%10==0)
+3003:         NSLog(@"[ChessAssistantPro] Uncalibrated move diagnostics n=%lld lag1=%.3f Q4=%.3f topFirstDepth=%d",
+3004:               HEStats.residualCount,HEStats.lagOne(),HEStats.portmanteau(),topFirstDepth);
+3005:     return HECommit(k,winLoss[k]);
+3006: }
+
+==========================================================================================
+6. Stockfish process and low-band call routing — Tweak.xm 3330-3535
+==========================================================================================
+3330: static BOOL CAPExternalEngineMove(const char *path, const char *fen,
+3331:                                   BOOL stockfish19, int requestedElo,
+3332:                                   std::string &bestMove) {
+3333:     if (!path || !fen || access(path, X_OK) != 0) return NO;
+3334:     CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
+3335:     // Accessed only from the serial God Engine queue. Keep Stockfish warm so
+3336:     // later positions do not pay process launch and NNUE initialization costs.
+3337:     static int cachedInput = -1, cachedOutput = -1, cachedThreads = 0;
+3338:     static pid_t cachedPid = 0;
+3339:     static std::string humanLastFen, humanLastMove;
+3340:     static int humanLastPly = -1, humanLastElo = -1;
+3341:     if (stockfish19 && cachedPid > 0) {
+3342:         int status = 0;
+3343:         pid_t exited;
+3344:         do { exited = waitpid(cachedPid, &status, WNOHANG); }
+3345:         while (exited < 0 && errno == EINTR);
+3346:         if (exited != 0) {
+3347:             close(cachedInput); close(cachedOutput);
+3348:             cachedInput = cachedOutput = -1;
+3349:             cachedPid = 0;
+3350:             cachedThreads = 0;
+3351:         }
+3352:     }
+3353:     int input[2] = {-1, -1}, output[2] = {-1, -1};
+3354:     pid_t pid = 0;
+3355:     BOOL reused = stockfish19 && cachedPid > 0;
+3356:     if (reused) {
+3357:         input[1] = cachedInput;
+3358:         output[0] = cachedOutput;
+3359:         pid = cachedPid;
+3360:     } else {
+3361:         if (socketpair(AF_UNIX, SOCK_STREAM, 0, input) != 0) return NO;
+3362:         if (pipe(output) != 0) { close(input[0]); close(input[1]); return NO; }
+3363:         int noSigPipe = 1;
+3364:         if (setsockopt(input[1], SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe)) != 0) {
+3365:             close(input[0]); close(input[1]); close(output[0]); close(output[1]);
+3366:             return NO;
+3367:         }
+3368:         posix_spawn_file_actions_t actions;
+3369:         posix_spawn_file_actions_init(&actions);
+3370:         posix_spawn_file_actions_adddup2(&actions, input[0], STDIN_FILENO);
+3371:         posix_spawn_file_actions_adddup2(&actions, output[1], STDOUT_FILENO);
+3372:         posix_spawn_file_actions_adddup2(&actions, output[1], STDERR_FILENO);
+3373:         posix_spawn_file_actions_addclose(&actions, input[1]);
+3374:         posix_spawn_file_actions_addclose(&actions, output[0]);
+3375:         char *const arguments[] = {const_cast<char *>(path), nullptr};
+3376:         int status = posix_spawn(&pid, path, &actions, nullptr, arguments, environ);
+3377:         posix_spawn_file_actions_destroy(&actions);
+3378:         close(input[0]); close(output[1]);
+3379:         if (status != 0) { close(input[1]); close(output[0]); return NO; }
+3380:     }
+3381:     BOOL success = NO;
+3382:     std::string line;
+3383:     BOOL lowElo = stockfish19 && requestedElo < 1320;
+3384:     BOOL pdfElo = stockfish19 && HEPdfBand(requestedElo);
+3385:     int ply = (lowElo || pdfElo) ? CAPFenPly(fen) : -1;
+3386:     NSString *humanGo = nil;
+3387:     if (lowElo) {
+3388:         BOOL newGame = humanLastElo != requestedElo || humanLastPly < 0 ||
+3389:             ply < humanLastPly ||
+3390:             (ply <= 1 && humanLastPly > 1);
+3391:         if (newGame) {
+3392:             HENewGame(strstr(fen, " b ") == nullptr, requestedElo);
+3393:             humanLastFen.clear(); humanLastMove.clear();
+3394:             NSLog(@"[ChessAssistantPro] Human band new game, ply=%d", ply);
+3395:         } else if (ply == humanLastPly + 1 && !humanLastFen.empty()) {
+3396:             HEBoard priorBoard;
+3397:             BOOL havePrior = HEParseFEN(humanLastFen.c_str(), &priorBoard);
+3398:             NSString *played = havePrior ?
+3399:                 HEInferOnePlyMove(humanLastFen.c_str(), fen) : nil;
+3400:             BOOL opponentMoved = havePrior && priorBoard.whiteToMove != HES.isWhite;
+3401:             if (opponentMoved) {
+3402:                 HENoteOpponentMove(played.UTF8String);
+3403:                 NSLog(@"[ChessAssistantPro] Human band opponent move %@",
+3404:                       played ?: @"unavailable from one-ply FEN transition");
+3405:             } else if (played) {
+3406:                 std::lock_guard<std::recursive_mutex> lock(HEMutex);
+3407:                 HELastOwnTo = HEParseMove(played.UTF8String).to;
+3408:             }
+3409:         } else if (ply == humanLastPly + 2 && !humanLastFen.empty() &&
+3410:                    !humanLastMove.empty()) {
+3411:             NSString *opponent = HEInferOpponentMove(humanLastFen.c_str(),
+3412:                 humanLastMove.c_str(), fen);
+3413:             if (opponent) {
+3414:                 HENoteOpponentMove(opponent.UTF8String);
+3415:                 NSLog(@"[ChessAssistantPro] Human band opponent move %@", opponent);
+3416:             } else {
+3417:                 HENoteOpponentMove(nullptr);
+3418:                 NSLog(@"[ChessAssistantPro] Human band opponent move unavailable from FEN transition");
+3419:             }
+3420:         } else if (ply > humanLastPly && ply != humanLastPly + 2) {
+3421:             HENoteOpponentMove(nullptr);
+3422:         }
+3423:     }
+3424:     CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 5.0;
+3425:     if (!reused) {
+3426:         if (!CAPWrite(input[1], "uci\n") || !CAPWaitForLine(output[0], "uciok", deadline)) goto done;
+3427:         if (stockfish19 && !CAPWrite(input[1], "setoption name Hash value 32\n")) goto done;
+3428:         if (stockfish19) HEInvalidateConfiguration();
+3429:     }
+3430:     if (stockfish19) {
+3431:         // The engine process is reused, so slider and engine-mode transitions
+3432:         // must restore the corresponding UCI options.
+3433:         int uciElo = requestedElo;
+3434:         if (!lowElo && cachedThreads != 2) {
+3435:             if (!CAPWrite(input[1], "setoption name Threads value 2\n")) goto done;
+3436:             cachedThreads = 2;
+3437:         }
+3438:         if (lowElo) {
+3439:             for (NSString *command in HEConfigureCommands(requestedElo)) {
+3440:                 if ([command hasPrefix:@"go "]) {
+3441:                     humanGo = command;
+3442:                 } else if ([command isEqualToString:@"setoption name Threads value 1"]) {
+3443:                     if (cachedThreads != 1) {
+3444:                         if (!CAPWrite(input[1], "setoption name Threads value 1\n")) goto done;
+3445:                         cachedThreads = 1;
+3446:                     }
+3447:                 } else if (!CAPWrite(input[1], std::string(command.UTF8String) + "\n")) goto done;
+3448:             }
+3449:             if (!humanGo) goto done;
+3450:             HEResetLines();
+3451:             NSLog(@"[ChessAssistantPro] Stockfish human band ELO=%d ply=%d %@",
+3452:                   requestedElo, ply, humanGo);
+3453:         } else if (pdfElo) {
+3454:             // Full-strength evaluations from one depth, sampled by the PDF
+3455:             // law. Never reuse the low-Elo or high-Elo UCI option state.
+3456:             HEInvalidateConfiguration();
+3457:             if (!CAPWrite(input[1], "setoption name UCI_LimitStrength value false\n") ||
+3458:                 !CAPWrite(input[1], "setoption name Skill Level value 20\n") ||
+3459:                 !CAPWrite(input[1], "setoption name MultiPV value 16\n")) goto done;
+3460:             HEResetLines();
+3461:             NSLog(@"[ChessAssistantPro] PDF move law preset=%d; searching 16 lines",requestedElo);
+3462:         } else {
+3463:             // Preserve the original 2000–3200 UCI path. Reset the sampled
+3464:             // modes' options if the slider later returns to either band.
+3465:             HEInvalidateConfiguration();
+3466:             if (!CAPWrite(input[1], "setoption name MultiPV value 1\n") ||
+3467:                 !CAPWrite(input[1], "setoption name Skill Level value 20\n") ||
+3468:                 !CAPWrite(input[1], std::string("setoption name UCI_LimitStrength value ") +
+3469:                                     (requestedElo >= 3190 ? "false\n" : "true\n"))) goto done;
+3470:             if (requestedElo < 3190 &&
+3471:                 !CAPWrite(input[1], "setoption name UCI_Elo value " +
+3472:                                     std::to_string(uciElo) + "\n")) goto done;
+3473:             NSLog(@"[ChessAssistantPro] Stockfish preset=%d UCI_Elo=%@ MultiPV=1",
+3474:                   requestedElo, requestedElo >= 3190 ? @"full strength" : @(uciElo));
+3475:         }
+3476:     }
+3477:     if (!CAPWrite(input[1], "isready\n") || !CAPWaitForLine(output[0], "readyok", deadline)) goto done;
+3478:     if (!CAPWrite(input[1], std::string("position fen ") + fen + "\n")) goto done;
+3479:     if (!CAPWrite(input[1], lowElo ? std::string(humanGo.UTF8String) + "\n" :
+3480:                           (pdfElo ? "go depth 12 movetime 1200\n" :
+3481:                            (stockfish19 ? "go movetime 200\n" : "go depth 16\n")))) goto done;
+3482:     deadline = CFAbsoluteTimeGetCurrent() + (stockfish19 ? 3.0 : 15.0);
+3483:     while (CAPReadLine(output[0], line, deadline)) {
+3484:         if (line.find("CRITICAL ERROR") != std::string::npos) break;
+3485:         if (line.compare(0, 9, "bestmove ") != 0) {
+3486:             if (lowElo || pdfElo) HEParseInfo(line.c_str());
+3487:             continue;
+3488:         }
+3489:         size_t end = line.find(' ', 9);
+3490:         bestMove = line.substr(9, end == std::string::npos ? end : end - 9);
+3491:         success = CAPUciMove(bestMove);
+3492:         if (success && (lowElo || pdfElo)) {
+3493:             if (humanLastFen == fen && humanLastElo == requestedElo &&
+3494:                 CAPUciMove(humanLastMove)) {
+3495:                 bestMove = humanLastMove;
+3496:             } else {
+3497:                 NSString *chosen = lowElo ?
+3498:                     HEChooseMove(fen, MAX(ply, 0), requestedElo) :
+3499:                     HEPdfChooseMove(requestedElo,ply);
+3500:                 if (chosen && CAPUciMove(chosen.UTF8String)) {
+3501:                     bestMove = chosen.UTF8String;
+3502:                 } else {
+3503:                     NSLog(@"[ChessAssistantPro] %@ choice unavailable ELO=%d ply=%d lines=%d; using engine bestmove",
+3504:                           lowElo ? @"Human" : @"PDF",requestedElo,ply,HELineCount);
+3505:                 }
+3506:                 humanLastFen = fen;
+3507:                 humanLastMove = bestMove;
+3508:                 humanLastPly = ply;
+3509:                 humanLastElo = requestedElo;
+3510:             }
+3511:         } else if (success && stockfish19) {
+3512:             // Returning from a high-Elo search must not reuse an old sampled
+3513:             // position when the slider changes back to a candidate-law mode.
+3514:             humanLastElo=-1;
+3515:         }
+3516:         break;
+3517:     }
+3518: done:
+3519:     if (stockfish19 && success) {
+3520:         cachedInput = input[1]; cachedOutput = output[0]; cachedPid = pid;
+3521:         NSLog(@"[ChessAssistantPro] Stockfish 19 bestmove %s in %.0f ms (%@)",
+3522:               bestMove.c_str(), (CFAbsoluteTimeGetCurrent() - started) * 1000.0,
+3523:               reused ? @"warm" : @"cold");
+3524:         return YES;
+3525:     }
+3526:     if (stockfish19) {
+3527:         cachedInput = cachedOutput = -1;
+3528:         cachedPid = 0;
+3529:         cachedThreads = 0;
+3530:     }
+3531:     close(input[1]); close(output[0]);
+3532:     kill(pid, SIGKILL);
+3533:     while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+3534:     return success;
+3535: }
+
+==========================================================================================
+3330: static BOOL CAPExternalEngineMove(const char *path, const char *fen,
+3331:                                   BOOL stockfish19, int requestedElo,
+3332:                                   std::string &bestMove) {
+3333:     if (!path || !fen || access(path, X_OK) != 0) return NO;
+3334:     CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
+3335:     // Accessed only from the serial God Engine queue. Keep Stockfish warm so
+3336:     // later positions do not pay process launch and NNUE initialization costs.
+3337:     static int cachedInput = -1, cachedOutput = -1, cachedThreads = 0;
+3338:     static pid_t cachedPid = 0;
+3339:     static std::string humanLastFen, humanLastMove;
+3340:     static int humanLastPly = -1, humanLastElo = -1;
+3341:     if (stockfish19 && cachedPid > 0) {
+3342:         int status = 0;
+3343:         pid_t exited;
+3344:         do { exited = waitpid(cachedPid, &status, WNOHANG); }
+3345:         while (exited < 0 && errno == EINTR);
+3346:         if (exited != 0) {
+3347:             close(cachedInput); close(cachedOutput);
+3348:             cachedInput = cachedOutput = -1;
+3349:             cachedPid = 0;
+3350:             cachedThreads = 0;
+3351:         }
+3352:     }
+3353:     int input[2] = {-1, -1}, output[2] = {-1, -1};
+3354:     pid_t pid = 0;
+3355:     BOOL reused = stockfish19 && cachedPid > 0;
+3356:     if (reused) {
+3357:         input[1] = cachedInput;
+3358:         output[0] = cachedOutput;
+3359:         pid = cachedPid;
+3360:     } else {
+3361:         if (socketpair(AF_UNIX, SOCK_STREAM, 0, input) != 0) return NO;
+3362:         if (pipe(output) != 0) { close(input[0]); close(input[1]); return NO; }
+3363:         int noSigPipe = 1;
+3364:         if (setsockopt(input[1], SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe)) != 0) {
+3365:             close(input[0]); close(input[1]); close(output[0]); close(output[1]);
+3366:             return NO;
+3367:         }
+3368:         posix_spawn_file_actions_t actions;
+3369:         posix_spawn_file_actions_init(&actions);
+3370:         posix_spawn_file_actions_adddup2(&actions, input[0], STDIN_FILENO);
+3371:         posix_spawn_file_actions_adddup2(&actions, output[1], STDOUT_FILENO);
+3372:         posix_spawn_file_actions_adddup2(&actions, output[1], STDERR_FILENO);
+3373:         posix_spawn_file_actions_addclose(&actions, input[1]);
+3374:         posix_spawn_file_actions_addclose(&actions, output[0]);
+3375:         char *const arguments[] = {const_cast<char *>(path), nullptr};
+3376:         int status = posix_spawn(&pid, path, &actions, nullptr, arguments, environ);
+3377:         posix_spawn_file_actions_destroy(&actions);
+3378:         close(input[0]); close(output[1]);
+3379:         if (status != 0) { close(input[1]); close(output[0]); return NO; }
+3380:     }
+3381:     BOOL success = NO;
+3382:     std::string line;
+3383:     BOOL lowElo = stockfish19 && requestedElo < 1320;
+3384:     BOOL pdfElo = stockfish19 && HEPdfBand(requestedElo);
+3385:     int ply = (lowElo || pdfElo) ? CAPFenPly(fen) : -1;
+3386:     NSString *humanGo = nil;
+3387:     if (lowElo) {
+3388:         BOOL newGame = humanLastElo != requestedElo || humanLastPly < 0 ||
+3389:             ply < humanLastPly ||
+3390:             (ply <= 1 && humanLastPly > 1);
+3391:         if (newGame) {
+3392:             HENewGame(strstr(fen, " b ") == nullptr, requestedElo);
+3393:             humanLastFen.clear(); humanLastMove.clear();
+3394:             NSLog(@"[ChessAssistantPro] Human band new game, ply=%d", ply);
+3395:         } else if (ply == humanLastPly + 1 && !humanLastFen.empty()) {
+3396:             HEBoard priorBoard;
+3397:             BOOL havePrior = HEParseFEN(humanLastFen.c_str(), &priorBoard);
+3398:             NSString *played = havePrior ?
+3399:                 HEInferOnePlyMove(humanLastFen.c_str(), fen) : nil;
+3400:             BOOL opponentMoved = havePrior && priorBoard.whiteToMove != HES.isWhite;
+3401:             if (opponentMoved) {
+3402:                 HENoteOpponentMove(played.UTF8String);
+3403:                 NSLog(@"[ChessAssistantPro] Human band opponent move %@",
+3404:                       played ?: @"unavailable from one-ply FEN transition");
+3405:             } else if (played) {
+3406:                 std::lock_guard<std::recursive_mutex> lock(HEMutex);
+3407:                 HELastOwnTo = HEParseMove(played.UTF8String).to;
+3408:             }
+3409:         } else if (ply == humanLastPly + 2 && !humanLastFen.empty() &&
+3410:                    !humanLastMove.empty()) {
+3411:             NSString *opponent = HEInferOpponentMove(humanLastFen.c_str(),
+3412:                 humanLastMove.c_str(), fen);
+3413:             if (opponent) {
+3414:                 HENoteOpponentMove(opponent.UTF8String);
+3415:                 NSLog(@"[ChessAssistantPro] Human band opponent move %@", opponent);
+3416:             } else {
+3417:                 HENoteOpponentMove(nullptr);
+3418:                 NSLog(@"[ChessAssistantPro] Human band opponent move unavailable from FEN transition");
+3419:             }
+3420:         } else if (ply > humanLastPly && ply != humanLastPly + 2) {
+3421:             HENoteOpponentMove(nullptr);
+3422:         }
+3423:     }
+3424:     CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 5.0;
+3425:     if (!reused) {
+3426:         if (!CAPWrite(input[1], "uci\n") || !CAPWaitForLine(output[0], "uciok", deadline)) goto done;
+3427:         if (stockfish19 && !CAPWrite(input[1], "setoption name Hash value 32\n")) goto done;
+3428:         if (stockfish19) HEInvalidateConfiguration();
+3429:     }
+3430:     if (stockfish19) {
+3431:         // The engine process is reused, so slider and engine-mode transitions
+3432:         // must restore the corresponding UCI options.
+3433:         int uciElo = requestedElo;
+3434:         if (!lowElo && cachedThreads != 2) {
+3435:             if (!CAPWrite(input[1], "setoption name Threads value 2\n")) goto done;
+3436:             cachedThreads = 2;
+3437:         }
+3438:         if (lowElo) {
+3439:             for (NSString *command in HEConfigureCommands(requestedElo)) {
+3440:                 if ([command hasPrefix:@"go "]) {
+3441:                     humanGo = command;
+3442:                 } else if ([command isEqualToString:@"setoption name Threads value 1"]) {
+3443:                     if (cachedThreads != 1) {
+3444:                         if (!CAPWrite(input[1], "setoption name Threads value 1\n")) goto done;
+3445:                         cachedThreads = 1;
+3446:                     }
+3447:                 } else if (!CAPWrite(input[1], std::string(command.UTF8String) + "\n")) goto done;
+3448:             }
+3449:             if (!humanGo) goto done;
+3450:             HEResetLines();
+3451:             NSLog(@"[ChessAssistantPro] Stockfish human band ELO=%d ply=%d %@",
+3452:                   requestedElo, ply, humanGo);
+3453:         } else if (pdfElo) {
+3454:             // Full-strength evaluations from one depth, sampled by the PDF
+3455:             // law. Never reuse the low-Elo or high-Elo UCI option state.
+3456:             HEInvalidateConfiguration();
+3457:             if (!CAPWrite(input[1], "setoption name UCI_LimitStrength value false\n") ||
+3458:                 !CAPWrite(input[1], "setoption name Skill Level value 20\n") ||
+3459:                 !CAPWrite(input[1], "setoption name MultiPV value 16\n")) goto done;
+3460:             HEResetLines();
+3461:             NSLog(@"[ChessAssistantPro] PDF move law preset=%d; searching 16 lines",requestedElo);
+3462:         } else {
+3463:             // Preserve the original 2000–3200 UCI path. Reset the sampled
+3464:             // modes' options if the slider later returns to either band.
+3465:             HEInvalidateConfiguration();
+3466:             if (!CAPWrite(input[1], "setoption name MultiPV value 1\n") ||
+3467:                 !CAPWrite(input[1], "setoption name Skill Level value 20\n") ||
+3468:                 !CAPWrite(input[1], std::string("setoption name UCI_LimitStrength value ") +
+3469:                                     (requestedElo >= 3190 ? "false\n" : "true\n"))) goto done;
+3470:             if (requestedElo < 3190 &&
+3471:                 !CAPWrite(input[1], "setoption name UCI_Elo value " +
+3472:                                     std::to_string(uciElo) + "\n")) goto done;
+3473:             NSLog(@"[ChessAssistantPro] Stockfish preset=%d UCI_Elo=%@ MultiPV=1",
+3474:                   requestedElo, requestedElo >= 3190 ? @"full strength" : @(uciElo));
+3475:         }
+3476:     }
+3477:     if (!CAPWrite(input[1], "isready\n") || !CAPWaitForLine(output[0], "readyok", deadline)) goto done;
+3478:     if (!CAPWrite(input[1], std::string("position fen ") + fen + "\n")) goto done;
+3479:     if (!CAPWrite(input[1], lowElo ? std::string(humanGo.UTF8String) + "\n" :
+3480:                           (pdfElo ? "go depth 12 movetime 1200\n" :
+3481:                            (stockfish19 ? "go movetime 200\n" : "go depth 16\n")))) goto done;
+3482:     deadline = CFAbsoluteTimeGetCurrent() + (stockfish19 ? 3.0 : 15.0);
+3483:     while (CAPReadLine(output[0], line, deadline)) {
+3484:         if (line.find("CRITICAL ERROR") != std::string::npos) break;
+3485:         if (line.compare(0, 9, "bestmove ") != 0) {
+3486:             if (lowElo || pdfElo) HEParseInfo(line.c_str());
+3487:             continue;
+3488:         }
+3489:         size_t end = line.find(' ', 9);
+3490:         bestMove = line.substr(9, end == std::string::npos ? end : end - 9);
+3491:         success = CAPUciMove(bestMove);
+3492:         if (success && (lowElo || pdfElo)) {
+3493:             if (humanLastFen == fen && humanLastElo == requestedElo &&
+3494:                 CAPUciMove(humanLastMove)) {
+3495:                 bestMove = humanLastMove;
+3496:             } else {
+3497:                 NSString *chosen = lowElo ?
+3498:                     HEChooseMove(fen, MAX(ply, 0), requestedElo) :
+3499:                     HEPdfChooseMove(requestedElo,ply);
+3500:                 if (chosen && CAPUciMove(chosen.UTF8String)) {
+3501:                     bestMove = chosen.UTF8String;
+3502:                 } else {
+3503:                     NSLog(@"[ChessAssistantPro] %@ choice unavailable ELO=%d ply=%d lines=%d; using engine bestmove",
+3504:                           lowElo ? @"Human" : @"PDF",requestedElo,ply,HELineCount);
+3505:                 }
+3506:                 humanLastFen = fen;
+3507:                 humanLastMove = bestMove;
+3508:                 humanLastPly = ply;
+3509:                 humanLastElo = requestedElo;
+3510:             }
+3511:         } else if (success && stockfish19) {
+3512:             // Returning from a high-Elo search must not reuse an old sampled
+3513:             // position when the slider changes back to a candidate-law mode.
+3514:             humanLastElo=-1;
+3515:         }
+3516:         break;
+3517:     }
+3518: done:
+3519:     if (stockfish19 && success) {
+3520:         cachedInput = input[1]; cachedOutput = output[0]; cachedPid = pid;
+3521:         NSLog(@"[ChessAssistantPro] Stockfish 19 bestmove %s in %.0f ms (%@)",
+3522:               bestMove.c_str(), (CFAbsoluteTimeGetCurrent() - started) * 1000.0,
+3523:               reused ? @"warm" : @"cold");
+3524:         return YES;
+3525:     }

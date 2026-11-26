@@ -50,6 +50,7 @@ static NSString *const kAutoPlayMaxDelayKey = @"ChessAssistantPro_AutoPlayMaxDel
 static NSString *const kStrengthEloKey = @"ChessAssist_ELO";
 static NSString *const kGodEngineKey = @"godEngineChoice";
 static NSString *const kAutoEngineKey = @"ChessAssistantPro_AutoPlayEngine";
+static NSString *const kWinEveryGameKey = @"ChessAssistantPro_WinEveryGame";
 static const char *kStockfish19Path = "/var/jb/usr/bin/stockfish19";
 static const char *kTriumviratusPath = "/var/jb/usr/bin/triumviratus";
 static const int kEloPresets[] = {
@@ -1502,11 +1503,22 @@ static const double HEMix600 [HE_NCLASS] = { 0.08, 0.12, 0.20, 0.25, 0.35 };
 static const double HEMix1319[HE_NCLASS] = { 0.22, 0.23, 0.23, 0.18, 0.14 };
 
 
-// Win% for a centipawn score (Lichess curve, close to Game Review)
+// Section 1.1: Win% for a centipawn score (Lichess AccuracyPercent.scala)
 static double HEWinPct(int cp) {
      if (cp >    2000) cp =   2000;
      if (cp < -2000) cp = -2000;
      return 50.0 + 50.0 * (2.0 / (1.0 + exp(-0.00368208 * cp)) - 1.0);
+}
+// Section 1.1: exact move accuracy from win% drop (Lichess formula)
+static double HEMoveAccuracy(double deltaW) {
+    if (deltaW <= 0) return 100.0;
+    double a = 103.166810 * std::exp(-0.043544 * deltaW) - 3.166925 + 1.0;
+    return std::max(0.0, std::min(100.0, a));
+}
+// Section 3.2: probabilistic book exit — P(exit) rises with ply
+static double HEBookExitProb(int ply, double plyHalf) {
+    double r = (double)ply / std::max(1.0, plyHalf);
+    return 1.0 - std::exp(-(r * r));
 }
 
 
@@ -1548,6 +1560,30 @@ typedef struct {
     double clockM0;                // base moves remaining
     double clockM1;                // moves-remaining slope
     double clockMmin;              // minimum moves remaining
+    // Section 1.2: Regan-Haworth master table parameters
+    double sBase;                  // sensitivity 0.42→0.17
+    double cRegan;                 // consistency  0.46→0.52
+    // Section 2.1: dual-depth tactical myopia
+    int    dHuman;                 // shallow depth 1→4
+    double lambda;                 // true eval blend 0.18→0.68
+    // Section 2.2: winning-position blunder surge
+    double winningSMult;           // s multiplier when winning 1.45→1.55
+    // Section 2.3: phase multipliers for s_eff
+    double phaseOpening;           // ×0.78
+    double phaseMid;               // ×1.25
+    double phaseEndgame;           // ×1.10
+    // Section 2.3: capture/check impulse bias
+    double captureImpulse;         // 1.45→1.25
+    double quietBackward;          // 0.65→0.85
+    // Section 3.2: opening book exit
+    double bookExitPlyHalf;        // 3→9
+    // Section 4.1: Russek ΔU weight
+    double betaElo;                // 0.25→0.75
+    // Section 5.1: game-to-game variance
+    double thetaGameSigma;         // σ for game form N(0,σ)
+    // Section 5.3: resignation
+    double resignCp;               // -1200→-650
+    int    resignMinPly;           // 999→40
 } HEParams;
 
 
@@ -1603,6 +1639,33 @@ static HEParams HEParamsFor(int elo) {
     p.clockM0        = 40.0;
     p.clockM1        = 0.30 + 0.10 * t;
     p.clockMmin      = 5.0 + 3.0 * t;
+    // Section 1.2: Regan-Haworth (master table, linear interp 400→1319)
+    // t400=-0.278  t600=0  t800=0.278  t1000=0.556  t1200=0.834  t1319=1.0
+    // s: 0.42→0.34→0.28→0.23→0.19→0.17
+    p.sBase          = 0.34 - 0.17 * t;    // 0.34@600, 0.17@1319
+    // c: 0.46→0.48→0.49→0.50→0.51→0.52
+    p.cRegan         = 0.48 + 0.04 * t;    // 0.48@600, 0.52@1319
+    // Section 2.1: dual-depth tactical myopia
+    p.dHuman         = (int)lround(1.5 + 2.5 * t); // 1@400 → 4@1319
+    p.lambda         = 0.28 + 0.40 * t;    // 0.28@600, 0.68@1319
+    // Section 2.2: winning-position s multiplier
+    p.winningSMult   = 1.50 + 0.05 * t;    // 1.50@600, 1.55@1319
+    // Section 2.3: phase multipliers
+    p.phaseOpening   = 0.78;
+    p.phaseMid       = 1.25;
+    p.phaseEndgame   = 1.10;
+    // Section 2.3: impulse bias
+    p.captureImpulse = 1.45 - 0.20 * t;    // 1.45@600, 1.25@1319
+    p.quietBackward  = 0.65 + 0.20 * t;    // 0.65@600, 0.85@1319
+    // Section 3.2: opening book exit (ply_half)
+    p.bookExitPlyHalf= 4.0 + 5.0 * t;     // 4@600, 9@1319
+    // Section 4.1: Russek ΔU weight
+    p.betaElo        = 0.35 + 0.40 * t;    // 0.35@600, 0.75@1319
+    // Section 5.1: game form sigma
+    p.thetaGameSigma = 0.22;
+    // Section 5.3: resignation thresholds
+    p.resignCp       = -1200.0 + 550.0 * t; // -1200@600, -650@1319
+    p.resignMinPly   = (int)lround(80.0 - 40.0 * t); // 80@600, 40@1319
     return p;
 }
 
@@ -1614,6 +1677,10 @@ static HEParams HEParamsFor(int elo) {
 
 static inline double HEFrand(void) {
     return (double)arc4random_uniform(1000000u) / 1000000.0;
+}
+static double HEGauss(void) {
+    double u1 = std::max(1e-10, HEFrand()), u2 = HEFrand();
+    return std::sqrt(-2.0 * std::log(u1)) * std::cos(2.0 * 3.14159265358979323846 * u2);
 }
 
 
@@ -2004,6 +2071,16 @@ typedef struct {
     double distractedSigma;        // sensitivity multiplier when distracted
     double transitionToDistracted; // P(distracted | focused)
     double transitionToFocused;    // P(focused | distracted)
+    // Section 5.1: game-to-game variance
+    double gameFormMult;           // exp(θ_game) — per-game s multiplier
+    double gameAggroTilt;          // a_g archetype
+    double gameRiskTilt;           // r_g archetype
+    // Section 5.2: tilt state machine
+    double tiltLevel;              // 0–3, grows on loss, decays on win
+    // Section 5.4: running accuracy for governor
+    double runningAccSum;
+    int    runningAccN;
+    double accTarget;              // per-game accuracy target (65–85%)
 } HEState;
 
 
@@ -2016,7 +2093,9 @@ static int            HECfgElo = -1;      // last ELO whose options were sent
 
 static void HEStatsReset(void);
 static void HECoreNewGame(int playingWhite, int elo) {
+    double savedTilt = HES.tiltLevel; // Section 5.2: tilt carries across games
     memset(&HES, 0, sizeof(HES));
+    HES.tiltLevel = savedTilt;
     HEStatsReset();
     HEHP = HEParamsFor(elo);
 
@@ -2036,7 +2115,17 @@ static void HECoreNewGame(int playingWhite, int elo) {
     HES.distractedSigma        = 1.30 + HEFrand() * 0.40;
     HES.transitionToDistracted = 0.03 + 0.04 * (1.0 - HEHP.t);
     HES.transitionToFocused    = 0.15 + 0.10 * HEHP.t;
-
+    // Section 5.1: per-game form and archetype
+    double thetaGame = HEGauss() * HEHP.thetaGameSigma;
+    HES.gameFormMult  = std::exp(thetaGame);
+    HES.gameAggroTilt = HEGauss() * 0.22;
+    HES.gameRiskTilt  = HEGauss() * 0.18;
+    // Section 5.2: tilt — preserved across games, but init to 0 on first
+    // (tiltLevel is NOT reset here — it carries across games in a session)
+    // Section 5.4: running accuracy + per-game target
+    HES.runningAccSum = 0;
+    HES.runningAccN   = 0;
+    HES.accTarget     = 65.0 + HEFrand() * 20.0; // Uniform(65%, 85%)
 
     HEClockSeconds = -1;
     HELastOwnTo = -1;
@@ -2191,17 +2280,17 @@ void HEParseInfo(const char *line) {
 static double HEHumanBias(const HEFeatures *f, int ply) {
     double t = HEHP.t, inv = 1.0 - t, w = 1.0;
 
-
-    if (f->isCapture)          w *= HES.greed;
+    // Section 2.3: capture/check impulse bias (captureImpulse 1.45→1.25)
+    if (f->isCapture)          w *= HES.greed * HEHP.captureImpulse;
     if (f->isRecapture)        w *= 1.0 + 0.90 * inv;
     if (f->capturesHigher)      w *= 1.0 + 0.60 * inv;
-    if (f->givesCheck)          w *= HES.aggro;
+    if (f->givesCheck)          w *= HES.aggro * HEHP.captureImpulse;
     if (f->attacksQueen)        w *= 1.0 + 0.30 * inv;
     if (f->isPromotion)         w *= 1.6;
 
-
-    if (f->isBackward)          w *= HES.fear;
-    if (f->isQuiet)             w *= HEHP.quietW;
+    // Section 2.3: quiet backward bias (quietBackward 0.65→0.85)
+    if (f->isBackward)          w *= HES.fear * HEHP.quietBackward;
+    if (f->isQuiet)             w *= HEHP.quietW * HEHP.quietBackward;
     if (f->isSamePieceAgain) w *= 1.0 + 0.35 * inv;
     if (f->isPawnPush)          w *= 1.0 + 0.20 * inv;
     if (f->hangsPiece)          w *= 0.25 + 0.60 * t;
@@ -3007,6 +3096,65 @@ static double HEMoveBudget(int moveNumber, double clockRemaining, double increme
 }
 
 // ===========================================================================
+// MARK: - Phase & game-level helpers
+// ===========================================================================
+
+// Section 2.3: determine game phase from ply and material
+enum HEGamePhase { HE_PHASE_OPENING = 0, HE_PHASE_MIDDLEGAME, HE_PHASE_ENDGAME };
+static HEGamePhase HEDetectPhase(const HEBoard *b, int ply) {
+    if (ply < 12) return HE_PHASE_OPENING;
+    if (!b) return HE_PHASE_MIDDLEGAME;
+    int totalMaterial = 0;
+    for (int sq = 0; sq < 64; ++sq) {
+        int v = HEPieceValue(b->sq[sq]);
+        if (v >= 300 && v <= 400) totalMaterial += 3;
+        else if (v == 500) totalMaterial += 5;
+        else if (v == 900) totalMaterial += 9;
+    }
+    if (totalMaterial <= 16) return HE_PHASE_ENDGAME;
+    return HE_PHASE_MIDDLEGAME;
+}
+
+// Section 2.3: phase multiplier on s_eff
+static double HEPhaseMult(HEGamePhase phase) {
+    switch (phase) {
+        case HE_PHASE_OPENING:    return HEHP.phaseOpening;
+        case HE_PHASE_ENDGAME:    return HEHP.phaseEndgame;
+        default:                  return HEHP.phaseMid;
+    }
+}
+
+// Section 4.3: time-pressure s_clock multiplier from empirical blunder curve
+static double HETimePressureMult(double clockSeconds, double startClock) {
+    if (clockSeconds <= 0 || startClock <= 0) return 1.0;
+    double pct = clockSeconds / startClock;
+    if (pct > 0.50) return 1.00;
+    if (pct > 0.25) return 1.60;
+    if (pct > 0.10) return 1.75;
+    return 2.05;
+}
+
+// Section 5.2: tilt state machine update — call after each game result
+static void HETiltUpdate(bool wasLoss, bool wasBlunder) {
+    if (wasLoss || wasBlunder) {
+        double add = wasBlunder ? 1.0 : 0.7;
+        HES.tiltLevel = std::min(3.0, HES.tiltLevel + add);
+    } else {
+        HES.tiltLevel = std::max(0.0, HES.tiltLevel - 0.5);
+    }
+}
+
+// Section 5.2: tilt effects on s_eff and timing
+static double HETiltSMult(void) {
+    if (HES.tiltLevel < 1.5) return 1.0;
+    return 1.0 + 0.15 * std::min(HES.tiltLevel, 3.0) / 3.0 * 2.33;
+}
+static double HETiltTimeMult(void) {
+    if (HES.tiltLevel < 1.5) return 1.0;
+    return std::max(0.40, 1.0 - 0.20 * HES.tiltLevel);
+}
+
+// ===========================================================================
 // MARK: - Move choice
 // ===========================================================================
 
@@ -3159,8 +3307,36 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     bool opportunity=mateNow || (HES.haveLastCp&&jump>=250&&HEL[0].cp>=200
                  &&HES.lastCp<HEHP.convThresh);
 
+    // Section 3.2: probabilistic book exit — early plies may use book instead
+    if (ply < 20) {
+        double exitP = HEBookExitProb(ply, HEHP.bookExitPlyHalf);
+        if (HEFrand() > exitP && n > 0) {
+            // Still in "book" territory — just pick the top move quickly
+            // (book moves are always the engine's best at this ply)
+            return HECommit(0, 0);
+        }
+    }
+
     for(int i=0;i<n;++i){
-        values[i]=std::max(-2000.0,std::min(2000.0,(double)HEL[i].cp))/100.0;
+        // Section 2.1: dual-depth tactical myopia — blend shallow and true eval
+        double vTrue = std::max(-2000.0, std::min(2000.0, (double)HEL[i].cp)) / 100.0;
+        double vShallow = vTrue;
+        if (n > 1 && HEHP.dHuman < chosenDepth) {
+            // Use eval from shallow depth snapshot if available
+            int dh = std::max(1, HEHP.dHuman);
+            if (dh < HE_MAX_TRACKED_DEPTH && HEDepthCounts[dh] > 0) {
+                for (int j = 0; j < HE_MAX_PV; ++j) {
+                    if (HELinesAtDepth[dh][j].valid &&
+                        strcmp(HELinesAtDepth[dh][j].move, HEL[i].move) == 0) {
+                        vShallow = std::max(-2000.0, std::min(2000.0,
+                                   (double)HELinesAtDepth[dh][j].cp)) / 100.0;
+                        break;
+                    }
+                }
+            }
+        }
+        double vPerceived = (1.0 - HEHP.lambda) * vShallow + HEHP.lambda * vTrue;
+        values[i] = vPerceived;
         quality[i]=HEWinPct(HEL[i].cp)/100.0;
         winLoss[i]=std::max(0.0,bestWin-HEWinPct(HEL[i].cp));
         if(haveBoard)features[i]=HEExtract(&board,HEParseMove(HEL[i].move));
@@ -3184,22 +3360,47 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
 
     // H.27: composite sensitivity: s_eff = s(R) * exp(η_κ) * drift * σ_attention
     // fitLaw finds the s that matches the target AEe; we scale its result
-    HEMath::Law law=HEMath::fitLaw(delta,elo,.50);
-    double sComposite = law.s * std::exp(etaShift) * driftMult * attnSigma;
-    sComposite = HEMath::clamp(sComposite, law.s * 0.5, law.s * 3.0);
+    HEMath::Law law=HEMath::fitLaw(delta,elo,HEHP.cRegan);
+    // Section 2.3: phase multiplier on s_eff
+    HEGamePhase gamePhase = haveBoard ? HEDetectPhase(&board, ply)
+                                      : HE_PHASE_MIDDLEGAME;
+    double phaseMult = HEPhaseMult(gamePhase);
+
+    // Section 2.2: winning-position blunder surge — multiply s when winning
+    double winSurgeMult = 1.0;
+    if (HEL[0].cp > 250) winSurgeMult = HEHP.winningSMult;
+
+    // Section 5.1: game-to-game form multiplier (drawn at game start)
+    double gameForm = HES.gameFormMult;
+
+    // Section 5.2: tilt effects on s_eff
+    double tiltSMult = HETiltSMult();
+
+    double sComposite = law.s * std::exp(etaShift) * driftMult * attnSigma
+                      * phaseMult * winSurgeMult * gameForm * tiltSMult;
+    sComposite = HEMath::clamp(sComposite, law.s * 0.3, law.s * 5.0);
+
+    // Section 5.4: accuracy governor (winEveryGameMode)
+    bool winMode = [[NSUserDefaults standardUserDefaults] boolForKey:kWinEveryGameKey];
+    if (winMode && HES.runningAccN >= 3) {
+        double avgAcc = HES.runningAccSum / std::max(1, HES.runningAccN);
+        double kAcc = std::exp(0.06 * (avgAcc - HES.accTarget));
+        kAcc = HEMath::clamp(kAcc, 0.35, 3.2);
+        sComposite *= kAcc;
+    }
+
     if (std::fabs(sComposite - law.s) > 1e-10)
         law = HEMath::choice(delta, sComposite, law.c);
 
-    // Eq 61-63, 68-69: a CLOCK-CONDITIONED regime changes sensitivity.
-    // Larger s = weaker play.  More budget should LOWER s (stronger),
-    // low clock should RAISE s (weaker / time-trouble degradation).
+    // Eq 61-63, 68-69 + Section 4.3: clock-conditioned s with empirical
+    // time-pressure blunder curve multipliers.
     if(HEClockSeconds>0){
         double budget = HEMoveBudget(ply / 2, HEClockSeconds, 0);
         double clockScale=HEMath::clamp(
             1.0-0.10*std::log(budget / (HEClockSeconds / 40.0 + 1.0)),0.85,1.35);
-        if(HEClockSeconds<30.0){
-            clockScale*=1.0+0.45*(1.0-HEClockSeconds/30.0);
-        }
+        // Section 4.3: overlay empirical time-pressure multiplier
+        double startClock = std::max(180.0, HEClockSeconds + (ply / 2) * 5.0);
+        clockScale *= HETimePressureMult(HEClockSeconds, startClock);
         law=HEMath::choice(delta,law.s*clockScale,law.c);
     }
 
@@ -3214,6 +3415,32 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
 
     // H.20: apply playing style as feature tilt
     winning = HEStyleTilt(winning, features, n);
+
+    // Section 5.1: game archetype tilt on log P — shift capture/check vs quiet
+    if (std::fabs(HES.gameAggroTilt) > 0.01 || std::fabs(HES.gameRiskTilt) > 0.01) {
+        for (int i = 0; i < n; ++i) {
+            double shift = 0;
+            if (features[i].isCapture || features[i].givesCheck)
+                shift += HES.gameAggroTilt * 0.5;
+            if (features[i].isQuiet && features[i].isBackward)
+                shift -= HES.gameAggroTilt * 0.3;
+            if (features[i].isPawnPush)
+                shift += HES.gameRiskTilt * 0.4;
+            winning[i] *= std::exp(shift);
+        }
+        winning = HEMath::normalize(winning);
+    }
+
+    // Section 5.4: win-safe floor (winEveryGameMode) — prevent throwing won games
+    if (winMode && HEL[0].cp >= 180) {
+        double cpFloor = std::max(100.0, 0.45 * (double)HEL[0].cp);
+        for (int i = 0; i < n; ++i) {
+            if ((double)HEL[0].cp - (double)HEL[i].cp > cpFloor) {
+                winning[i] *= 0.05; // heavily suppress game-losing moves
+            }
+        }
+        winning = HEMath::normalize(winning);
+    }
 
     double cx=haveBoard?HEComplexity(&board,side):1.0;
     double sharp=std::min(1.5,std::max(.70,.60+.40*cx));
@@ -3323,6 +3550,15 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
         HEPendingTime->altMean=logM;
         suggested=.12+std::exp(logM+.5*.55*.55);
 
+        // Section 4.1: ΔU-based timing — deeper thought when instinct ≠ best
+        if (n >= 2) {
+            double winBest = HEWinPct(HEL[0].cp);
+            double winInstinct = HEWinPct(HEL[std::min(1, n-1)].cp);
+            double deltaU = std::max(0.0, winBest - winInstinct);
+            double mDeltaU = 1.0 + HEHP.betaElo * std::min(deltaU / 25.0, 2.0);
+            suggested *= mDeltaU;
+        }
+
         // Context gating: override the base timing for specific scenarios
         bool isOpening  = (ply < 10);
         bool isForced   = (n == 1) || (n >= 2 && winLoss[1] > 20.0
@@ -3363,10 +3599,42 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
         }
         suggested=HEMath::clamp(suggested,.15,std::max(.15,HEClockSeconds*.15));
     }
+    // Section 5.2: apply tilt to timing
+    suggested *= HETiltTimeMult();
+
     HEStats->record(law,selectedLaw,quality,k,-1,suggested,topFirstDepth);
     if(HEStats->residualCount>=5&&HEStats->residualCount%10==0)
         NSLog(@"[ChessAssistantPro] Uncalibrated move diagnostics n=%lld lag1=%.3f Q4=%.3f topFirstDepth=%d",
               HEStats->residualCount,HEStats->lagOne(),HEStats->portmanteau(),topFirstDepth);
+
+    // Section 1.1: track running accuracy for the accuracy governor
+    if (HES.haveLastCp) {
+        double wBefore = HEWinPct(HES.lastCp);
+        double wAfter  = HEWinPct(HEL[k].cp);
+        double dW = std::max(0.0, wBefore - wAfter);
+        double moveAcc = HEMoveAccuracy(dW);
+        HES.runningAccSum += moveAcc;
+        HES.runningAccN++;
+    }
+
+    // Section 5.3: resignation behavior
+    if (ply >= HEHP.resignMinPly && HEL[0].cp <= HEHP.resignCp) {
+        bool forcedMate = (HEL[0].mateIn < 0 && HEL[0].mateIn >= -3);
+        double resignProb = 0;
+        if (forcedMate) {
+            resignProb = 0.80;
+        } else if (elo >= 1200) {
+            resignProb = 0.20;
+        } else if (elo >= 800) {
+            resignProb = 0.15 + 0.10 * ((double)(elo - 800) / 500.0);
+        }
+        if (resignProb > 0 && HEFrand() < resignProb) {
+            NSLog(@"[ChessAssistantPro] Resignation triggered ELO=%d ply=%d cp=%d",
+                  elo, ply, HEL[0].cp);
+            return "resign";
+        }
+    }
+
     return HECommit(k,winLoss[k]);
 }
 
@@ -3533,6 +3801,7 @@ NSArray<NSString *> *HEConfigureCommands(int elo) {
 NSString *HEChooseMove(const char *fen, int ply, int elo) {
     std::lock_guard<std::recursive_mutex> lock(*HEMutex);
     const char *m = HECoreChooseMove(fen, ply, elo);
+    if (m && strcmp(m, "resign") == 0) return nil; // Section 5.3: resign = no move
     return m ? [NSString stringWithUTF8String:m] : nil;
 }
 
@@ -3967,6 +4236,7 @@ static UIButton *CAPFindPauseButton(UIView *view) {
 static char kAutoPlayRowKey, kAutoEngineRowKey, kDelayRowKey,
             kMinDelayFieldKey, kMaxDelayFieldKey;
 static char kGodEngineRowKey, kStockfishSkillRowKey, kStockfishSkillLabelKey;
+static char kWinEveryGameRowKey;
 
 static UISegmentedControl *CAPFindSegment(UIView *view) {
     if ([view isKindOfClass:UISegmentedControl.class]) return (UISegmentedControl *)view;
@@ -4132,6 +4402,39 @@ static void CAPInsertGodEngine(id panel) {
     objc_setAssociatedObject(panel, &kGodEngineRowKey, row, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+// Section 5.4: Win Every Game Mode toggle in overlay
+static void CAPInsertWinEveryGame(id panel) {
+    if (![panel isKindOfClass:UIView.class]) return;
+    UIView *existing = objc_getAssociatedObject(panel, &kWinEveryGameRowKey);
+    if ([existing isDescendantOfView:(UIView *)panel]) return;
+    UIButton *pause = CAPFindPauseButton((UIView *)panel);
+    if (!pause) return;
+    UIView *child = pause;
+    UIStackView *stack = nil;
+    while (child.superview) {
+        UIView *parent = child.superview;
+        if ([parent isKindOfClass:UIStackView.class] &&
+            [((UIStackView *)parent).arrangedSubviews containsObject:child]) {
+            stack = (UIStackView *)parent;
+            break;
+        }
+        child = parent;
+    }
+    if (!stack || ![panel respondsToSelector:@selector(switchOn:sel:)] ||
+        ![panel respondsToSelector:@selector(rowTitle:control:)]) return;
+    NSUInteger index = [stack.arrangedSubviews indexOfObject:child];
+    if (index == NSNotFound) return;
+    UISwitch *toggle = ((id (*)(id, SEL, BOOL, SEL))objc_msgSend)
+        (panel, @selector(switchOn:sel:),
+         [[NSUserDefaults standardUserDefaults] boolForKey:kWinEveryGameKey],
+         @selector(cap_winEveryGameChanged:));
+    UIView *row = ((id (*)(id, SEL, id, id))objc_msgSend)
+        (panel, @selector(rowTitle:control:), @"Win Every Game", toggle);
+    if (![row isKindOfClass:UIView.class]) return;
+    [stack insertArrangedSubview:row atIndex:index];
+    objc_setAssociatedObject(panel, &kWinEveryGameRowKey, row, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 static UISlider *CAPFindEloSlider(UIView *view) {
     if ([view isKindOfClass:UISlider.class]) {
         UISlider *slider = (UISlider *)view;
@@ -4287,6 +4590,7 @@ static void CAPInstallDumpGesture(id panel) {
     CAPInsertGodEngine(self);
     CAPInsertStockfishSkill(self);
     CAPInsertAutoPlay(self);
+    CAPInsertWinEveryGame(self);
     CAPInstallDumpGesture(self);
 }
 - (void)populate {
@@ -4295,6 +4599,7 @@ static void CAPInstallDumpGesture(id panel) {
     CAPInsertGodEngine(self);
     CAPInsertStockfishSkill(self);
     CAPInsertAutoPlay(self);
+    CAPInsertWinEveryGame(self);
     CAPInstallDumpGesture(self);
 }
 - (void)eloSlide:(UISlider *)sender {
@@ -4394,6 +4699,11 @@ static void CAPInstallDumpGesture(id panel) {
         CAPSyncEngineChoiceUI(self);
         CAPScheduleCachedMove();
     }
+}
+%new
+- (void)cap_winEveryGameChanged:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:kWinEveryGameKey];
+    NSLog(@"[ChessAssistantPro] Win Every Game mode %@", sender.on ? @"ON" : @"OFF");
 }
 %new
 - (void)cap_delayDone:(id)sender {

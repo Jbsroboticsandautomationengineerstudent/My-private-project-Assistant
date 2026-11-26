@@ -76,8 +76,25 @@ def stage_runtime():
     if not (FRAMEWORK / "onnxruntime").is_file() or not (FRAMEWORK / "Headers/onnxruntime_c_api.h").is_file():
         raise RuntimeError("ONNX Runtime library or C header is missing")
 
+BUNDLE_FRAMEWORK = ROOT / "layout/Frameworks/onnxruntime.framework"
+
+def bundle_framework():
+    """Copy the ORT shared library into layout/Frameworks/ so it ends up
+    inside Chess.app/Frameworks/ when sideloaded."""
+    binary_src = FRAMEWORK / "onnxruntime"
+    info_src = FRAMEWORK / "Info.plist"
+    if not binary_src.is_file():
+        raise RuntimeError("ORT framework binary not found after staging")
+    BUNDLE_FRAMEWORK.mkdir(parents=True, exist_ok=True)
+    binary_dst = BUNDLE_FRAMEWORK / "onnxruntime"
+    if not binary_dst.is_file() or binary_dst.stat().st_size != binary_src.stat().st_size:
+        shutil.copy2(binary_src, binary_dst)
+    if info_src.is_file():
+        shutil.copy2(info_src, BUNDLE_FRAMEWORK / "Info.plist")
+
 def main():
     stage_runtime()
+    bundle_framework()
     expected = os.environ.get("MAIA79_ONNX_SHA256") or model_sha256()
     if len(expected) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in expected):
         raise RuntimeError("MAIA79_ONNX_SHA256 must be a SHA-256 hex digest")
@@ -85,6 +102,7 @@ def main():
     if MODEL.stat().st_size < 200_000_000:
         raise RuntimeError("Maia 79M ONNX file is unexpectedly small")
     print(f"Staged {MODEL} and {FRAMEWORK}")
+    print(f"Bundled framework at {BUNDLE_FRAMEWORK}")
 
 if __name__ == "__main__":
     main()

@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-13
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -16,6 +16,16 @@ jobs:
 
       - name: Setup Theos
         uses: Randomblock1/theos-action@v1
+
+      - name: Cache assets and engine sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ChessAssistantPro/.asset-cache
+            ChessAssistantPro/.build-sources
+          key: assets-${{ hashFiles('ChessAssistantPro/prepare_assets.py', 'ChessAssistantPro/build_stockfish19.sh', 'ChessAssistantPro/build_triumviratus.sh') }}
+          restore-keys: |
+            assets-
 
       - name: Build package
         working-directory: ./ChessAssistantPro

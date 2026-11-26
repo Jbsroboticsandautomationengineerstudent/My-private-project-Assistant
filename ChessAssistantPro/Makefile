@@ -28,18 +28,7 @@ assets:
 
 # Download before compilation so the ONNX Runtime headers and library exist.
 # Theos prefixes layout/ with /var/jb for rootless packages.
-# Engine builds (Stockfish 19 / Triumviratus) are skipped when the iOS SDK
-# is not available (e.g. GitHub Actions CI) — they are only needed for the
-# final .deb, not for verifying the tweak compiles.
 before-all::
 	@python3 prepare_assets.py
-	@if xcrun --sdk iphoneos --show-sdk-path >/dev/null 2>&1; then \
-		bash build_stockfish19.sh; \
-	else \
-		echo "[skip] build_stockfish19.sh — no iOS SDK"; \
-	fi
-	@if xcrun --sdk iphoneos --show-sdk-path >/dev/null 2>&1; then \
-		bash build_triumviratus.sh; \
-	else \
-		echo "[skip] build_triumviratus.sh — no iOS SDK"; \
-	fi
+	@bash build_stockfish19.sh
+	@bash build_triumviratus.sh

@@ -2091,15 +2091,28 @@ typedef struct {
     double gamePhaseMult;          // multiplier on phase sensitivity shift
     double gameSClampMult;         // per-game jitter on sComposite clamp ceiling
     int    gameDepthOffset;        // -1, 0, or +1 depth jitter (set once per game)
-    // Streak breaker: track consecutive move classes to force variety
+    // Human momentum: hot/cold streaks like real players
     int    lastMoveClass;          // HE_TOP..HE_BLUNDER of last move played
     int    consecutiveSameClass;   // how many in a row of the same class
-    int    consecutiveGoodMoves;   // consecutive Top+Good moves (streak detection)
+    int    consecutiveGoodMoves;   // consecutive Top+Good moves
+    double momentum;               // -1.0(cold)..+1.0(hot), drifts naturally
+    double momentumTarget;         // where momentum is drifting toward
+    int    momentumPhaseLen;       // moves until next momentum target change
+    int    momentumPhaseCtr;       // counter within current phase
+    // Human moments: random focus-loss windows mid-game
+    int    humanMomentStart;       // ply where next "human moment" begins
+    int    humanMomentLen;         // how many moves the accuracy drop lasts
+    double humanMomentStr;         // strength of the accuracy drop (0.3-0.8)
+    int    humanMomentsUsed;       // how many moments have occurred this game
+    int    humanMomentsMax;        // max moments for this game (1-3)
     // Per-game randomized thresholds
     double gameAheadThresh;        // randomized isAhead quality threshold
     double gameLapseMult;          // per-game lapse rate multiplier
     double gameEvalNoise;          // per-game eval perception noise scale
     double gameArchetypeShift;     // per-game archetype tilt magnitude shift
+    // CPL fat-tail: probability of a single large blunder per move
+    double gameFatTailProb;        // per-game probability of a sudden big error
+    double gameFatTailMag;         // magnitude of the fat-tail blunder
 } HEState;
 
 
@@ -2155,15 +2168,28 @@ static void HECoreNewGame(int playingWhite, int elo) {
     HES.gamePhaseMult     = 0.75 + HEFrand() * 0.50;
     HES.gameSClampMult    = 0.70 + HEFrand() * 0.60;
     HES.gameDepthOffset   = (int)arc4random_uniform(3) - 1;
-    // Streak breaker init
+    // Human momentum: start at a random point in a random phase
     HES.lastMoveClass        = -1;
     HES.consecutiveSameClass = 0;
     HES.consecutiveGoodMoves = 0;
+    HES.momentum             = HEGauss() * 0.30;
+    HES.momentumTarget       = (HEFrand() < 0.5) ? (-0.3 - HEFrand()*0.5) : (0.2 + HEFrand()*0.5);
+    HES.momentumPhaseLen     = 3 + (int)arc4random_uniform(5);
+    HES.momentumPhaseCtr     = 0;
+    // Human moments: schedule 1-3 random accuracy-drop windows across the game
+    HES.humanMomentsMax      = 1 + (int)arc4random_uniform(3);
+    HES.humanMomentsUsed     = 0;
+    HES.humanMomentStart     = 8 + (int)arc4random_uniform(15);
+    HES.humanMomentLen       = 2 + (int)arc4random_uniform(3);
+    HES.humanMomentStr       = 0.30 + HEFrand() * 0.50;
     // Per-game randomized thresholds
     HES.gameAheadThresh    = 0.50 + HEFrand() * 0.20;
     HES.gameLapseMult      = 0.60 + HEFrand() * 0.80;
     HES.gameEvalNoise      = 0.03 + HEFrand() * 0.07;
     HES.gameArchetypeShift = 0.70 + HEFrand() * 0.60;
+    // CPL fat tails: occasional single-move large blunders (right-skewed distribution)
+    HES.gameFatTailProb    = 0.03 + HEFrand() * 0.07;
+    HES.gameFatTailMag     = 0.40 + HEFrand() * 0.40;
 
     HEClockSeconds = -1;
     HELastOwnTo = -1;
@@ -3420,8 +3446,11 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     // Section 5.2: tilt effects on s_eff
     double tiltSMult = HETiltSMult();
 
+    // Session fatigue: errors increase naturally as the game goes on
+    double fatigueMult = 1.0 + 0.008 * std::max(0, ply - 10) * (0.7 + HEFrand() * 0.6);
+    fatigueMult = std::min(fatigueMult, 1.8);
     double sComposite = law.s * std::exp(etaShift) * driftMult * attnSigma
-                      * phaseMult * winSurgeMult * gameForm * tiltSMult;
+                      * phaseMult * winSurgeMult * gameForm * tiltSMult * fatigueMult;
     double sClampCeil = law.s * (6.0 + 4.0 * HES.gameSClampMult);
     sComposite = HEMath::clamp(sComposite, law.s * 0.3, sClampCeil);
 
@@ -3599,28 +3628,85 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     double effectiveLapse = HEHP.lapseRate * HES.gameLapseMult * (0.85 + HEFrand() * 0.30);
     selectedLaw = HEApplyLapse(selectedLaw, law.p, winLoss, effectiveLapse);
 
-    // Streak breaker: suppress top-class probability when too many consecutive
-    // good moves have been played — real humans don't play 5 Best in a row
-    if (HES.consecutiveGoodMoves >= 2 && n > 1) {
-        double streakPenalty = HEMath::clamp(0.15 * (HES.consecutiveGoodMoves - 1), 0.0, 0.60);
-        streakPenalty *= (0.80 + HEFrand() * 0.40);
+    // Human momentum system: players go through hot/cold phases naturally.
+    // Hot momentum → more Best/Good, cold momentum → more Inaccuracy/Mistake.
+    // This creates the natural streaky patterns that real humans exhibit.
+    {
+        // Drift momentum toward its target
+        double mDelta = (HES.momentumTarget - HES.momentum) * 0.15;
+        HES.momentum += mDelta + HEGauss() * 0.08;
+        HES.momentum = HEMath::clamp(HES.momentum, -1.0, 1.0);
+        HES.momentumPhaseCtr++;
+        // When phase ends, pick a new random target (hot or cold)
+        if (HES.momentumPhaseCtr >= HES.momentumPhaseLen) {
+            HES.momentumPhaseCtr = 0;
+            HES.momentumPhaseLen = 3 + (int)arc4random_uniform(6);
+            if (HEFrand() < 0.45)
+                HES.momentumTarget = -0.2 - HEFrand() * 0.6;
+            else if (HEFrand() < 0.65)
+                HES.momentumTarget = 0.1 + HEFrand() * 0.5;
+            else
+                HES.momentumTarget = HEGauss() * 0.2;
+        }
+        // Apply momentum: hot boosts Top/Good, cold boosts Mistake/Blunder
+        if (n > 1 && std::fabs(HES.momentum) > 0.05) {
+            double m = HES.momentum;
+            for (int i = 0; i < n; ++i) {
+                int c = HEClassOf(winLoss[i]);
+                double mShift = 0;
+                if (c == HE_TOP)        mShift =  0.30 * m;
+                else if (c == HE_GOOD)  mShift =  0.15 * m;
+                else if (c == HE_MISTAKE) mShift = -0.20 * m;
+                else if (c == HE_BLUNDER) mShift = -0.35 * m;
+                selectedLaw[i] *= std::exp(mShift);
+            }
+            selectedLaw = HEMath::normalize(selectedLaw);
+        }
+    }
+    // Human moments: scheduled accuracy-drop windows where the "player"
+    // loses focus for 2-4 moves. This creates the mid-game accuracy dips
+    // that fair-play specialists expect to see in real human games.
+    if (HES.humanMomentsUsed < HES.humanMomentsMax
+        && ply >= HES.humanMomentStart
+        && ply < HES.humanMomentStart + HES.humanMomentLen * 2) {
+        double dropStr = HES.humanMomentStr * (0.70 + HEFrand() * 0.60);
         for (int i = 0; i < n; ++i) {
             int c = HEClassOf(winLoss[i]);
-            if (c == HE_TOP) selectedLaw[i] *= (1.0 - streakPenalty);
+            if (c <= HE_GOOD) selectedLaw[i] *= (1.0 - dropStr);
+            if (c >= HE_MISTAKE) selectedLaw[i] *= (1.0 + dropStr * 0.5);
         }
         selectedLaw = HEMath::normalize(selectedLaw);
+        // Schedule the next human moment when this one ends
+        if (ply >= HES.humanMomentStart + HES.humanMomentLen * 2 - 1) {
+            HES.humanMomentsUsed++;
+            HES.humanMomentStart = ply + 5 + (int)arc4random_uniform(12);
+            HES.humanMomentLen   = 2 + (int)arc4random_uniform(3);
+            HES.humanMomentStr   = 0.30 + HEFrand() * 0.50;
+        }
     }
-    // Same-class streak breaker: avoid picking the same class 3+ times in a row
-    if (HES.consecutiveSameClass >= 2 && HES.lastMoveClass >= 0 && n > 1) {
-        double sameClassPen = HEMath::clamp(0.20 * (HES.consecutiveSameClass - 1), 0.0, 0.50);
+    // CPL fat-tail injection: with small probability, strongly boost error
+    // moves to create the right-skewed CPL distribution real humans have
+    // (mostly small losses, occasional large spike)
+    if (HEFrand() < HES.gameFatTailProb && n > 1 && ply >= 6) {
         for (int i = 0; i < n; ++i) {
-            if (HEClassOf(winLoss[i]) == HES.lastMoveClass)
-                selectedLaw[i] *= (1.0 - sameClassPen);
+            int c = HEClassOf(winLoss[i]);
+            if (c >= HE_INACC) selectedLaw[i] *= (1.0 + HES.gameFatTailMag * 2.0);
+            if (c == HE_TOP)   selectedLaw[i] *= (1.0 - HES.gameFatTailMag);
         }
         selectedLaw = HEMath::normalize(selectedLaw);
     }
-    // Final entropy injection: add small random noise to every candidate
-    // to prevent deterministic picks from repeated positions
+    // Phase-dependent accuracy: opening should be different from middlegame,
+    // different from endgame — real humans concentrate differently per phase
+    {
+        double phaseNoise = 0;
+        if (ply < 12)       phaseNoise = HEGauss() * 0.06;
+        else if (ply < 30)  phaseNoise = HEGauss() * 0.10;
+        else                phaseNoise = HEGauss() * 0.08 + 0.03;
+        for (int i = 0; i < n; ++i)
+            selectedLaw[i] *= std::exp(HEGauss() * 0.05 + phaseNoise * (HEClassOf(winLoss[i]) >= HE_INACC ? 0.5 : -0.3));
+        selectedLaw = HEMath::normalize(selectedLaw);
+    }
+    // Final entropy injection
     for (int i = 0; i < n; ++i) {
         selectedLaw[i] *= std::exp(HEGauss() * 0.08);
     }
@@ -3628,7 +3714,7 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
 
     int k=HEPick(selectedLaw.data(),n);
     if(k<0)k=0;
-    // Update streak tracking
+    // Update streak and momentum tracking
     {
         int pickedClass = HEClassOf(winLoss[k]);
         if (pickedClass == HES.lastMoveClass) HES.consecutiveSameClass++;
@@ -3636,6 +3722,9 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
         HES.lastMoveClass = pickedClass;
         if (pickedClass <= HE_GOOD) HES.consecutiveGoodMoves++;
         else HES.consecutiveGoodMoves = 0;
+        // Feedback: good moves build momentum, bad moves drain it
+        if (pickedClass <= HE_GOOD) HES.momentum += 0.05;
+        else if (pickedClass >= HE_MISTAKE) HES.momentum -= 0.08;
     }
     NSLog(@"[ChessAssistantPro] Human choice ELO=%d ply=%d depth=%d candidates=%d classes=%d/%d/%d/%d/%d picked=%d loss=%.1fpp attn=%.2f drift=%.3f eta=%.3f",
           elo,ply,chosenDepth,n,available[0],available[1],available[2],

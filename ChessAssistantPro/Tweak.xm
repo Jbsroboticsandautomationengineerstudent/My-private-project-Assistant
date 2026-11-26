@@ -1662,7 +1662,7 @@ static HEParams HEParamsFor(int elo) {
     // Section 4.1: Russek ΔU weight
     p.betaElo        = 0.35 + 0.40 * t;    // 0.35@600, 0.75@1319
     // Section 5.1: game form sigma
-    p.thetaGameSigma = 0.22;
+    p.thetaGameSigma = 0.38;
     // Section 5.3: resignation thresholds
     p.resignCp       = -1200.0 + 550.0 * t; // -1200@600, -650@1319
     p.resignMinPly   = (int)lround(80.0 - 40.0 * t); // 80@600, 40@1319
@@ -2101,9 +2101,9 @@ static void HECoreNewGame(int playingWhite, int elo) {
 
 
     HES.isWhite = playingWhite ? 1 : 0;
-    HES.greed         = HEHP.greedBase + HEFrand() * 0.50;
-    HES.aggro         = HEHP.aggroBase + HEFrand() * 0.45;
-    HES.fear          = HEHP.fearBase     + HEFrand() * 0.30;
+    HES.greed         = HEHP.greedBase + HEFrand() * 0.75;
+    HES.aggro         = HEHP.aggroBase + HEFrand() * 0.70;
+    HES.fear          = HEHP.fearBase     + HEFrand() * 0.50;
     if (playingWhite) HES.aggro *= 1.20; else HES.fear *= 1.15;
     // H.13: session drift
     HES.lastLoss      = 0;
@@ -2118,16 +2118,14 @@ static void HECoreNewGame(int playingWhite, int elo) {
     // Section 5.1: per-game form and archetype
     double thetaGame = HEGauss() * HEHP.thetaGameSigma;
     HES.gameFormMult  = std::exp(thetaGame);
-    HES.gameAggroTilt = HEGauss() * 0.22;
-    HES.gameRiskTilt  = HEGauss() * 0.18;
+    HES.gameAggroTilt = HEGauss() * 0.40;
+    HES.gameRiskTilt  = HEGauss() * 0.35;
     // Section 5.2: tilt — preserved across games, but init to 0 on first
     // (tiltLevel is NOT reset here — it carries across games in a session)
     // Section 5.4: running accuracy + per-game target
     HES.runningAccSum = 0;
     HES.runningAccN   = 0;
-    double accBase = (HEHP.t >= 0) ? (50.0 + 25.0 * HEHP.t)
-                                    : (50.0 + 60.0 * HEHP.t);
-    HES.accTarget     = accBase + HEFrand() * 12.0;
+    HES.accTarget     = 65.0 + HEFrand() * 20.0;
 
     HEClockSeconds = -1;
     HELastOwnTo = -1;
@@ -3313,7 +3311,7 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     // At low ELO, skip book most of the time — 400-rated players don't play theory
     if (ply < 20) {
         double exitP = HEBookExitProb(ply, HEHP.bookExitPlyHalf);
-        double bookSkip = HEMath::clamp(0.5 - HEHP.t, 0.0, 0.95);
+        double bookSkip = HEMath::clamp(0.35 - 0.30 * HEHP.t, 0.0, 0.85);
         if (HEFrand() > exitP && HEFrand() > bookSkip && n > 0) {
             return HECommit(0, 0);
         }
@@ -3382,9 +3380,9 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
                       * phaseMult * winSurgeMult * gameForm * tiltSMult;
     sComposite = HEMath::clamp(sComposite, law.s * 0.3, law.s * 5.0);
 
-    // Section 5.4: accuracy governor (winEveryGameMode)
+    // Section 5.4: accuracy governor — always active to keep accuracy in target range
     bool winMode = [[NSUserDefaults standardUserDefaults] boolForKey:kWinEveryGameKey];
-    if (winMode && HES.runningAccN >= 3) {
+    if (HES.runningAccN >= 3) {
         double avgAcc = HES.runningAccSum / std::max(1, HES.runningAccN);
         double kAcc = std::exp(0.06 * (avgAcc - HES.accTarget));
         kAcc = HEMath::clamp(kAcc, 0.35, 3.2);
@@ -3436,7 +3434,7 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     // Section 5.4: win-safe floor (winEveryGameMode) — prevent throwing won games
     // Scale with ELO: low-rated players throw winning positions regularly
     if (winMode && HEL[0].cp >= 180) {
-        double floorStr = HEMath::clamp(0.2 + 0.8 * HEHP.t, 0.0, 1.0);
+        double floorStr = HEMath::clamp(0.10 + 0.60 * HEHP.t, 0.0, 0.80);
         double cpFloor = std::max(100.0, 0.45 * (double)HEL[0].cp);
         for (int i = 0; i < n; ++i) {
             if ((double)HEL[0].cp - (double)HEL[i].cp > cpFloor) {
@@ -3456,18 +3454,29 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     // Low-rated players still blunder constantly even when ahead.
     bool isAhead = (quality[0] >= 0.60);
     if(isAhead){
-        double aheadStr = HEMath::clamp(0.3 + 0.7 * HEHP.t, 0.0, 1.0);
+        double aheadStr = HEMath::clamp(0.15 + 0.50 * HEHP.t, 0.0, 0.65);
         proposedMix[HE_BLUNDER] *= (1.0 - aheadStr);
-        proposedMix[HE_MISTAKE] *= (1.0 - 0.75 * aheadStr);
+        proposedMix[HE_MISTAKE] *= (1.0 - 0.50 * aheadStr);
     }
     if(ply<8){
         proposedMix[HE_MISTAKE]*=.85-.25*HEHP.t;
         proposedMix[HE_BLUNDER]*=.75-.30*HEHP.t;
     }
     if(HES.haveLastCp&&HES.lastCp>=HEHP.convThresh&&HEL[0].cp>=HEHP.convThresh){
-        double convStr = HEMath::clamp(HEHP.t, 0.0, 1.0);
-        proposedMix[HE_MISTAKE] *= 1.0 - convStr * (0.10 + 0.20 * HEHP.t);
+        double convStr = HEMath::clamp(0.10 + 0.60 * HEHP.t, 0.0, 0.70);
+        proposedMix[HE_MISTAKE] *= 1.0 - convStr * 0.30;
         proposedMix[HE_BLUNDER] *= (1.0 - convStr);
+    }
+    // Governor mix correction: if accuracy is overshooting target, re-inject errors
+    if (HES.runningAccN >= 3) {
+        double avgAcc = HES.runningAccSum / std::max(1, HES.runningAccN);
+        if (avgAcc > HES.accTarget + 3.0) {
+            double excess = HEMath::clamp((avgAcc - HES.accTarget) / 15.0, 0.0, 1.0);
+            proposedMix[HE_BLUNDER] = std::max(proposedMix[HE_BLUNDER],
+                                                HEHP.mix[HE_BLUNDER] * 0.50 * excess);
+            proposedMix[HE_MISTAKE] = std::max(proposedMix[HE_MISTAKE],
+                                                HEHP.mix[HE_MISTAKE] * 0.50 * excess);
+        }
     }
     proposedMix=HEMath::normalize(proposedMix);
 

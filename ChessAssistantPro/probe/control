@@ -1,0 +1,9 @@
+Package: com.jerich.chessprobe
+Name: ChessProbe
+Version: 0.1.0
+Architecture: iphoneos-arm64
+Description: Read-only Swift board probe
+Maintainer: jerich
+Author: jerich
+Section: Tweaks
+Depends: mobilesubstrate

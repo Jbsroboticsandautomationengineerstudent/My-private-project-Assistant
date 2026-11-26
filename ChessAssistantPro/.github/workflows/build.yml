@@ -1,0 +1,32 @@
+name: Build Chess Assistant Pro
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-26-intel
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Setup Theos
+        uses: Randomblock1/theos-action@v1
+      - name: Cache Triumviratus network
+        uses: actions/cache@v4
+        with:
+          path: .asset-cache/triumviratus/nn-consilium-plebis.nnue
+          key: triumviratus-8.1-net-b069fc089421bdf2dfcc5d7ea4de2345d7af4795cd996373c07d5f5cf67e0670
+      - name: Cache Stockfish 19 network
+        uses: actions/cache@v4
+        with:
+          path: .asset-cache/stockfish19/nn-1a298aa575a0.nnue
+          key: stockfish-19-net-1a298aa575a0
+      - name: Build package
+        run: make clean package FINALPACKAGE=1
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chess-assistant-pro-deb
+          path: packages/*.deb

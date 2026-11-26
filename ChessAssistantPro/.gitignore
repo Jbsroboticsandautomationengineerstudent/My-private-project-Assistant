@@ -1,0 +1,9 @@
+.asset-cache/
+.analysis_tools/
+.build-sources/
+.theos/
+layout/
+packages/
+__pycache__/
+*.pyc
+*.deb

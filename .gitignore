@@ -8,3 +8,5 @@ __pycache__/
 .asset-cache/
 packages/
 ChessAssistantPro/.git/
+ChessAssistantPro/.git_backup/
+chess_dylib_strings.txt

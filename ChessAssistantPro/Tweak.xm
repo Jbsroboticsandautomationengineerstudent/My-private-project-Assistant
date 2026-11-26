@@ -1607,7 +1607,7 @@ static HEParams HEParamsFor(int elo) {
     p.multipv        = (int)lround(40.0 - 10.0 * t);
     for (int c = 0; c < HE_NCLASS; c++)
           p.mix[c]   = HEMix600[c] + (HEMix1319[c] - HEMix600[c]) * t;
-    p.spotObvious = 0.60 + 0.25 * t;
+    p.spotObvious = 0.40 + 0.45 * t;
     p.spotTactic     = 0.15 + 0.45 * t;
     p.spotMate1      = 0.85 + 0.15 * t;
     p.visW           = 1.50 - 1.00 * t;
@@ -1650,8 +1650,8 @@ static HEParams HEParamsFor(int elo) {
     p.lambda         = 0.28 + 0.40 * t;    // 0.28@600, 0.68@1319
     // Section 2.2: winning-position s multiplier
     p.winningSMult   = 1.50 + 0.05 * t;    // 1.50@600, 1.55@1319
-    // Section 2.3: phase multipliers
-    p.phaseOpening   = 0.78;
+    // Section 2.3: phase multipliers — opening bonus weakens at low ELO
+    p.phaseOpening   = 0.78 + 0.52 * std::max(0.0, -t);
     p.phaseMid       = 1.25;
     p.phaseEndgame   = 1.10;
     // Section 2.3: impulse bias
@@ -2125,7 +2125,9 @@ static void HECoreNewGame(int playingWhite, int elo) {
     // Section 5.4: running accuracy + per-game target
     HES.runningAccSum = 0;
     HES.runningAccN   = 0;
-    HES.accTarget     = 65.0 + HEFrand() * 20.0; // Uniform(65%, 85%)
+    double accBase = (HEHP.t >= 0) ? (50.0 + 25.0 * HEHP.t)
+                                    : (50.0 + 60.0 * HEHP.t);
+    HES.accTarget     = accBase + HEFrand() * 12.0;
 
     HEClockSeconds = -1;
     HELastOwnTo = -1;
@@ -3308,11 +3310,11 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
                  &&HES.lastCp<HEHP.convThresh);
 
     // Section 3.2: probabilistic book exit — early plies may use book instead
+    // At low ELO, skip book most of the time — 400-rated players don't play theory
     if (ply < 20) {
         double exitP = HEBookExitProb(ply, HEHP.bookExitPlyHalf);
-        if (HEFrand() > exitP && n > 0) {
-            // Still in "book" territory — just pick the top move quickly
-            // (book moves are always the engine's best at this ply)
+        double bookSkip = HEMath::clamp(0.5 - HEHP.t, 0.0, 0.95);
+        if (HEFrand() > exitP && HEFrand() > bookSkip && n > 0) {
             return HECommit(0, 0);
         }
     }
@@ -3432,11 +3434,13 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     }
 
     // Section 5.4: win-safe floor (winEveryGameMode) — prevent throwing won games
+    // Scale with ELO: low-rated players throw winning positions regularly
     if (winMode && HEL[0].cp >= 180) {
+        double floorStr = HEMath::clamp(0.2 + 0.8 * HEHP.t, 0.0, 1.0);
         double cpFloor = std::max(100.0, 0.45 * (double)HEL[0].cp);
         for (int i = 0; i < n; ++i) {
             if ((double)HEL[0].cp - (double)HEL[i].cp > cpFloor) {
-                winning[i] *= 0.05; // heavily suppress game-losing moves
+                winning[i] *= (1.0 - 0.95 * floorStr);
             }
         }
         winning = HEMath::normalize(winning);
@@ -3448,21 +3452,22 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     proposedMix[HE_MISTAKE]*=sharp;proposedMix[HE_BLUNDER]*=sharp;
 
     // When winning (bestQuality >= 0.60 i.e. eval >= +1.5 pawns or so),
-    // suppress blunders entirely and reduce mistakes heavily.
-    // Real strong humans beat 400-1319 by keeping blunders near zero while
-    // still making natural inaccuracies (15-60 cp).
+    // suppress blunders and mistakes — but scale with ELO.
+    // Low-rated players still blunder constantly even when ahead.
     bool isAhead = (quality[0] >= 0.60);
     if(isAhead){
-        proposedMix[HE_BLUNDER]=0.0;
-        proposedMix[HE_MISTAKE]*=0.25;
+        double aheadStr = HEMath::clamp(0.3 + 0.7 * HEHP.t, 0.0, 1.0);
+        proposedMix[HE_BLUNDER] *= (1.0 - aheadStr);
+        proposedMix[HE_MISTAKE] *= (1.0 - 0.75 * aheadStr);
     }
     if(ply<8){
         proposedMix[HE_MISTAKE]*=.85-.25*HEHP.t;
         proposedMix[HE_BLUNDER]*=.75-.30*HEHP.t;
     }
     if(HES.haveLastCp&&HES.lastCp>=HEHP.convThresh&&HEL[0].cp>=HEHP.convThresh){
-        proposedMix[HE_MISTAKE]*=.90-.20*HEHP.t;
-        proposedMix[HE_BLUNDER]*=0.0;  // zero blunders while converting
+        double convStr = HEMath::clamp(HEHP.t, 0.0, 1.0);
+        proposedMix[HE_MISTAKE] *= 1.0 - convStr * (0.10 + 0.20 * HEHP.t);
+        proposedMix[HE_BLUNDER] *= (1.0 - convStr);
     }
     proposedMix=HEMath::normalize(proposedMix);
 
@@ -3492,8 +3497,8 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
             || (features[0].isCapture && features[0].capturedValue>=300
                 && winLoss[0]<2.0);
         if(obviousWin){
-            // Suppress blunders in obvious positions — human always takes
-            for(int i=0;i<n;++i)if(winLoss[i]>5)candidate[i]*=.15;
+            double obSupp = 0.15 + 0.50 * HEMath::clamp(-HEHP.t, 0.0, 1.0);
+            for(int i=0;i<n;++i)if(winLoss[i]>5)candidate[i]*=obSupp;
             HES.missStreak=0;
         }else{
             // Non-obvious tactics: roll for recognition

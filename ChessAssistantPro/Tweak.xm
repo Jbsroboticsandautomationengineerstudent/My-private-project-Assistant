@@ -2007,7 +2007,7 @@ typedef struct {
 } HEState;
 
 
-static std::recursive_mutex HEMutex;  // protects ALL engine global state, including info lines.
+static std::recursive_mutex *HEMutex;  // protects ALL engine global state, including info lines. Heap-allocated to avoid static-init crash.
 static HEState        HES;
 static HEParams HEHP;
 static double HEClockSeconds = -1.0; // set with HEClockRemainingSeconds(), optional
@@ -2047,7 +2047,7 @@ static void HECoreNewGame(int playingWhite, int elo) {
 
 
 void HENoteOpponentMove(const char *uci) {
-    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    std::lock_guard<std::recursive_mutex> lock(*HEMutex);
     HEOppLastTo = HEParseMove(uci).to;
 }
 
@@ -2075,7 +2075,7 @@ static int HEDepthCounts[HE_MAX_TRACKED_DEPTH];
 
 
 void HEResetLines(void) {
-    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    std::lock_guard<std::recursive_mutex> lock(*HEMutex);
     memset(HELines, 0, sizeof(HELines));
     HELineCount = 0;
     memset(HELinesAtDepth, 0, sizeof(HELinesAtDepth));
@@ -2127,7 +2127,7 @@ static int HECoreConfigure(int elo, char out[][HE_CMD_LEN], int max) {
 
 // Parses "info depth D ... multipv K score cp X ... pv MOVE ..."
 void HEParseInfo(const char *line) {
-    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    std::lock_guard<std::recursive_mutex> lock(*HEMutex);
     if (!line) return;
     if (!strstr(line, " multipv ") || !strstr(line, " pv ")) return;
     if (strstr(line, " lowerbound") || strstr(line, " upperbound")) return;
@@ -2843,9 +2843,9 @@ struct HEClockTiming {
     bool active=false;
     double motor=.12,spread=.55,baseMean=0,altMean=0;
 };
-static HEClockTiming HEPendingTime;
-static HEMath::Tracker HEStats;
-static void HEStatsReset(void){HEStats=HEMath::Tracker{};HEPendingTime=HEClockTiming{};}
+static HEClockTiming *HEPendingTime;  // heap-allocated to avoid static-init crash
+static HEMath::Tracker *HEStats;  // heap-allocated to avoid static-init crash
+static void HEStatsReset(void){*HEStats=HEMath::Tracker{};*HEPendingTime=HEClockTiming{};}
 
 // ===========================================================================
 // MARK: - Section 1 equation helpers for the 400-1319 band
@@ -3063,7 +3063,7 @@ struct HEPdfDiagnostics {
     double lagOne()const {return residuals>1?lagOneNumerator/residuals:0.0;}
     double scoreZ()const {return HEMath::standardizedScore(centered,variance);}
 };
-static HEPdfDiagnostics HEPdfStats;
+static HEPdfDiagnostics *HEPdfStats;  // heap-allocated to avoid static-init crash
 
 
 static int HEClassOf(double lossW) {
@@ -3313,14 +3313,14 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     // Context-gated timing: fast-path for openings, forced moves, and time
     // scramble; reserve long thinks for genuinely complex positions.
     double suggested=0;
-    HEPendingTime=HEClockTiming{};
+    *HEPendingTime=HEClockTiming{};
     if(HEClockSeconds>0){
         double budget = HEMoveBudget(ply / 2, HEClockSeconds, 0);
         double ent=HEMath::entropy(selectedLaw);
         double logM=HEMath::timeLogMean(-.9,.30,.10,ent,budget);
-        HEPendingTime.active=true;
-        HEPendingTime.baseMean=HEMath::timeLogMean(-.9,.30,.10,HEMath::entropy(law.p),budget);
-        HEPendingTime.altMean=logM;
+        HEPendingTime->active=true;
+        HEPendingTime->baseMean=HEMath::timeLogMean(-.9,.30,.10,HEMath::entropy(law.p),budget);
+        HEPendingTime->altMean=logM;
         suggested=.12+std::exp(logM+.5*.55*.55);
 
         // Context gating: override the base timing for specific scenarios
@@ -3363,10 +3363,10 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
         }
         suggested=HEMath::clamp(suggested,.15,std::max(.15,HEClockSeconds*.15));
     }
-    HEStats.record(law,selectedLaw,quality,k,-1,suggested,topFirstDepth);
-    if(HEStats.residualCount>=5&&HEStats.residualCount%10==0)
+    HEStats->record(law,selectedLaw,quality,k,-1,suggested,topFirstDepth);
+    if(HEStats->residualCount>=5&&HEStats->residualCount%10==0)
         NSLog(@"[ChessAssistantPro] Uncalibrated move diagnostics n=%lld lag1=%.3f Q4=%.3f topFirstDepth=%d",
-              HEStats.residualCount,HEStats.lagOne(),HEStats.portmanteau(),topFirstDepth);
+              HEStats->residualCount,HEStats->lagOne(),HEStats->portmanteau(),topFirstDepth);
     return HECommit(k,winLoss[k]);
 }
 
@@ -3378,7 +3378,7 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
 // assigned a probability from the available UCI output.
 static const char *HEPdfCoreChooseMove(int elo,int ply) {
     if(!HEPdfBand(elo))return nullptr;
-    HEPdfStats.begin(elo,ply);
+    HEPdfStats->begin(elo,ply);
     int widest=0;
     for(int d=1;d<HE_MAX_TRACKED_DEPTH;++d)
         widest=std::max(widest,HEDepthCounts[d]);
@@ -3410,14 +3410,14 @@ static const char *HEPdfCoreChooseMove(int elo,int ply) {
         }
     const double target=HEMath::targetError(elo);
     const double attainable=HEMath::total(losses)/n;
-    HEPdfStats.record(law,selected,firstVisibleDepth,target,attainable);
+    HEPdfStats->record(law,selected,firstVisibleDepth,target,attainable);
     memcpy(HEPdfChosen,HEL[selected].move,sizeof(HEPdfChosen));
     NSLog(@"[ChessAssistantPro] PDF move law preset=%d depth=%d candidates=%d s=%.5f c=%.3f p0=%.4f selected=%s targetAEe=%.4f attainableAEe=%.4f",
           elo,depth,n,law.s,law.c,law.p0,HEPdfChosen,target,attainable);
-    if(HEPdfStats.moves%10==0)
+    if(HEPdfStats->moves%10==0)
         NSLog(@"[ChessAssistantPro] PDF diagnostics preset=%d moves=%lld expectedIPR=%.1f observedIPR=%.1f topScoreZ=%.3f residualLag1=%.3f saturated=%lld firstTopDepth=%d",
-              elo,HEPdfStats.moves,HEPdfStats.expectedIPR(),HEPdfStats.observedIPR(),
-              HEPdfStats.scoreZ(),HEPdfStats.lagOne(),HEPdfStats.saturated,
+              elo,HEPdfStats->moves,HEPdfStats->expectedIPR(),HEPdfStats->observedIPR(),
+              HEPdfStats->scoreZ(),HEPdfStats->lagOne(),HEPdfStats->saturated,
               firstVisibleDepth);
     return HEPdfChosen;
 }
@@ -3425,34 +3425,34 @@ static const char *HEPdfCoreChooseMove(int elo,int ply) {
 // Optional caller-supplied clock, not a fabricated game clock. User controls
 // clock/observed timings from the bot match controller.
 void HEClockRemainingSeconds(double seconds){
-    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    std::lock_guard<std::recursive_mutex> lock(*HEMutex);
     HEClockSeconds=(std::isfinite(seconds)&&seconds>0)?seconds:-1;
 }
 void HERecordDecisionTimeSeconds(double seconds){
-    std::lock_guard<std::recursive_mutex> lock(HEMutex);
-    if(HEPendingTime.active&&std::isfinite(seconds)&&seconds>HEPendingTime.motor){
-        double l0=HEMath::logNormalLogDensity(seconds,HEPendingTime.motor,
-                                    HEPendingTime.baseMean,HEPendingTime.spread);
-        double l1=HEMath::logNormalLogDensity(seconds,HEPendingTime.motor,
-                                    HEPendingTime.altMean,HEPendingTime.spread);
+    std::lock_guard<std::recursive_mutex> lock(*HEMutex);
+    if(HEPendingTime->active&&std::isfinite(seconds)&&seconds>HEPendingTime->motor){
+        double l0=HEMath::logNormalLogDensity(seconds,HEPendingTime->motor,
+                                    HEPendingTime->baseMean,HEPendingTime->spread);
+        double l1=HEMath::logNormalLogDensity(seconds,HEPendingTime->motor,
+                                    HEPendingTime->altMean,HEPendingTime->spread);
         // Eq 23-28: joint move+time log evidence and conditional KL.
-        HEStats.logEvidence+=l1-l0;
-        HEStats.latest.evidence=HEStats.logEvidence;
-        HEStats.latest.hasTime=true;
-        HEStats.latest.timeLogLikelihood=l0;
-        HEStats.sumTimingLog+=l0;++HEStats.timingSamples;
-        HEPendingTime.active=false; // a timing observation is applied once
+        HEStats->logEvidence+=l1-l0;
+        HEStats->latest.evidence=HEStats->logEvidence;
+        HEStats->latest.hasTime=true;
+        HEStats->latest.timeLogLikelihood=l0;
+        HEStats->sumTimingLog+=l0;++HEStats->timingSamples;
+        HEPendingTime->active=false; // a timing observation is applied once
     }
 }
 // One sample of time to optionally delay applying the chosen move in a bot
 // controller. Search time is separate from move presentation/think time.
 int HESuggestThinkTimeMilliseconds(){
-    std::lock_guard<std::recursive_mutex> lock(HEMutex);
-    if(!HEPendingTime.active)return 0;
+    std::lock_guard<std::recursive_mutex> lock(*HEMutex);
+    if(!HEPendingTime->active)return 0;
     double u=std::max(1.0e-12,HEFrand());
     double z=std::sqrt(-2.0*std::log(u))*std::cos(2*HEMath::pi*HEFrand());
-    double seconds=HEPendingTime.motor+
-        std::exp(HEPendingTime.altMean+HEPendingTime.spread*z);
+    double seconds=HEPendingTime->motor+
+        std::exp(HEPendingTime->altMean+HEPendingTime->spread*z);
     seconds=HEMath::clamp(seconds,.12,std::max(.12,HEClockSeconds*.15));
     return static_cast<int>(std::lround(seconds*1000));
 }
@@ -3469,40 +3469,40 @@ struct HEFormulaReport {
     int topFirstVisibleDepth;
 };
 HEFormulaReport HEGetFormulaReport(){
-    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    std::lock_guard<std::recursive_mutex> lock(*HEMutex);
     HEFormulaReport r{};
-    r.expectedIPR=HEStats.expectedIPR();r.observedIPR=HEStats.observedIPR();
-    r.moves=HEStats.moves;r.timingSamples=HEStats.timingSamples;
-    if(r.moves){r.expectedLoss=HEStats.sumExpectedLoss/r.moves;
-                r.observedLoss=HEStats.sumLoss/r.moves;}
-    r.scoreZ=HEMath::standardizedScore(HEStats.sumCentered,HEStats.sumVariance);
-    r.lagOne=HEStats.lagOne();r.lagTwo=HEStats.lag(2);
-    r.lagThree=HEStats.lag(3);r.lagFour=HEStats.lag(4);
-    r.portmanteauQ4=HEStats.portmanteau();
-    r.standardizedResidual=HEStats.latest.standardizedResidual;
-    r.residualCount=HEStats.residualCount;
-    r.topFirstVisibleDepth=HEStats.latest.topFirstVisibleDepth;
+    r.expectedIPR=HEStats->expectedIPR();r.observedIPR=HEStats->observedIPR();
+    r.moves=HEStats->moves;r.timingSamples=HEStats->timingSamples;
+    if(r.moves){r.expectedLoss=HEStats->sumExpectedLoss/r.moves;
+                r.observedLoss=HEStats->sumLoss/r.moves;}
+    r.scoreZ=HEMath::standardizedScore(HEStats->sumCentered,HEStats->sumVariance);
+    r.lagOne=HEStats->lagOne();r.lagTwo=HEStats->lag(2);
+    r.lagThree=HEStats->lag(3);r.lagFour=HEStats->lag(4);
+    r.portmanteauQ4=HEStats->portmanteau();
+    r.standardizedResidual=HEStats->latest.standardizedResidual;
+    r.residualCount=HEStats->residualCount;
+    r.topFirstVisibleDepth=HEStats->latest.topFirstVisibleDepth;
     if(r.topFirstVisibleDepth>=1&&r.topFirstVisibleDepth<HE_MAX_TRACKED_DEPTH){
         const int d=r.topFirstVisibleDepth;
-        r.depthStratumCount=HEStats.depthCount[d];
+        r.depthStratumCount=HEStats->depthCount[d];
         if(r.depthStratumCount>0){
-            r.depthTopRate=(double)HEStats.depthTopCount[d]/r.depthStratumCount;
-            r.depthMeanLoss=HEStats.depthLoss[d]/r.depthStratumCount;
+            r.depthTopRate=(double)HEStats->depthTopCount[d]/r.depthStratumCount;
+            r.depthMeanLoss=HEStats->depthLoss[d]/r.depthStratumCount;
         }
     }
-    r.moveLogEvidence=HEStats.logEvidence;
-    r.localLogEvidence=HEStats.localEvidence;
-    r.moveKLDivergence=HEStats.latest.moveKL;
-    r.effectiveInformation=HEStats.latest.effFisher;
-    r.entropy=HEStats.latest.entropy;
-    r.predictedThinkSeconds=HEStats.latest.predictedTimeSec;
-    r.timingLogLikelihood=HEStats.sumTimingLog;
-    r.timingKLDivergence=HEPendingTime.active?
-        HEMath::logNormalKL(HEPendingTime.altMean,HEPendingTime.baseMean,
-                             HEPendingTime.spread):0.0;
-    r.expectedWinProbability=HEStats.latest.expectedQuality;
-    r.modelSampleLowerBound=HEStats.latest.moveKL>HEMath::tiny?
-        HEMath::effectiveSampleLower(.01,.10,HEStats.latest.moveKL):INFINITY;
+    r.moveLogEvidence=HEStats->logEvidence;
+    r.localLogEvidence=HEStats->localEvidence;
+    r.moveKLDivergence=HEStats->latest.moveKL;
+    r.effectiveInformation=HEStats->latest.effFisher;
+    r.entropy=HEStats->latest.entropy;
+    r.predictedThinkSeconds=HEStats->latest.predictedTimeSec;
+    r.timingLogLikelihood=HEStats->sumTimingLog;
+    r.timingKLDivergence=HEPendingTime->active?
+        HEMath::logNormalKL(HEPendingTime->altMean,HEPendingTime->baseMean,
+                             HEPendingTime->spread):0.0;
+    r.expectedWinProbability=HEStats->latest.expectedQuality;
+    r.modelSampleLowerBound=HEStats->latest.moveKL>HEMath::tiny?
+        HEMath::effectiveSampleLower(.01,.10,HEStats->latest.moveKL):INFINITY;
     return r;
 }
 
@@ -3515,13 +3515,13 @@ HEFormulaReport HEGetFormulaReport(){
 
 
 void HENewGame(BOOL playingWhite, int elo) {
-    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    std::lock_guard<std::recursive_mutex> lock(*HEMutex);
     HECoreNewGame(playingWhite ? 1 : 0, elo);
 }
 
 
 NSArray<NSString *> *HEConfigureCommands(int elo) {
-    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    std::lock_guard<std::recursive_mutex> lock(*HEMutex);
     char cmds[8][HE_CMD_LEN];
     int n = HECoreConfigure(elo, cmds, 8);
     NSMutableArray<NSString *> *out = [NSMutableArray arrayWithCapacity:n];
@@ -3531,41 +3531,41 @@ NSArray<NSString *> *HEConfigureCommands(int elo) {
 
 
 NSString *HEChooseMove(const char *fen, int ply, int elo) {
-    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    std::lock_guard<std::recursive_mutex> lock(*HEMutex);
     const char *m = HECoreChooseMove(fen, ply, elo);
     return m ? [NSString stringWithUTF8String:m] : nil;
 }
 
 static NSString *HEPdfChooseMove(int elo,int ply) {
-    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    std::lock_guard<std::recursive_mutex> lock(*HEMutex);
     const char *move=HEPdfCoreChooseMove(elo,ply);
     return move ? [NSString stringWithUTF8String:move] : nil;
 }
 
 
 NSDictionary *HEDescribeElo(int elo) {
-    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    std::lock_guard<std::recursive_mutex> lock(*HEMutex);
     if (!HEHumanBand(elo)) {
         if(HEPdfBand(elo)) {
-            const bool have=HEPdfStats.elo==elo && HEPdfStats.moves>0;
-            const int depth=have?HEPdfStats.lastFirstVisibleDepth:-1;
+            const bool have=HEPdfStats->elo==elo && HEPdfStats->moves>0;
+            const int depth=have?HEPdfStats->lastFirstVisibleDepth:-1;
             const long long depthN=depth>=1&&depth<HE_MAX_TRACKED_DEPTH?
-                HEPdfStats.depthCount[depth]:0;
+                HEPdfStats->depthCount[depth]:0;
             return @{ @"mode": @"PDF candidate move law · uncalibrated ELO",
                       @"skill": @20,
-                      @"moves": @(have?HEPdfStats.moves:0),
+                      @"moves": @(have?HEPdfStats->moves:0),
                       @"targetAEe": @(HEMath::targetError(elo)),
-                      @"expectedAEe": @(have?HEPdfStats.expectedLoss/HEPdfStats.moves:0),
-                      @"observedAEe": @(have?HEPdfStats.observedLoss/HEPdfStats.moves:0),
-                      @"expectedIPR": @(have?HEPdfStats.expectedIPR():0),
-                      @"observedIPR": @(have?HEPdfStats.observedIPR():0),
-                      @"topMoveScoreZ": @(have?HEPdfStats.scoreZ():0),
-                      @"topMoveResidualLag1": @(have?HEPdfStats.lagOne():0),
-                      @"saturatedPositions": @(have?HEPdfStats.saturated:0),
+                      @"expectedAEe": @(have?HEPdfStats->expectedLoss/HEPdfStats->moves:0),
+                      @"observedAEe": @(have?HEPdfStats->observedLoss/HEPdfStats->moves:0),
+                      @"expectedIPR": @(have?HEPdfStats->expectedIPR():0),
+                      @"observedIPR": @(have?HEPdfStats->observedIPR():0),
+                      @"topMoveScoreZ": @(have?HEPdfStats->scoreZ():0),
+                      @"topMoveResidualLag1": @(have?HEPdfStats->lagOne():0),
+                      @"saturatedPositions": @(have?HEPdfStats->saturated:0),
                       @"firstTopVisibleDepth": @(depth),
                       @"depthStratumCount": @(depthN),
-                      @"depthTopRate": @(depthN?(double)HEPdfStats.depthTopCount[depth]/depthN:0),
-                      @"depthMeanLoss": @(depthN?HEPdfStats.depthLoss[depth]/depthN:0) };
+                      @"depthTopRate": @(depthN?(double)HEPdfStats->depthTopCount[depth]/depthN:0),
+                      @"depthMeanLoss": @(depthN?HEPdfStats->depthLoss[depth]/depthN:0) };
         }
         return @{ @"mode"     : elo < 3190 ? @"Stockfish UCI ELO limit"
                                               : @"Full strength · no fixed ELO",
@@ -3585,19 +3585,19 @@ NSDictionary *HEDescribeElo(int elo) {
          @"mistake"    : @(HES.count[HE_MISTAKE]),
          @"blunder"    : @(HES.count[HE_BLUNDER]),
          @"miss"       : @(HES.misses),
-         @"expectedIPR": @(HEStats.expectedIPR()),
-         @"observedIPR": @(HEStats.observedIPR()),
-         @"moveEvidence": @(HEStats.logEvidence),
-         @"moveScoreZ" : @(HEMath::standardizedScore(HEStats.sumCentered,HEStats.sumVariance)),
-         @"standardizedResidual": @(HEStats.latest.standardizedResidual),
-         @"residualCount": @(HEStats.residualCount),
-         @"lag1": @(HEStats.lag(1)),
-         @"lag2": @(HEStats.lag(2)),
-         @"lag3": @(HEStats.lag(3)),
-         @"lag4": @(HEStats.lag(4)),
-         @"portmanteauQ4": @(HEStats.portmanteau()),
-         @"topFirstVisibleDepth": @(HEStats.latest.topFirstVisibleDepth),
-         @"predictedThinkSeconds": @(HEStats.latest.predictedTimeSec)
+         @"expectedIPR": @(HEStats->expectedIPR()),
+         @"observedIPR": @(HEStats->observedIPR()),
+         @"moveEvidence": @(HEStats->logEvidence),
+         @"moveScoreZ" : @(HEMath::standardizedScore(HEStats->sumCentered,HEStats->sumVariance)),
+         @"standardizedResidual": @(HEStats->latest.standardizedResidual),
+         @"residualCount": @(HEStats->residualCount),
+         @"lag1": @(HEStats->lag(1)),
+         @"lag2": @(HEStats->lag(2)),
+         @"lag3": @(HEStats->lag(3)),
+         @"lag4": @(HEStats->lag(4)),
+         @"portmanteauQ4": @(HEStats->portmanteau()),
+         @"topFirstVisibleDepth": @(HEStats->latest.topFirstVisibleDepth),
+         @"predictedThinkSeconds": @(HEStats->latest.predictedTimeSec)
     };
 }
 
@@ -3660,7 +3660,7 @@ NSString *HEInferOpponentMove(const char *priorFen, const char *selectedMove,
 
 
 static void HEInvalidateConfiguration(void) {
-    std::lock_guard<std::recursive_mutex> lock(HEMutex);
+    std::lock_guard<std::recursive_mutex> lock(*HEMutex);
     HECfgElo = -1;
 }
 
@@ -3752,7 +3752,7 @@ static BOOL CAPExternalEngineMove(const char *path, const char *fen,
                 NSLog(@"[ChessAssistantPro] Human band opponent move %@",
                       played ?: @"unavailable from one-ply FEN transition");
             } else if (played) {
-                std::lock_guard<std::recursive_mutex> lock(HEMutex);
+                std::lock_guard<std::recursive_mutex> lock(*HEMutex);
                 HELastOwnTo = HEParseMove(played.UTF8String).to;
             }
         } else if (ply == humanLastPly + 2 && !humanLastFen.empty() &&
@@ -4449,6 +4449,10 @@ static void CAPSetFillColor(CAShapeLayer *layer, SEL selector, CGColorRef color)
 
 %ctor {
     @autoreleasepool {
+        HEMutex = new std::recursive_mutex();
+        HEStats = new HEMath::Tracker();
+        HEPdfStats = new HEPdfDiagnostics();
+        HEPendingTime = new HEClockTiming();
         %init;
         Class modelClass = objc_getClass("MLModel");
         if (modelClass) MSHookMessageEx(modelClass, @selector(predictionFromFeatures:error:),

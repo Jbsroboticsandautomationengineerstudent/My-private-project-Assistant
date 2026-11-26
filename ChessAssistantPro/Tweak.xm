@@ -1495,12 +1495,12 @@ static const double HEClassLo[HE_NCLASS] = { 0.0, 2.0,             5.0, 10.0, 20
 
 
 
-// Weaker human-band class targets. Preserve the 600 and 1319 anchors; 400 is
-// a continuous extrapolation of the same formula, not a separate move policy.
-// These are weights before position-specific availability and human biases.
+// Human-band class targets calibrated for 65-85% accuracy at all ELO levels.
+// ELO difference shows in style (aggro, risk) and per-game randomization,
+// not in a wildly different move quality distribution.
 //                                             top      good   inacc mistake blunder
-static const double HEMix600 [HE_NCLASS] = { 0.08, 0.12, 0.20, 0.25, 0.35 };
-static const double HEMix1319[HE_NCLASS] = { 0.22, 0.23, 0.23, 0.18, 0.14 };
+static const double HEMix600 [HE_NCLASS] = { 0.18, 0.22, 0.24, 0.20, 0.16 };
+static const double HEMix1319[HE_NCLASS] = { 0.25, 0.24, 0.22, 0.18, 0.11 };
 
 
 // Section 1.1: Win% for a centipawn score (Lichess AccuracyPercent.scala)
@@ -2081,6 +2081,7 @@ typedef struct {
     double runningAccSum;
     int    runningAccN;
     double accTarget;              // per-game accuracy target (65–85%)
+    double gameMixShift;           // per-game mix randomization (-1..+1)
 } HEState;
 
 
@@ -2126,6 +2127,7 @@ static void HECoreNewGame(int playingWhite, int elo) {
     HES.runningAccSum = 0;
     HES.runningAccN   = 0;
     HES.accTarget     = 65.0 + HEFrand() * 20.0;
+    HES.gameMixShift  = HEGauss() * 0.35;
 
     HEClockSeconds = -1;
     HELastOwnTo = -1;
@@ -2523,7 +2525,7 @@ static bool referenceSolverCheck(){
 // 04,11: historical intrinsic performance rating and inversion (not actual Elo).
 static double expectedError(const Vec&p,const Vec&d){return dot(p,d);}
 static double intrinsicRating(double ae){return 3571.0-15413.0*ae;}
-static double targetError(int rating){return std::max(0.0,(3571.0-rating)/15413.0);}
+static double targetError(int rating){return std::max(0.0,(3571.0-rating)/9500.0);}
 // 05,18: conditional moments and Fisher variance in outcome quality.
 static double mean(const Vec&p,const Vec&u){return dot(p,u);}
 static double variance(const Vec&p,const Vec&u){double m=mean(p,u),v=0;
@@ -3311,7 +3313,7 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     // At low ELO, skip book most of the time — 400-rated players don't play theory
     if (ply < 20) {
         double exitP = HEBookExitProb(ply, HEHP.bookExitPlyHalf);
-        double bookSkip = HEMath::clamp(0.35 - 0.30 * HEHP.t, 0.0, 0.85);
+        double bookSkip = HEMath::clamp(0.50 - 0.40 * HEHP.t, 0.0, 0.90);
         if (HEFrand() > exitP && HEFrand() > bookSkip && n > 0) {
             return HECommit(0, 0);
         }
@@ -3378,14 +3380,14 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
 
     double sComposite = law.s * std::exp(etaShift) * driftMult * attnSigma
                       * phaseMult * winSurgeMult * gameForm * tiltSMult;
-    sComposite = HEMath::clamp(sComposite, law.s * 0.3, law.s * 5.0);
+    sComposite = HEMath::clamp(sComposite, law.s * 0.3, law.s * 8.0);
 
     // Section 5.4: accuracy governor — always active to keep accuracy in target range
     bool winMode = [[NSUserDefaults standardUserDefaults] boolForKey:kWinEveryGameKey];
     if (HES.runningAccN >= 3) {
         double avgAcc = HES.runningAccSum / std::max(1, HES.runningAccN);
-        double kAcc = std::exp(0.06 * (avgAcc - HES.accTarget));
-        kAcc = HEMath::clamp(kAcc, 0.35, 3.2);
+        double kAcc = std::exp(0.08 * (avgAcc - HES.accTarget));
+        kAcc = HEMath::clamp(kAcc, 0.25, 5.0);
         sComposite *= kAcc;
     }
 
@@ -3410,7 +3412,7 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
 
     // Model the alternative's intent to win through a positive exponential
     // tilt (Eq 17-20) using risk-adjusted quality.
-    double theta=.60+0.75*HEHP.t;
+    double theta=.35+0.40*HEHP.t;
     HEMath::Vec winning=HEMath::tilt(law.p,riskQ,theta);
 
     // H.20: apply playing style as feature tilt
@@ -3434,7 +3436,7 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     // Section 5.4: win-safe floor (winEveryGameMode) — prevent throwing won games
     // Scale with ELO: low-rated players throw winning positions regularly
     if (winMode && HEL[0].cp >= 180) {
-        double floorStr = HEMath::clamp(0.10 + 0.60 * HEHP.t, 0.0, 0.80);
+        double floorStr = HEMath::clamp(0.05 + 0.40 * HEHP.t, 0.0, 0.50);
         double cpFloor = std::max(100.0, 0.45 * (double)HEL[0].cp);
         for (int i = 0; i < n; ++i) {
             if ((double)HEL[0].cp - (double)HEL[i].cp > cpFloor) {
@@ -3447,6 +3449,14 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     double cx=haveBoard?HEComplexity(&board,side):1.0;
     double sharp=std::min(1.5,std::max(.70,.60+.40*cx));
     for(int c=0;c<HE_NCLASS;++c)proposedMix[c]=HEHP.mix[c];
+    {
+        double sh = HES.gameMixShift;
+        proposedMix[HE_TOP]     *= std::exp(-1.0 * sh);
+        proposedMix[HE_GOOD]    *= std::exp(-0.5 * sh);
+        proposedMix[HE_MISTAKE] *= std::exp( 0.5 * sh);
+        proposedMix[HE_BLUNDER] *= std::exp( 0.8 * sh);
+        proposedMix = HEMath::normalize(proposedMix);
+    }
     proposedMix[HE_MISTAKE]*=sharp;proposedMix[HE_BLUNDER]*=sharp;
 
     // When winning (bestQuality >= 0.60 i.e. eval >= +1.5 pawns or so),
@@ -3454,28 +3464,28 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
     // Low-rated players still blunder constantly even when ahead.
     bool isAhead = (quality[0] >= 0.60);
     if(isAhead){
-        double aheadStr = HEMath::clamp(0.15 + 0.50 * HEHP.t, 0.0, 0.65);
+        double aheadStr = HEMath::clamp(0.08 + 0.30 * HEHP.t, 0.0, 0.40);
         proposedMix[HE_BLUNDER] *= (1.0 - aheadStr);
-        proposedMix[HE_MISTAKE] *= (1.0 - 0.50 * aheadStr);
+        proposedMix[HE_MISTAKE] *= (1.0 - 0.40 * aheadStr);
     }
     if(ply<8){
-        proposedMix[HE_MISTAKE]*=.85-.25*HEHP.t;
-        proposedMix[HE_BLUNDER]*=.75-.30*HEHP.t;
+        proposedMix[HE_MISTAKE]*=.92-.15*HEHP.t;
+        proposedMix[HE_BLUNDER]*=.88-.18*HEHP.t;
     }
     if(HES.haveLastCp&&HES.lastCp>=HEHP.convThresh&&HEL[0].cp>=HEHP.convThresh){
-        double convStr = HEMath::clamp(0.10 + 0.60 * HEHP.t, 0.0, 0.70);
-        proposedMix[HE_MISTAKE] *= 1.0 - convStr * 0.30;
+        double convStr = HEMath::clamp(0.05 + 0.30 * HEHP.t, 0.0, 0.35);
+        proposedMix[HE_MISTAKE] *= 1.0 - convStr * 0.25;
         proposedMix[HE_BLUNDER] *= (1.0 - convStr);
     }
     // Governor mix correction: if accuracy is overshooting target, re-inject errors
     if (HES.runningAccN >= 3) {
         double avgAcc = HES.runningAccSum / std::max(1, HES.runningAccN);
-        if (avgAcc > HES.accTarget + 3.0) {
-            double excess = HEMath::clamp((avgAcc - HES.accTarget) / 15.0, 0.0, 1.0);
+        if (avgAcc > HES.accTarget + 2.0) {
+            double excess = HEMath::clamp((avgAcc - HES.accTarget) / 10.0, 0.0, 1.0);
             proposedMix[HE_BLUNDER] = std::max(proposedMix[HE_BLUNDER],
-                                                HEHP.mix[HE_BLUNDER] * 0.50 * excess);
+                                                HEHP.mix[HE_BLUNDER] * 0.70 * excess);
             proposedMix[HE_MISTAKE] = std::max(proposedMix[HE_MISTAKE],
-                                                HEHP.mix[HE_MISTAKE] * 0.50 * excess);
+                                                HEHP.mix[HE_MISTAKE] * 0.70 * excess);
         }
     }
     proposedMix=HEMath::normalize(proposedMix);
@@ -3505,10 +3515,12 @@ static const char *HECoreChooseMove(const char *fen, int ply, int elo) {
         bool obviousWin = (HEL[0].mateIn>0 && HEL[0].mateIn<=2)
             || (features[0].isCapture && features[0].capturedValue>=300
                 && winLoss[0]<2.0);
-        if(obviousWin){
-            double obSupp = 0.15 + 0.50 * HEMath::clamp(-HEHP.t, 0.0, 1.0);
+        if(obviousWin && HEFrand() < HEHP.spotObvious){
+            double obSupp = 0.25 + 0.40 * HEMath::clamp(-HEHP.t, 0.0, 1.0);
             for(int i=0;i<n;++i)if(winLoss[i]>5)candidate[i]*=obSupp;
             HES.missStreak=0;
+        }else if(obviousWin){
+            HES.missStreak++;
         }else{
             // Non-obvious tactics: roll for recognition
             double spot=HEHP.spotTactic;

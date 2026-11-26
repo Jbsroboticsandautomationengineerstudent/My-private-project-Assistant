@@ -78,6 +78,11 @@ def stage_runtime():
 
 def main():
     stage_runtime()
+    ci = os.environ.get("CI", "").lower() in ("true", "1")
+    if ci:
+        print(f"CI detected — skipping Maia ONNX model download (200MB+)")
+        print(f"Staged {FRAMEWORK} (headers + library for compilation)")
+        return
     expected = os.environ.get("MAIA79_ONNX_SHA256") or model_sha256()
     if len(expected) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in expected):
         raise RuntimeError("MAIA79_ONNX_SHA256 must be a SHA-256 hex digest")
